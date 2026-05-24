@@ -1,88 +1,155 @@
+
 import streamlit as st
 from pathlib import Path
 import sys
 
 sys.path.insert(0, str(Path(__file__).parent))
 
+from core.qa_engine import QASystem
+from core.formula_engine import FormulaEngine
 from utils.config import RAW_DIR, PROCESSED_DIR
-from core.parser import parse_construction_document, save_to_json
-from core.knowledge_graph import build_knowledge_graph, get_graph_statistics
-from ui.components import (
-    render_statistics_tab, render_materials_tab,
-    render_standards_tab, render_parameters_tab, render_sidebar
-)
-from ui.pages.graph import render_graph_page
 
 # Настройка страницы
 st.set_page_config(
-    page_title="Анализ строительной документации",
-    page_icon="📄",
+    page_title="Инженерный чат-бот",
+    page_icon="🏗️",
     layout="wide"
 )
 
+# Инициализация QA системы
+if 'qa_system' not in st.session_state:
+    st.session_state.qa_system = QASystem(use_llm=False)
+    index_path = PROCESSED_DIR / "qa_index"
+    if index_path.exists():
+        st.session_state.qa_system.load_index(index_path)
+
+# Инициализация Formula Engine
+if 'formula_engine' not in st.session_state:
+    st.session_state.formula_engine = FormulaEngine()
+
+# Инициализация сообщений чата
+if 'messages' not in st.session_state:
+    st.session_state.messages = [
+        {
+            "role": "assistant",
+            "content": """🏗️ **Здравствуйте!** Я инженерный помощник по строительной документации.
+
+📖 **База знаний:** СП 61.13330.2012 «Тепловая изоляция оборудования и трубопроводов»
+
+**Что я умею:**
+• 📖 Отвечать на вопросы по документации
+• 📐 Рассчитывать толщину изоляции
+• 🌡️ Определять тепловые потери
+• 📊 Находить материалы и нормативы
+
+**💡 Примеры вопросов:**
+• Какие материалы для тепловой изоляции?
+• Как рассчитать толщину изоляции?
+• Рассчитай толщину при температуре 150°C
+• Какая температура на поверхности изоляции?
+• Какие нормативы регулируют изоляцию?
+
+**Задайте свой вопрос!**"""
+        }
+    ]
+
+qa_system = st.session_state.qa_system
+formula_engine = st.session_state.formula_engine
+
 # Заголовок
-st.title("📄 Анализ строительной документации")
-st.markdown("Загрузите документ для анализа: статистика, материалы, нормативы, параметры, граф знаний")
+st.title("🏗️ Инженерный помощник по строительной документации")
+st.caption("📄 База знаний: СП 61.13330.2012 «Тепловая изоляция оборудования и трубопроводов»")
 
 # Боковая панель
-uploaded_file = render_sidebar()
-max_nodes = 30
-graph_type = "Matplotlib"
-# Дополнительная информация в боковой панели
 with st.sidebar:
+    st.header("📚 О системе")
+    st.markdown("""
+    **База знаний:**
+    - СП 61.13330.2012
+    - Тепловая изоляция
+    - 93 714 символов
+    - 460 предложений
+    
+    **Что я умею:**
+    - ✅ Отвечать на вопросы
+    - ✅ Рассчитывать толщину
+    - ✅ Определять теплопотери
+    - ✅ Находить нормативы
+    """)
+
     st.divider()
-    st.subheader("📄 Доступные документы")
-    docs = list(RAW_DIR.glob("*"))
-    if docs:
-        for doc in docs:
-            st.write(f"• {doc.name}")
+
+    # Статус системы
+    if qa_system.is_ready:
+        st.success(f"✅ База знаний готова\n📄 {qa_system.index.ntotal} фрагментов")
     else:
-        st.info("Нет документов")
+        st.warning("⚠️ База знаний не загружена")
+        if st.button("📚 Индексировать документы"):
+            with st.spinner("Индексация..."):
+                success = qa_system.index_documents(RAW_DIR)
+                if success:
+                    index_path = PROCESSED_DIR / "qa_index"
+                    index_path.mkdir(parents=True, exist_ok=True)
+                    qa_system.save_index(index_path)
+                    st.success(f"✅ Проиндексировано {qa_system.index.ntotal} фрагментов")
+                    st.rerun()
+                else:
+                    st.error("❌ Не найдено документов для индексации")
 
-# Основные вкладки (без чата)
-tab1, tab2, tab3, tab4, tab5 = st.tabs([
-    "📊 Статистика",
-    "🏗️ Материалы",
-    "📜 Нормативы",
-    "🌡️ Параметры",
-    "🕸️ Граф знаний"
-])
+    st.divider()
 
-# Загрузка и анализ документа
-if uploaded_file is not None:
-    file_path = RAW_DIR / uploaded_file.name
-    with open(file_path, 'wb') as f:
-        f.write(uploaded_file.getbuffer())
-    st.success(f"✅ Загружен: {uploaded_file.name}")
+    # Доступные формулы
+    st.subheader("📐 Доступные формулы")
+    formulas = formula_engine.get_available_formulas()
+    for f in formulas:
+        with st.expander(f"📖 {f['name'][:25]}"):
+            st.write(f"`{f['expression']}`")
+            st.caption(f['description'][:50])
 
-    if st.button("🔍 Анализировать", type="primary"):
-        with st.spinner("Анализ документа..."):
-            try:
-                result = parse_construction_document(str(file_path))
-                save_to_json(result, PROCESSED_DIR / f"{Path(uploaded_file.name).stem}_analysis.json")
+    st.divider()
 
-                # Построение графа знаний
-                G = build_knowledge_graph(result)
-                graph_stats = get_graph_statistics(G)
+    # Кнопка очистки истории
+    if st.button("🗑️ Очистить историю", use_container_width=True):
+        st.session_state.messages = [st.session_state.messages[0]]
+        st.rerun()
 
-                with tab1:
-                    render_statistics_tab(result)
-                with tab2:
-                    render_materials_tab(result)
-                with tab3:
-                    render_standards_tab(result)
-                with tab4:
-                    render_parameters_tab(result)
-                with tab5:
-                    render_graph_page(G, graph_stats, max_nodes, graph_type)
+# Отображение чата
+for message in st.session_state.messages:
+    with st.chat_message(message["role"]):
+        st.markdown(message["content"])
 
-                st.success("✅ Анализ завершён")
-            except Exception as e:
-                st.error(f"Ошибка: {e}")
-else:
-    for tab in [tab1, tab2, tab3, tab4, tab5]:
-        with tab:
-            st.info("👈 Загрузите документ для анализа")
+# Поле ввода вопроса
+if prompt := st.chat_input("Задайте вопрос по строительной документации..."):
+    # Добавляем вопрос пользователя
+    st.session_state.messages.append({"role": "user", "content": prompt})
+    with st.chat_message("user"):
+        st.markdown(prompt)
 
+    # Генерируем ответ
+    with st.chat_message("assistant"):
+        with st.spinner("🔍 Анализирую..."):
+            # Проверяем, расчетный ли вопрос
+            is_calc = any(word in prompt.lower() for word in
+                         ['рассчитай', 'вычисли', 'толщин', 'температур', 'потери', 'формул'])
+
+            if is_calc:
+                result = formula_engine.answer_calculation(prompt)
+                response = result['answer']
+            else:
+                search_result = qa_system.answer(prompt)
+                response = search_result['answer']
+
+                # Добавляем источники, если есть
+                if search_result.get('sources'):
+                    response += "\n\n---\n📚 **Источники:**\n"
+                    for src in search_result['sources'][:2]:
+                        response += f"\n• {src['doc_name']} (релевантность: {src['score']:.2f})"
+
+            st.markdown(response)
+
+    # Сохраняем ответ
+    st.session_state.messages.append({"role": "assistant", "content": response})
+
+# Подвал
 st.divider()
-st.caption("Инструмент для технического анализа строительной документации 2026")
+st.caption("💡 Совет: для расчетов указывайте температуру (например, 'при 150°C')")
