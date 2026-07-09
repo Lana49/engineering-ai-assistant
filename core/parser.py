@@ -1,25 +1,25 @@
 import spacy
 import re
-from pathlib import Path
 import json
 from docx import Document
-from collections import defaultdict
-import spacy
+
 # загрузка модели
 try:
     nlp = spacy.load('ru_core_news_md')
     print("✅ Модель ru_core_news_md загружена")
-except:
+except Exception as e:
     try:
         nlp = spacy.load('ru_core_news_sm')
         print("✅ Модель ru_core_news_sm загружена")
-    except:
-        # Автоматическая загрузка модели для Streamlit Cloud
+    except Exception as e2:
         import os
         os.system('python -m spacy download ru_core_news_md')
         nlp = spacy.load('ru_core_news_md')
         print("✅ Модель ru_core_news_md загружена автоматически")
-# РАСШИРЕННЫЙ СЛОВАРЬ МАТЕРИАЛОВ
+
+
+# ========== РАСШИРЕННЫЙ СЛОВАРЬ МАТЕРИАЛОВ ==========
+
 MATERIALS = {
     # Металлы и сплавы
     'железо', 'железобетон', 'металл', 'сталь', 'алюминий', 'чугун', 'медь',
@@ -85,6 +85,10 @@ MATERIALS = {
     'полимерное покрытие', 'порошковая краска', 'мастика', 'герметик',
     'клей', 'силиконовый герметик', 'акриловый герметик', 'полиуретановый герметик',
 
+    # Жидкости и теплоносители (ОВК)
+    'вода', 'теплоноситель', 'хладагент', 'фреон', 'антифриз',
+    'этиленгликоль', 'пропиленгликоль',
+
     # Прочие
     'пенопластовые изделия', 'пенополиуретановые изделия', 'полистиролбетонные блоки',
     'газосиликатные блоки', 'пеносиликатные блоки', 'перлитовый песок', 'вермикулитовый песок',
@@ -92,7 +96,7 @@ MATERIALS = {
     'магнезиальный цемент', 'гипс', 'гипсокартон', 'гипсоволокнистый лист', 'ГВЛ',
     'стекломагниевый лист', 'СМЛ', 'целлюлозно-волокнистый утеплитель'
 }
-# Дополнительные фразы (биграммы и триграммы)
+
 MATERIAL_PHRASES = {
     'оцинкованная сталь', 'нержавеющая сталь', 'каменная вата', 'минеральная вата',
     'базальтовое волокно', 'вспененный каучук', 'алюминиевая фольга',
@@ -105,71 +109,128 @@ MATERIAL_PHRASES = {
     'минераловатные маты', 'минераловатные цилиндры', 'рулонированные маты',
     'прошивные маты', 'иглопробивные маты', 'древесно-стружечная плита',
     'вспененный полиэтилен', 'экструзионный пенополистирол', 'гипсокартон',
-    'стекломагниевый лист', 'пенопластовые изделия'
+    'стекломагниевый лист', 'пенопластовые изделия', 'водный раствор',
+    'незамерзающая жидкость', 'охлаждающая жидкость'
 }
+
+# ========== РАСШИРЕННЫЕ СЛОВАРИ ДЛЯ ГОСТОВ И СП ==========
+
+STANDARDS_TYPES = {
+    'ГОСТ', 'ГОСТ Р', 'ГОСТ РВ', 'СП', 'СНиП', 'СанПиН', 'ТУ',
+    'МСН', 'МСП', 'СТО', 'ЕН', 'ISO', 'ВСН', 'ТСН', 'СН',
+    'Технический регламент', 'Методические рекомендации'
+}
+
+STANDARD_PATTERNS = [
+    r'(ГОСТ Р\s+\d+(?:\.\d+)*-\d{4})',
+    r'(ГОСТ\s+\d+(?:\.\d+)*-\d{4})',
+    r'(СП\s+\d+(?:\.\d+)*\.\d{4})',
+    r'(СНиП\s+\d+(?:\.\d+)*-\d{2}-\d{2})',
+    r'(СанПиН\s+\d+(?:\.\d+)*\.\d+\.\d+\.\d+)',
+    r'(ТУ\s+\d+(?:\.\d+)*-\d+(?:-\d+)?)',
+    r'(МСН\s+\d+(?:\.\d+)*-\d{2})',
+    r'(СТО\s+\d+(?:\.\d+)*-\d{4})',
+]
+
+# ========== СЛОВАРИ КОНСТРУКЦИЙ И ПАРАМЕТРОВ (ДОБАВЛЕНЫ) ==========
 
 Construction_terms = {
     'материалы': MATERIALS,
     'конструкции': {
-        'тоннель', 'теплоизоляционная конструкция', 'покровный слой',
-        'пароизоляционный слой', 'предохранительный слой', 'выравнивающий слой',
-        'теплоизоляционный слой', 'опорные элементы', 'разгружающие устройства',
-        'крепление', 'температурный шов', 'фланцевое соединение', 'компенсатор',
-        'трубопровод', 'оборудование', 'газоход', 'воздуховод', 'канал',
-        'эстакада', 'галерея', 'фундамент', 'стена', 'перекрытие', 'опорные конструкции',
-        'крепежные детали', 'изоляция', 'многослойная конструкция', 'съемная конструкция'
+        'здание', 'помещение', 'фундамент', 'стена', 'перекрытие', 'фасад', 'кровля',
+        'эстакада', 'галерея', 'тоннель',
+        'теплоизоляционная конструкция', 'покровный слой', 'пароизоляционный слой',
+        'предохранительный слой', 'выравнивающий слой', 'теплоизоляционный слой',
+        'опорные элементы', 'разгружающие устройства', 'крепление', 'температурный шов',
+        'фланцевое соединение', 'компенсатор', 'многослойная конструкция',
+        'съемная конструкция', 'опорные конструкции', 'крепежные детали', 'изоляция',
+        'трубопровод', 'газоход', 'воздуховод', 'канал', 'оборудование',
+        'система отопления', 'система вентиляции', 'кондиционер', 'вентилятор',
+        'калорифер', 'теплообменник', 'радиатор', 'конвектор', 'насос', 'клапан',
+        'воздухораспределитель', 'чиллер', 'фанкойл', 'рекуператор', 'тепловой пункт',
+        'метеорологическая станция'
     },
     'параметры': {
         'толщина стенок', 'плотность', 'теплопроводность', 'коэффициент теплопроводности',
         'паропроницаемость', 'температуростойкость', 'уплотнение', 'коэффициент уплотнения',
         'горючесть', 'группа горючести', 'температура применения', 'срок эксплуатации',
-        'толщина изоляции', 'потери', 'плотность теплового потока', 'термическое сопротивление'
+        'толщина изоляции', 'потери', 'плотность теплового потока', 'термическое сопротивление',
+        'температура воздуха', 'энтальпия', 'солнечная радиация', 'влажность',
+        'скорость ветра', 'осадки', 'градусо-сутки', 'расход воздуха', 'расход теплоты',
+        'кратность воздухообмена', 'аэродинамическое сопротивление', 'микроклимат',
+        'барометрическое давление', 'обеспеченность'
     },
     'нормативы': {
         'ГОСТ', 'СНиП', 'СП', 'ТУ', 'ГОСТ Р', 'СанПиН', 'ВСН', 'ТСН', 'СТО', 'ЕН', 'ISO'
     }
 }
 
-# Создаем множества лемм для быстрого поиска
+# ========== СОЗДАНИЕ ЛЕММ (ТЕПЕРЬ ОПРЕДЕЛЕНЫ) ==========
+
 LEMMA_MATERIALS = {term.lower() for term in Construction_terms['материалы']}
 LEMMA_STRUCTURES = {term.lower() for term in Construction_terms['конструкции']}
 LEMMA_PARAMETERS = {term.lower() for term in Construction_terms['параметры']}
 LEMMA_STANDARDS = Construction_terms['нормативы']
 
 
+# ========== ФУНКЦИИ ЧТЕНИЯ ==========
+
 def read_docx(file_path):
-    """Чтение DOCX файла"""
     doc = Document(file_path)
     return '\n'.join([paragraph.text for paragraph in doc.paragraphs])
 
+def read_pdf(file_path):
+    try:
+        import fitz
+        doc = fitz.open(file_path)
+        text = ""
+        for page in doc:
+            text += page.get_text()
+        return text
+    except ImportError:
+        print("⚠️ Для работы с PDF установите PyMuPDF: pip install pymupdf")
+        return ""
+    except Exception as e:
+        print(f"❌ Ошибка при чтении PDF {file_path}: {e}")
+        return ""
+
+def read_rtf(file_path):
+    try:
+        from striprtf.striprtf import rtf_to_text
+        with open(file_path, 'r', encoding='utf-8', errors='replace') as f:
+            rtf_content = f.read()
+        return rtf_to_text(rtf_content).strip()
+    except ImportError:
+        print("⚠️ Для работы с RTF установите striprtf: pip install striprtf")
+        return ""
+    except Exception as e:
+        print(f"❌ Ошибка при чтении RTF {file_path}: {e}")
+        return ""
 
 def read_file(file_path):
-    """Универсальное чтение файла"""
+    file_path = str(file_path)
     if file_path.endswith('.docx'):
         return read_docx(file_path)
+    elif file_path.endswith('.pdf'):
+        return read_pdf(file_path)
+    elif file_path.endswith('.rtf'):
+        return read_rtf(file_path)
     else:
         with open(file_path, 'r', encoding='utf-8') as f:
             return f.read()
 
+# ========== ПАРСИНГ ==========
 
 def parse_construction_document(file_path):
-    """Парсинг строительной документации"""
-
     print(f"📖 Чтение файла: {file_path}")
 
-    # Читаем файл
     text = read_file(file_path)
     print(f"✅ Загружено {len(text)} символов")
 
-    # Ограничиваем текст для скорости
-    text_for_analysis = text[:500000]
+    doc = nlp(text[:500000])
 
-    # Обработка через spaCy
-    doc = nlp(text_for_analysis)
-
-    # Результаты
     result = {
-        'file': file_path,
+        'file': str(file_path),
         'full_text': text[:10000] + "..." if len(text) > 10000 else text,
         'stats': {
             'characters': len(text),
@@ -186,17 +247,19 @@ def parse_construction_document(file_path):
         'temperatures': [],
         'thicknesses': [],
         'densities': [],
+        'speeds': [],
+        'flows': [],
         'sections': {}
     }
 
-    # 1. Поиск разделов документа
+    # Поиск разделов
     section_pattern = r'\n(\d+(?:\.\d+)*)\s+([А-ЯЁ][^\n]{5,100})'
     for match in re.finditer(section_pattern, text[:50000]):
         num = match.group(1)
         title = match.group(2).strip()
         result['sections'][num] = title[:80]
 
-    # 2. Поиск строительных терминов с использованием лемматизации
+    # Поиск терминов
     for token in doc:
         if token.is_punct or token.is_space:
             continue
@@ -204,7 +267,6 @@ def parse_construction_document(file_path):
         lemma = token.lemma_.lower()
         text_orig = token.text
 
-        # Поиск по леммам
         if lemma in LEMMA_MATERIALS:
             result['materials'].add(text_orig)
             result['materials_lemmas'].add(lemma)
@@ -217,14 +279,14 @@ def parse_construction_document(file_path):
             result['parameters'].add(text_orig)
             result['parameters_lemmas'].add(lemma)
 
-        # Поиск по биграммам (два слова подряд)
+        # Поиск биграмм
         if token.i + 1 < len(doc):
             bigram = f"{token.text} {doc[token.i + 1].text}".lower()
             if bigram in LEMMA_MATERIALS or bigram in MATERIAL_PHRASES:
                 result['materials'].add(bigram)
                 result['materials_lemmas'].add(bigram)
 
-        # Поиск по триграммам (три слова подряд)
+        # Поиск триграмм
         if token.i + 2 < len(doc):
             trigram = f"{token.text} {doc[token.i + 1].text} {doc[token.i + 2].text}".lower()
             if trigram in MATERIAL_PHRASES:
@@ -237,21 +299,27 @@ def parse_construction_document(file_path):
             else:
                 result['standards'].append(token.text)
 
+    # Поиск стандартов по паттернам
+    for pattern in STANDARD_PATTERNS:
+        matches = re.findall(pattern, text)
+        for match in matches:
+            if match not in result['standards']:
+                result['standards'].append(match)
 
-    # 1. Поиск по фразам из MATERIAL_PHRASES (только словарные)
+    # Поиск по фразам
     for phrase in MATERIAL_PHRASES:
         if phrase in text.lower():
             result['materials'].add(phrase)
             result['materials_lemmas'].add(phrase)
 
-    # 2. Прямой поиск материалов из MATERIALS (только словарные)
+    # Прямой поиск материалов
     for material in MATERIALS:
         if material in text.lower():
             if material not in result['materials_lemmas']:
                 result['materials'].add(material)
                 result['materials_lemmas'].add(material)
 
-    # 3. Поиск биграмм из текста (только если биграмма из словаря)
+    # Поиск биграмм
     words = text.lower().split()
     for i in range(len(words) - 1):
         bigram = f"{words[i]} {words[i + 1]}"
@@ -259,8 +327,8 @@ def parse_construction_document(file_path):
             result['materials'].add(bigram)
             result['materials_lemmas'].add(bigram)
 
-    # 4. Поиск по маркерам
-    markers = ['материал', 'покрытие', 'изоляция', 'утеплитель', 'плита', 'мат', 'слой']
+    # Поиск по маркерам
+    markers = ['материал', 'покрытие', 'изоляция', 'утеплитель', 'плита', 'мат', 'слой', 'жидкость', 'раствор']
     for sent in doc.sents:
         sent_text = sent.text.lower()
         for marker in markers:
@@ -268,14 +336,11 @@ def parse_construction_document(file_path):
                 for token in sent:
                     if token.pos_ == 'NOUN' and len(token.text) > 3:
                         lemma = token.lemma_.lower()
-                        # ДОБАВЛЯЕМ ТОЛЬКО ЕСЛИ УЖЕ ЕСТЬ В СЛОВАРЕ
                         if lemma in LEMMA_MATERIALS and lemma not in result['materials_lemmas']:
                             result['materials'].add(token.text)
                             result['materials_lemmas'].add(lemma)
-                            print(f"  🔍 Добавлен из словаря по маркеру: {lemma}")
 
-
-    # 5. Поиск материалов в контексте (дополнительно)
+    # Поиск материалов в контексте
     for sent in doc.sents:
         sent_text = sent.text.lower()
         for material in MATERIALS:
@@ -283,7 +348,7 @@ def parse_construction_document(file_path):
                 result['materials'].add(material)
                 result['materials_lemmas'].add(material)
 
-    # 6. Числовые значения
+    # Числовые значения
     temp_pattern = r'[−-]?\d+(?:[.,]\d+)?\s*°[CС]'
     result['temperatures'] = list(set(re.findall(temp_pattern, text)))
 
@@ -293,36 +358,23 @@ def parse_construction_document(file_path):
     density_pattern = r'\d+(?:[.,]\d+)?\s*кг/м³'
     result['densities'] = list(set(re.findall(density_pattern, text)))
 
+    speed_pattern = r'\d+(?:[.,]\d+)?\s*м/с'
+    result['speeds'] = list(set(re.findall(speed_pattern, text)))
+
+    flow_pattern = r'\d+(?:[.,]\d+)?\s*м³/ч'
+    result['flows'] = list(set(re.findall(flow_pattern, text)))
+
     # Преобразуем множества в списки
     result['materials'] = list(result['materials'])
     result['structures'] = list(result['structures'])
     result['parameters'] = list(result['parameters'])
     result['standards'] = list(set(result['standards']))
 
-    # Статистика найденного
-    print(f"📊 Найдено материалов (оригинальных форм): {len(result['materials'])}")
-    print(f"📊 Уникальных материалов (лемм): {len(result['materials_lemmas'])}")
-    print(f"📊 Найдено конструкций: {len(result['structures'])}")
-    print(f"📊 Найдено параметров: {len(result['parameters'])}")
+    print(f"📊 Найдено материалов (лемм): {len(result['materials_lemmas'])}")
     print(f"📊 Найдено нормативов: {len(result['standards'])}")
-
     return result
 
-
 def save_to_json(result, output_file):
-    """Сохраняет результат в JSON"""
     with open(output_file, 'w', encoding='utf-8') as f:
         json.dump(result, f, ensure_ascii=False, indent=2, default=str)
     print(f"💾 Результат сохранен в {output_file}")
-
-
-# Для тестирования
-if __name__ == "__main__":
-    file_path = "data/raw/sp_61_13330_2012_27052024.docx"
-
-    if Path(file_path).exists():
-        result = parse_construction_document(file_path)
-        save_to_json(result, "construction_analysis.json")
-        print("\n✅ Анализ завершен!")
-    else:
-        print(f"❌ Файл {file_path} не найден!")

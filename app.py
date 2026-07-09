@@ -1,7 +1,7 @@
-
 import streamlit as st
 from pathlib import Path
 import sys
+import json
 
 sys.path.insert(0, str(Path(__file__).parent))
 
@@ -9,88 +9,115 @@ from core.qa_engine import QASystem
 from core.formula_engine import FormulaEngine
 from utils.config import RAW_DIR, PROCESSED_DIR
 
-# Настройка страницы
-st.set_page_config(
-    page_title="Инженерный чат-бот",
-    page_icon="🏗️",
-    layout="wide"
-)
+st.set_page_config(page_title="Инженерный чат-бот", page_icon="🏗️", layout="wide")
 
-# Инициализация QA системы
+HISTORY_FILE = PROCESSED_DIR / "chat_history.json"
+
+# ИНИЦИАЛИЗАЦИЯ
 if 'qa_system' not in st.session_state:
     st.session_state.qa_system = QASystem(use_llm=False)
-    index_path = PROCESSED_DIR / "qa_index"
-    if index_path.exists():
-        st.session_state.qa_system.load_index(index_path)
+    idx_path = PROCESSED_DIR / "qa_index"  # переименовано
+    if idx_path.exists():
+        st.session_state.qa_system.load_index(idx_path)
 
-# Инициализация Formula Engine
 if 'formula_engine' not in st.session_state:
     st.session_state.formula_engine = FormulaEngine()
 
-# Инициализация сообщений чата
 if 'messages' not in st.session_state:
-    st.session_state.messages = [
-        {
-            "role": "assistant",
-            "content": """🏗️ **Здравствуйте!** Я инженерный помощник по строительной документации.
+    if HISTORY_FILE.exists():
+        with open(HISTORY_FILE, "r", encoding="utf-8") as f:
+            st.session_state.messages = json.load(f)
+    else:
+        st.session_state.messages = [
+            {
+                "role": "assistant",
+                "content": """🏗️ **Здравствуйте!** Я инженерный помощник по строительной документации.
 
-📖 **База знаний:** СП 61.13330.2012 «Тепловая изоляция оборудования и трубопроводов»
+📖 **База знаний (152 документа):** 
+• ГОСТы (строительные стандарты)
+• СП (Своды правил) 
+• МСН, МСП (межгосударственные нормы)
+• Технические регламенты
+• Методические рекомендации
 
 **Что я умею:**
-• 📖 Отвечать на вопросы по документации
-• 📐 Рассчитывать толщину изоляции
-• 🌡️ Определять тепловые потери
-• 📊 Находить материалы и нормативы
+• 📖 Отвечать на вопросы по нормативной документации
+• 📐 Рассчитывать толщину изоляции и теплопотери
+• 🌍 Вычислять ГСОП (градусо-сутки)
+• 💨 Определять расход теплоты на вентиляцию
 
-**💡 Примеры вопросов:**
-• Какие материалы для тепловой изоляции?
-• Как рассчитать толщину изоляции?
-• Рассчитай толщину при температуре 150°C
-• Какая температура на поверхности изоляции?
-• Какие нормативы регулируют изоляцию?
-
-**Задайте свой вопрос!**"""
-        }
-    ]
+**Задайте свой вопрос или попросите сделать расчет!**"""
+            }
+        ]
 
 qa_system = st.session_state.qa_system
 formula_engine = st.session_state.formula_engine
 
-# Заголовок
-st.title("🏗️ Инженерный помощник по строительной документации")
-st.caption("📄 База знаний: СП 61.13330.2012 «Тепловая изоляция оборудования и трубопроводов»")
 
-# Боковая панель
+def auto_load_documents():
+    """Автоматически загружает/индексирует документы"""
+
+    idx_path = PROCESSED_DIR / "qa_index"
+
+    # Если индекс уже загружен — показываем статистику
+    if idx_path.exists() and qa_system.is_ready:
+        st.sidebar.success(f"✅ База знаний готова\n📄 {qa_system.index.ntotal} фрагментов")
+        return True
+
+    # Проверяем, есть ли документы
+    docs = list(RAW_DIR.glob("*.docx")) + list(RAW_DIR.glob("*.pdf")) + list(RAW_DIR.glob("*.rtf"))
+
+    if not docs:
+        st.sidebar.info("📥 Документы будут загружены из Hugging Face...")
+        # Пробуем загрузить через snapshot_download
+        with st.sidebar:
+            with st.spinner("📥 Загрузка документов из Hugging Face..."):
+                qa_system.index_documents(RAW_DIR)
+                if qa_system.is_ready:
+                    idx_path.mkdir(parents=True, exist_ok=True)
+                    qa_system.save_index(idx_path)
+                    st.sidebar.success(f"✅ Загружено {qa_system.index.ntotal} фрагментов")
+                    st.rerun()
+                    return True
+                else:
+                    st.sidebar.warning("📁 Папка `data/raw/` пуста. Добавьте документы вручную")
+                    return False
+
+    # Если документы есть — индексируем
+    if not qa_system.is_ready:
+        with st.sidebar:
+            st.info(f"📚 Индексация {len(docs)} документов...")
+            progress_bar = st.progress(0)
+
+        success = qa_system.index_documents(RAW_DIR)
+
+        if success:
+            idx_path.mkdir(parents=True, exist_ok=True)
+            qa_system.save_index(idx_path)
+            with st.sidebar:
+                progress_bar.progress(1.0)
+                st.success(f"✅ Загружено {qa_system.index.ntotal} фрагментов")
+            return True
+        else:
+            st.sidebar.error("❌ Ошибка индексации")
+            return False
+
+st.title("🏗️ Инженерный помощник проектировщика")
+st.caption("📄 База: СП 61.13330 (Изоляция), СП 131.13330 (Климатология), СП 60.13330 (ОВК)")
+
 with st.sidebar:
     st.header("📚 О системе")
-    st.markdown("""
-    **База знаний:**
-    - СП 61.13330.2012
-    - Тепловая изоляция
-    - 93 714 символов
-    - 460 предложений
-    
-    **Что я умею:**
-    - ✅ Отвечать на вопросы
-    - ✅ Рассчитывать толщину
-    - ✅ Определять теплопотери
-    - ✅ Находить нормативы
-    """)
-
+    st.markdown("- ✅ Семантический поиск по тексту\n- ✅ Инженерные расчеты\n- ✅ Извлечение нормативных параметров")
     st.divider()
 
-    # Статус системы
-    if qa_system.is_ready:
-        st.success(f"✅ База знаний готова\n📄 {qa_system.index.ntotal} фрагментов")
-    else:
-        st.warning("⚠️ База знаний не загружена")
-        if st.button("📚 Индексировать документы"):
+    if not qa_system.is_ready:
+        if st.button("📚 Индексировать документы", key="index_btn"):
             with st.spinner("Индексация..."):
-                success = qa_system.index_documents(RAW_DIR)
-                if success:
-                    index_path = PROCESSED_DIR / "qa_index"
-                    index_path.mkdir(parents=True, exist_ok=True)
-                    qa_system.save_index(index_path)
+                res = qa_system.index_documents(RAW_DIR)  # переименовано
+                if res:
+                    idx_path = PROCESSED_DIR / "qa_index"
+                    idx_path.mkdir(parents=True, exist_ok=True)
+                    qa_system.save_index(idx_path)
                     st.success(f"✅ Проиндексировано {qa_system.index.ntotal} фрагментов")
                     st.rerun()
                 else:
@@ -98,58 +125,86 @@ with st.sidebar:
 
     st.divider()
 
-    # Доступные формулы
     st.subheader("📐 Доступные формулы")
     formulas = formula_engine.get_available_formulas()
     for f in formulas:
-        with st.expander(f"📖 {f['name'][:25]}"):
-            st.write(f"`{f['expression']}`")
-            st.caption(f['description'][:50])
+        with st.expander(f"📖 {f['name']}"):
+            st.markdown(f['expression'])
+            st.caption(f['description'])
+            if f.get('legend'):
+                st.markdown("**Обозначения:**")
+                st.markdown(f['legend'])
 
     st.divider()
 
-    # Кнопка очистки истории
     if st.button("🗑️ Очистить историю", use_container_width=True):
         st.session_state.messages = [st.session_state.messages[0]]
+        if HISTORY_FILE.exists():
+            HISTORY_FILE.unlink()
         st.rerun()
 
-# Отображение чата
+    st.divider()
+
+    st.subheader("📊 Статистика базы")
+    docs_count = len(list(RAW_DIR.glob("*.docx"))) + len(list(RAW_DIR.glob("*.pdf"))) + len(list(RAW_DIR.glob("*.rtf")))
+    chunks_count = qa_system.index.ntotal if qa_system.is_ready else 0
+    st.metric("Документов", docs_count)
+    st.metric("Фрагментов базы", chunks_count)
+
+    st.divider()
+
+    chat_text = "\n\n".join(
+        [f"{'👤' if m['role'] == 'user' else '🤖'}:\n{m['content']}" for m in st.session_state.messages])
+    st.download_button(label="📥 Скачать отчет (TXT)", data=chat_text, file_name="engineering_report.txt",
+                       mime="text/plain", use_container_width=True)
+
+# ОТОБРАЖЕНИЕ ЧАТА
 for message in st.session_state.messages:
     with st.chat_message(message["role"]):
         st.markdown(message["content"])
 
-# Поле ввода вопроса
-if prompt := st.chat_input("Задайте вопрос по строительной документации..."):
-    # Добавляем вопрос пользователя
+# ОБРАБОТКА ВОПРОСА
+if prompt := st.chat_input("Задайте вопрос по строительной документации...", key="main_chat_input"):
     st.session_state.messages.append({"role": "user", "content": prompt})
     with st.chat_message("user"):
         st.markdown(prompt)
 
-    # Генерируем ответ
     with st.chat_message("assistant"):
         with st.spinner("🔍 Анализирую..."):
-            # Проверяем, расчетный ли вопрос
-            is_calc = any(word in prompt.lower() for word in
-                         ['рассчитай', 'вычисли', 'толщин', 'температур', 'потери', 'формул'])
+            prompt_lower = prompt.lower()
+
+            calc_triggers = ['рассчитай', 'вычисли', 'посчитай', 'толщин', 'температур', 'потери', 'формул', 'вентиляц',
+                             'расход']
+            def_triggers = ['что такое', 'определение', 'термин', 'понятие', 'что значит', 'что означает', 'расшифруй',
+                            'аббревиатура', 'расшифровка', 'что это', 'как понимать', 'объясните', 'поясните']
+
+            is_calc = any(w in prompt_lower for w in calc_triggers)
+            is_def = any(w in prompt_lower for w in def_triggers)
 
             if is_calc:
                 result = formula_engine.answer_calculation(prompt)
                 response = result['answer']
+            elif is_def:
+                clean_term = prompt_lower
+                for trigger in def_triggers:
+                    clean_term = clean_term.replace(trigger, "").strip()
+                definition_result = qa_system.find_definition(clean_term)
+                if definition_result['found']:
+                    response = f"📖 **Определение термина «{clean_term}»:**\n\n{definition_result['definition']}\n\n📚 **Источник:** {definition_result['source']}"
+                else:
+                    response = f"⚠️ В загруженных документах не найдено определение для термина «{clean_term}»."
             else:
                 search_result = qa_system.answer(prompt)
                 response = search_result['answer']
-
-                # Добавляем источники, если есть
-                if search_result.get('sources'):
-                    response += "\n\n---\n📚 **Источники:**\n"
-                    for src in search_result['sources'][:2]:
-                        response += f"\n• {src['doc_name']} (релевантность: {src['score']:.2f})"
+                if search_result.get('sources') and not qa_system.use_llm:
+                    response += "\n\n📚 **Источники:**\n" + "\n".join(
+                        [f"• {src['doc_name']}" for src in search_result['sources'][:2]])
 
             st.markdown(response)
 
-    # Сохраняем ответ
     st.session_state.messages.append({"role": "assistant", "content": response})
+    with open(HISTORY_FILE, "w", encoding="utf-8") as f:
+        json.dump(st.session_state.messages, f, ensure_ascii=False, indent=2)
 
-# Подвал
 st.divider()
-st.caption("💡 Совет: для расчетов указывайте температуру (например, 'при 150°C')")
+st.caption("💡 Совет: для расчетов указывайте числа и параметры прямо в вопросе")
