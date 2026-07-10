@@ -20,12 +20,12 @@ import hashlib
 import json
 from datetime import datetime
 
-
 # ========== ИМПОРТЫ С ОБРАБОТКОЙ ОШИБОК ==========
 
 # SentenceTransformer
 try:
     from sentence_transformers import SentenceTransformer
+
     SENTENCE_TRANSFORMER_AVAILABLE = True
 except ImportError:
     SENTENCE_TRANSFORMER_AVAILABLE = False
@@ -35,6 +35,7 @@ except ImportError:
 # BM25
 try:
     from rank_bm25 import BM25Okapi
+
     BM25_AVAILABLE = True
 except ImportError:
     BM25_AVAILABLE = False
@@ -44,6 +45,7 @@ except ImportError:
 # HuggingFace Hub
 try:
     from huggingface_hub import snapshot_download
+
     SNAPSHOT_AVAILABLE = True
 except ImportError:
     SNAPSHOT_AVAILABLE = False
@@ -66,7 +68,9 @@ class QASystem:
         self.chunks: List[Dict] = []
         self.dimension = 384
         self.is_ready = False
-        self.use_llm = use_llm
+
+        # LLM отключен
+        self.use_llm = False
         self.llm_engine = None
         self.bm25_index = None
 
@@ -78,15 +82,6 @@ class QASystem:
 
         # Кэш определений для быстрого доступа
         self.definitions_cache = {}
-
-        if use_llm:
-            try:
-                from core.llm_engine import LLMEngine
-                self.llm_engine = LLMEngine()
-                print("✅ LLM Engine готов")
-            except Exception as e:
-                print(f"⚠️ LLM Engine не загружен: {e}")
-                self.use_llm = False
 
     # ========== ВСПОМОГАТЕЛЬНЫЕ МЕТОДЫ ==========
 
@@ -289,7 +284,7 @@ class QASystem:
             print(f"❌ Ошибка чтения файла {file_path.name}: {e}")
             return ""
 
-    # ========== ИНДЕКСАЦИЯ ==========
+    # ========== ИНДЕКСАЦИЯ С КЭШИРОВАНИЕМ ==========
 
     @staticmethod
     def _get_documents_hash(documents_dir: Path) -> str:
@@ -344,31 +339,28 @@ class QASystem:
             self.bm25_index = None
 
     def index_documents(self, documents_dir: Path):
-        """Индексация документов из директории"""
-        # Проверяем существование директории
+        """
+        Индексация документов с кэшированием.
+        Если индекс уже существует и документы не изменились - загружает из кэша.
+        """
         if not documents_dir.exists():
             print(f"⚠️ Директория {documents_dir} не существует, создаём...")
             documents_dir.mkdir(parents=True, exist_ok=True)
 
-        current_hash = self._get_documents_hash(documents_dir)
-        saved_hash = self._load_saved_hash(documents_dir)
+        # === ПРОВЕРЯЕМ КЭШ ===
+        index_path = documents_dir.parent / "processed" / "qa_index"
 
-        # Проверяем, изменились ли документы
-        if saved_hash == current_hash and self.is_ready:
-            print("✅ Документы не изменились, индекс актуален")
-            return True
+        # Пытаемся загрузить существующий индекс
+        if index_path.exists():
+            if self.load_index(index_path):
+                print(f"✅ Индекс загружен из кэша: {self.index.ntotal} векторов")
+                self.is_ready = True
+                return True
 
-        if saved_hash == current_hash:
-            index_path = documents_dir.parent / "processed" / "qa_index"
-            if index_path.exists():
-                if self.load_index(index_path):
-                    print("✅ Индекс загружен из кэша")
-                    return True
+        # === ЕСЛИ НЕТ - СОЗДАЁМ ===
+        print("🔄 Создание нового индекса...")
 
-        print("🔄 Документы изменились или индекс отсутствует, пересоздаём...")
-        all_chunks = []
-
-        # Скачивание документов из Hugging Face
+        # Скачиваем документы
         if SNAPSHOT_AVAILABLE and snapshot_download is not None:
             try:
                 print("📥 Скачивание документов из dataset (snapshot)...")
@@ -387,7 +379,8 @@ class QASystem:
         else:
             print("📁 Использую локальные файлы (huggingface-hub не доступен)")
 
-        # Индексация файлов
+        # Собираем чанки
+        all_chunks = []
         files_found = False
         for file_path in documents_dir.glob("*"):
             if file_path.suffix.lower() in ['.docx', '.doc', '.pdf', '.rtf']:
@@ -428,12 +421,13 @@ class QASystem:
         # Создание BM25 индекса
         self._build_bm25_index()
 
-        # Сохранение
-        self._save_hash(documents_dir, current_hash)
-
-        index_path = documents_dir.parent / "processed" / "qa_index"
+        # === СОХРАНЯЕМ ===
         index_path.mkdir(parents=True, exist_ok=True)
         self.save_index(index_path)
+
+        # Сохраняем хеш
+        current_hash = self._get_documents_hash(documents_dir)
+        self._save_hash(documents_dir, current_hash)
 
         print(f"✅ Индекс создан и сохранён: {self.index.ntotal} векторов")
         self.is_ready = True
@@ -637,20 +631,7 @@ class QASystem:
         all_tables = search_results.get('tables', [])
         all_formulas = search_results.get('formulas', [])
 
-        # LLM ответ (если включен)
-        if self.use_llm and self.llm_engine:
-            context = ""
-            for chunk in cleaned_chunks[:3]:
-                context += f"\n--- {chunk['doc_name']} ---\n{chunk['text'][:500]}\n"
-            try:
-                result = self.llm_engine.answer_with_context(question, context, cleaned_chunks[:3])
-                result['tables'] = all_tables[:3]
-                result['formulas'] = all_formulas[:5]
-                return result
-            except Exception as e:
-                print(f"❌ Ошибка LLM: {e}")
-
-        # Обычный ответ
+        # LLM отключен - используем обычный ответ
         first_sentence = cleaned_chunks[0]['text'].split('.')[0] + "."
         answer = f"**📌 Краткий ответ:**\n{first_sentence}\n\n"
         answer += f"**📖 Подробнее из документации:**\n"
@@ -850,11 +831,13 @@ class QASystem:
 
         if not index_path.exists() or not chunks_path.exists():
             return False
-
-        self.index = faiss.read_index(str(index_path))
-        with open(chunks_path, 'rb') as f:
-            self.chunks = pickle.load(f)
-
-        self.is_ready = True
-        print(f"✅ Индекс загружен: {self.index.ntotal} векторов")
-        return True
+        try:
+            self.index = faiss.read_index(str(index_path))
+            with open(chunks_path, 'rb') as f:
+                self.chunks = pickle.load(f)
+            self.is_ready = True
+            print(f"✅ Индекс загружен: {self.index.ntotal} векторов")
+            return True
+        except Exception as e:
+            print(f"❌ Ошибка загрузки индекса: {e}")
+            return False

@@ -4,6 +4,10 @@ import sys
 import json
 from datetime import datetime
 import asyncio
+import os
+
+print(f"Текущая директория: {os.getcwd()}")
+print(f"Права на запись в data/processed: {os.access('data/processed', os.W_OK)}")
 
 sys.path.insert(0, str(Path(__file__).parent))
 
@@ -66,15 +70,50 @@ def get_initial_message():
     }]
 
 
+# ========= ЭКСПОРТ В ИСТОРИЮ =========
+
+def export_history_to_docx():
+    try:
+        from docx import Document
+
+        doc = Document()
+        doc.add_heading("Инженерный чат-бот - История", 0)
+        doc.add_paragraph(f"Дата: {datetime.now().strftime('%d.%m.%Y %H:%M')}")
+        doc.add_paragraph()
+
+        for msg in st.session_state.messages:
+            role = "Пользователь" if msg["role"] == "user" else "Ассистент"
+            doc.add_heading(role, level=1)
+            doc.add_paragraph(msg["content"])
+            doc.add_paragraph()
+
+        output_path = PROCESSED_DIR / f"chat_history_{datetime.now().strftime('%Y%m%d_%H%M%S')}.docx"
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        doc.save(str(output_path))
+        return output_path
+
+    except Exception as e:
+        st.error(f"❌ Ошибка: {e}")
+        return None
+
+
 # ========= ИНИЦИАЛИЗАЦИЯ =========
 
 def init_session_state():
     """Инициализация состояния сессии"""
-    if "qa_system" not in st.session_state:
+    if 'qa_system' not in st.session_state:
         st.session_state.qa_system = QASystem(use_llm=False)
+
+        # ПЫТАЕМСЯ ЗАГРУЗИТЬ ИНДЕКС СРАЗУ
         idx_path = PROCESSED_DIR / "qa_index"
         if idx_path.exists():
-            st.session_state.qa_system.load_index(idx_path)
+            loaded = st.session_state.qa_system.load_index(idx_path)
+            if loaded:
+                print(f"✅ Индекс загружен при старте: {st.session_state.qa_system.index.ntotal} векторов")
+            else:
+                print("⚠️ Не удалось загрузить индекс")
+        else:
+            print("📁 Индекс не найден, будет создан при первой необходимости")
 
     if "formula_engine" not in st.session_state:
         st.session_state.formula_engine = FormulaEngine(st.session_state.qa_system)
@@ -308,10 +347,18 @@ def auto_load_documents():
     qa_system = st.session_state.qa_system
     idx_path = PROCESSED_DIR / "qa_index"
 
-    if idx_path.exists() and qa_system.is_ready:
+    # === СНАЧАЛА ПРОВЕРЯЕМ ГОТОВНОСТЬ ===
+    if qa_system.is_ready and qa_system.index is not None:
         st.sidebar.success(f"✅ База знаний готова\n📄 {qa_system.index.ntotal} фрагментов")
         return True
 
+    # === ПЫТАЕМСЯ ЗАГРУЗИТЬ ===
+    if idx_path.exists():
+        if qa_system.load_index(idx_path):
+            st.sidebar.success(f"✅ Индекс загружен\n📄 {qa_system.index.ntotal} фрагментов")
+            return True
+
+    # === ЕСЛИ НЕТ - СОЗДАЁМ ===
     docs = list(RAW_DIR.glob("*.docx")) + list(RAW_DIR.glob("*.pdf")) + list(RAW_DIR.glob("*.rtf"))
 
     if not docs:
@@ -376,6 +423,27 @@ def main():
         auto_load_documents()
         st.divider()
 
+        # Кнопки управления индексом
+        col1, col2 = st.columns(2)
+        with col1:
+            if st.button("🔄 Перезагрузить индекс", use_container_width=True):
+                idx_path = PROCESSED_DIR / "qa_index"
+                if idx_path.exists():
+                    st.session_state.qa_system.load_index(idx_path)
+                    st.success(f"✅ Индекс перезагружен: {qa_system.index.ntotal} векторов")
+                    st.rerun()
+                else:
+                    st.warning("⚠️ Индекс не найден")
+
+        with col2:
+            if st.button("🗑️ Очистить индекс", use_container_width=True):
+                import shutil
+                idx_path = PROCESSED_DIR / "qa_index"
+                if idx_path.exists():
+                    shutil.rmtree(idx_path)
+                    st.success("✅ Индекс очищен")
+                    st.rerun()
+
         if not qa_system.is_ready:
             if st.button("📚 Индексировать документы", key="index_btn", use_container_width=True):
                 with st.spinner("Индексация..."):
@@ -406,9 +474,9 @@ def main():
 
         st.subheader("📊 Статистика базы")
         docs_count = (
-            len(list(RAW_DIR.glob("*.docx")))
-            + len(list(RAW_DIR.glob("*.pdf")))
-            + len(list(RAW_DIR.glob("*.rtf")))
+                len(list(RAW_DIR.glob("*.docx")))
+                + len(list(RAW_DIR.glob("*.pdf")))
+                + len(list(RAW_DIR.glob("*.rtf")))
         )
         chunks_count = qa_system.index.ntotal if qa_system.is_ready else 0
         col1, col2 = st.columns(2)
@@ -603,7 +671,6 @@ def main():
         HISTORY_FILE.parent.mkdir(parents=True, exist_ok=True)
         with open(HISTORY_FILE, "w", encoding="utf-8") as f:
             json.dump(st.session_state.messages, f, ensure_ascii=False, indent=2)
-
     # ========= FOOTER =========
     st.divider()
     st.caption("💡 Совет: для расчетов указывайте числа и параметры прямо в вопросе")
