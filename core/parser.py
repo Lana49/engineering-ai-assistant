@@ -1,21 +1,48 @@
+# -*- coding: utf-8 -*-
+"""
+Парсер строительной документации.
+Извлекает:
+- Материалы и их свойства
+- Конструкции
+- Параметры (температура, толщина, плотность и т.д.)
+- Стандарты (ГОСТ, СП, СНиП)
+- Таблицы
+- Формулы
+- Разделы документа
+- Числовые данные с единицами измерения
+"""
+
 import spacy
 import re
 import json
-from docx import Document
+from pathlib import Path
+from typing import Dict, List, Set, Optional, Any, Tuple
+from collections import defaultdict
+from dataclasses import dataclass, field
 
-# загрузка модели
-try:
-    nlp = spacy.load('ru_core_news_md')
-    print("✅ Модель ru_core_news_md загружена")
-except Exception as e:
+
+# ========== ЗАГРУЗКА МОДЕЛИ SPACY ==========
+
+def load_spacy_model():
+    """Загрузка модели spaCy с автоматической установкой"""
     try:
-        nlp = spacy.load('ru_core_news_sm')
-        print("✅ Модель ru_core_news_sm загружена")
-    except Exception as e2:
-        import os
-        os.system('python -m spacy download ru_core_news_md')
         nlp = spacy.load('ru_core_news_md')
-        print("✅ Модель ru_core_news_md загружена автоматически")
+        print("✅ Модель ru_core_news_md загружена")
+        return nlp
+    except Exception:
+        try:
+            nlp = spacy.load('ru_core_news_sm')
+            print("✅ Модель ru_core_news_sm загружена")
+            return nlp
+        except Exception:
+            import os
+            os.system('python -m spacy download ru_core_news_md')
+            nlp = spacy.load('ru_core_news_md')
+            print("✅ Модель ru_core_news_md загружена автоматически")
+            return nlp
+
+
+nlp = load_spacy_model()
 
 
 # ========== РАСШИРЕННЫЙ СЛОВАРЬ МАТЕРИАЛОВ ==========
@@ -24,11 +51,9 @@ MATERIALS = {
     # Металлы и сплавы
     'железо', 'железобетон', 'металл', 'сталь', 'алюминий', 'чугун', 'медь',
     'латунь', 'бронза', 'титан', 'свинец', 'цинк', 'сплав', 'нихром', 'инвар',
-
-    # Виды стали
-    'оцинкованная сталь', 'нержавеющая сталь', 'сталь углеродистая', 'сталь легированная',
-    'сталь низколегированная', 'сталь высоколегированная', 'сталь коррозионно-стойкая',
-    'сталь жаропрочная', 'сталь инструментальная',
+    'оцинкованная сталь', 'нержавеющая сталь', 'сталь углеродистая',
+    'сталь легированная', 'сталь низколегированная', 'сталь высоколегированная',
+    'сталь коррозионно-стойкая', 'сталь жаропрочная', 'сталь инструментальная',
 
     # Бетоны и растворы
     'бетон', 'асфальтобетон', 'цемент', 'цементобетон', 'армопенобетон',
@@ -85,7 +110,7 @@ MATERIALS = {
     'полимерное покрытие', 'порошковая краска', 'мастика', 'герметик',
     'клей', 'силиконовый герметик', 'акриловый герметик', 'полиуретановый герметик',
 
-    # Жидкости и теплоносители (ОВК)
+    # Жидкости и теплоносители
     'вода', 'теплоноситель', 'хладагент', 'фреон', 'антифриз',
     'этиленгликоль', 'пропиленгликоль',
 
@@ -113,7 +138,7 @@ MATERIAL_PHRASES = {
     'незамерзающая жидкость', 'охлаждающая жидкость'
 }
 
-# ========== РАСШИРЕННЫЕ СЛОВАРИ ДЛЯ ГОСТОВ И СП ==========
+# ========== СЛОВАРИ ДЛЯ ГОСТОВ И СП ==========
 
 STANDARDS_TYPES = {
     'ГОСТ', 'ГОСТ Р', 'ГОСТ РВ', 'СП', 'СНиП', 'СанПиН', 'ТУ',
@@ -132,9 +157,9 @@ STANDARD_PATTERNS = [
     r'(СТО\s+\d+(?:\.\d+)*-\d{4})',
 ]
 
-# ========== СЛОВАРИ КОНСТРУКЦИЙ И ПАРАМЕТРОВ (ДОБАВЛЕНЫ) ==========
+# ========== СЛОВАРИ КОНСТРУКЦИЙ И ПАРАМЕТРОВ ==========
 
-Construction_terms = {
+CONSTRUCTION_TERMS = {
     'материалы': MATERIALS,
     'конструкции': {
         'здание', 'помещение', 'фундамент', 'стена', 'перекрытие', 'фасад', 'кровля',
@@ -165,21 +190,32 @@ Construction_terms = {
     }
 }
 
-# ========== СОЗДАНИЕ ЛЕММ (ТЕПЕРЬ ОПРЕДЕЛЕНЫ) ==========
+# ========== СОЗДАНИЕ ЛЕММ ==========
 
-LEMMA_MATERIALS = {term.lower() for term in Construction_terms['материалы']}
-LEMMA_STRUCTURES = {term.lower() for term in Construction_terms['конструкции']}
-LEMMA_PARAMETERS = {term.lower() for term in Construction_terms['параметры']}
-LEMMA_STANDARDS = Construction_terms['нормативы']
+LEMMA_MATERIALS = {term.lower() for term in CONSTRUCTION_TERMS['материалы']}
+LEMMA_STRUCTURES = {term.lower() for term in CONSTRUCTION_TERMS['конструкции']}
+LEMMA_PARAMETERS = {term.lower() for term in CONSTRUCTION_TERMS['параметры']}
+LEMMA_STANDARDS = CONSTRUCTION_TERMS['normatives']
 
 
-# ========== ФУНКЦИИ ЧТЕНИЯ ==========
+# ========== ФУНКЦИИ ЧТЕНИЯ ФАЙЛОВ ==========
 
-def read_docx(file_path):
-    doc = Document(file_path)
-    return '\n'.join([paragraph.text for paragraph in doc.paragraphs])
+def read_docx(file_path: str) -> str:
+    """Чтение DOCX файла"""
+    try:
+        from docx import Document
+        doc = Document(file_path)
+        return '\n'.join([paragraph.text for paragraph in doc.paragraphs])
+    except ImportError:
+        print("⚠️ Для работы с DOCX установите python-docx: pip install python-docx")
+        return ""
+    except Exception as e:
+        print(f"❌ Ошибка при чтении DOCX {file_path}: {e}")
+        return ""
 
-def read_pdf(file_path):
+
+def read_pdf(file_path: str) -> str:
+    """Чтение PDF файла"""
     try:
         import fitz
         doc = fitz.open(file_path)
@@ -194,7 +230,9 @@ def read_pdf(file_path):
         print(f"❌ Ошибка при чтении PDF {file_path}: {e}")
         return ""
 
-def read_rtf(file_path):
+
+def read_rtf(file_path: str) -> str:
+    """Чтение RTF файла"""
     try:
         from striprtf.striprtf import rtf_to_text
         with open(file_path, 'r', encoding='utf-8', errors='replace') as f:
@@ -207,174 +245,372 @@ def read_rtf(file_path):
         print(f"❌ Ошибка при чтении RTF {file_path}: {e}")
         return ""
 
-def read_file(file_path):
+
+def read_file(file_path: str) -> str:
+    """Универсальное чтение файла"""
     file_path = str(file_path)
-    if file_path.endswith('.docx'):
+    if file_path.endswith('.docx') or file_path.endswith('.doc'):
         return read_docx(file_path)
     elif file_path.endswith('.pdf'):
         return read_pdf(file_path)
-    elif file_path.endswith('.rtf'):
+    elif file_path.endswith('.rtf') or file_path.endswith('.RTF'):
         return read_rtf(file_path)
     else:
-        with open(file_path, 'r', encoding='utf-8') as f:
-            return f.read()
+        try:
+            with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
+                return f.read()
+        except Exception as e:
+            print(f"❌ Ошибка при чтении файла {file_path}: {e}")
+            return ""
 
-# ========== ПАРСИНГ ==========
 
-def parse_construction_document(file_path):
-    print(f"📖 Чтение файла: {file_path}")
+# ========== ОСНОВНОЙ КЛАСС ПАРСЕРА ==========
 
-    text = read_file(file_path)
-    print(f"✅ Загружено {len(text)} символов")
+class DocumentParser:
+    """Парсер строительной документации"""
 
-    doc = nlp(text[:500000])
+    def __init__(self, nlp_model=None):
+        self.nlp = nlp_model or nlp
+        self.materials_set = MATERIALS
+        self.material_phrases = MATERIAL_PHRASES
+        self.standards_types = STANDARDS_TYPES
+        self.standard_patterns = STANDARD_PATTERNS
+        self.construction_terms = CONSTRUCTION_TERMS
+        self.lemma_materials = LEMMA_MATERIALS
+        self.lemma_structures = LEMMA_STRUCTURES
+        self.lemma_parameters = LEMMA_PARAMETERS
+        self.lemma_standards = LEMMA_STANDARDS
 
-    result = {
-        'file': str(file_path),
-        'full_text': text[:10000] + "..." if len(text) > 10000 else text,
-        'stats': {
-            'characters': len(text),
-            'words': len([t for t in doc if not t.is_space]),
-            'sentences': len(list(doc.sents))
-        },
-        'materials': set(),
-        'structures': set(),
-        'parameters': set(),
-        'materials_lemmas': set(),
-        'structures_lemmas': set(),
-        'parameters_lemmas': set(),
-        'standards': [],
-        'temperatures': [],
-        'thicknesses': [],
-        'densities': [],
-        'speeds': [],
-        'flows': [],
-        'sections': {}
-    }
+    def parse(self, file_path: str, max_chars: int = 500000) -> Dict[str, Any]:
+        """
+        Парсинг документа
 
-    # Поиск разделов
-    section_pattern = r'\n(\d+(?:\.\d+)*)\s+([А-ЯЁ][^\n]{5,100})'
-    for match in re.finditer(section_pattern, text[:50000]):
-        num = match.group(1)
-        title = match.group(2).strip()
-        result['sections'][num] = title[:80]
+        Args:
+            file_path: Путь к файлу
+            max_chars: Максимальное количество символов для обработки
 
-    # Поиск терминов
-    for token in doc:
-        if token.is_punct or token.is_space:
-            continue
+        Returns:
+            Dict с извлечёнными данными
+        """
+        print(f"📖 Чтение файла: {file_path}")
 
-        lemma = token.lemma_.lower()
-        text_orig = token.text
+        text = read_file(file_path)
+        if not text:
+            return {"error": f"Не удалось прочитать файл {file_path}"}
 
-        if lemma in LEMMA_MATERIALS:
-            result['materials'].add(text_orig)
-            result['materials_lemmas'].add(lemma)
+        print(f"✅ Загружено {len(text)} символов")
 
-        if lemma in LEMMA_STRUCTURES:
-            result['structures'].add(text_orig)
-            result['structures_lemmas'].add(lemma)
+        # Ограничиваем текст для обработки
+        text_to_process = text[:max_chars]
+        doc = self.nlp(text_to_process)
 
-        if lemma in LEMMA_PARAMETERS:
-            result['parameters'].add(text_orig)
-            result['parameters_lemmas'].add(lemma)
+        result = {
+            'file': str(file_path),
+            'full_text': text[:10000] + "..." if len(text) > 10000 else text,
+            'stats': {
+                'characters': len(text),
+                'words': len([t for t in doc if not t.is_space]),
+                'sentences': len(list(doc.sents))
+            },
+            'materials': set(),
+            'structures': set(),
+            'parameters': set(),
+            'materials_lemmas': set(),
+            'structures_lemmas': set(),
+            'parameters_lemmas': set(),
+            'standards': [],
+            'temperatures': [],
+            'thicknesses': [],
+            'densities': [],
+            'speeds': [],
+            'flows': [],
+            'sections': {},
+            'tables': [],
+            'formulas': []
+        }
 
-        # Поиск биграмм
-        if token.i + 1 < len(doc):
-            bigram = f"{token.text} {doc[token.i + 1].text}".lower()
-            if bigram in LEMMA_MATERIALS or bigram in MATERIAL_PHRASES:
-                result['materials'].add(bigram)
-                result['materials_lemmas'].add(bigram)
+        # Поиск разделов
+        result['sections'] = self._extract_sections(text)
 
-        # Поиск триграмм
-        if token.i + 2 < len(doc):
-            trigram = f"{token.text} {doc[token.i + 1].text} {doc[token.i + 2].text}".lower()
-            if trigram in MATERIAL_PHRASES:
-                result['materials'].add(trigram)
+        # Поиск терминов
+        materials, structures, parameters = self._extract_terms(doc, text)
+        result['materials'] = list(materials)
+        result['structures'] = list(structures)
+        result['parameters'] = list(parameters)
 
-        # Поиск нормативов
-        if token.text.upper() in LEMMA_STANDARDS:
-            if token.i + 1 < len(doc) and doc[token.i + 1].like_num:
-                result['standards'].append(f"{token.text} {doc[token.i + 1].text}")
+        # Поиск стандартов
+        result['standards'] = self._extract_standards(text)
+
+        # Поиск таблиц
+        result['tables'] = self._extract_tables(text)
+
+        # Поиск формул
+        result['formulas'] = self._extract_formulas(text)
+
+        # Числовые значения
+        result['temperatures'] = self._extract_numeric_values(text, r'[−-]?\d+(?:[.,]\d+)?\s*°[CС]')
+        result['thicknesses'] = self._extract_numeric_values(text, r'\d+(?:[.,]\d+)?\s*мм')
+        result['densities'] = self._extract_numeric_values(text, r'\d+(?:[.,]\d+)?\s*кг/м³')
+        result['speeds'] = self._extract_numeric_values(text, r'\d+(?:[.,]\d+)?\s*м/с')
+        result['flows'] = self._extract_numeric_values(text, r'\d+(?:[.,]\d+)?\s*м³/ч')
+
+        # Преобразуем множества в списки
+        result['materials'] = list(result['materials'])
+        result['structures'] = list(result['structures'])
+        result['parameters'] = list(result['parameters'])
+        result['standards'] = list(set(result['standards']))
+
+        print(f"📊 Найдено материалов: {len(result['materials'])}")
+        print(f"📊 Найдено стандартов: {len(result['standards'])}")
+        print(f"📊 Найдено таблиц: {len(result['tables'])}")
+        print(f"📊 Найдено формул: {len(result['formulas'])}")
+
+        return result
+
+    def _extract_sections(self, text: str) -> Dict[str, str]:
+        """Извлечение разделов документа"""
+        sections = {}
+        patterns = [
+            r'\n(\d+(?:\.\d+)*)\s+([А-ЯЁ][^\n]{5,100})',
+            r'\n(Раздел|Глава|Приложение)\s+(\d+[\.\s]+)([А-ЯЁ][^\n]{5,100})',
+        ]
+
+        for pattern in patterns:
+            for match in re.finditer(pattern, text[:50000]):
+                groups = match.groups()
+                if len(groups) >= 2:
+                    num = groups[0] if groups[0] else groups[1]
+                    title = groups[1] if len(groups) == 2 else groups[2]
+                    if num and title:
+                        sections[num.strip()] = title.strip()[:80]
+
+        return sections
+
+    def _extract_terms(self, doc, text: str) -> Tuple[Set[str], Set[str], Set[str]]:
+        """Извлечение материалов, конструкций и параметров"""
+        materials = set()
+        structures = set()
+        parameters = set()
+
+        # Обработка токенов
+        for token in doc:
+            if token.is_punct or token.is_space:
+                continue
+
+            lemma = token.lemma_.lower()
+            text_orig = token.text
+
+            # Поиск материалов
+            if lemma in self.lemma_materials or text_orig in self.materials_set:
+                materials.add(text_orig)
+
+            # Поиск биграмм
+            if token.i + 1 < len(doc):
+                bigram = f"{token.text} {doc[token.i + 1].text}".lower()
+                if bigram in self.lemma_materials or bigram in self.material_phrases:
+                    materials.add(bigram)
+
+            # Поиск триграмм
+            if token.i + 2 < len(doc):
+                trigram = f"{token.text} {doc[token.i + 1].text} {doc[token.i + 2].text}".lower()
+                if trigram in self.material_phrases:
+                    materials.add(trigram)
+
+            # Поиск конструкций
+            if lemma in self.lemma_structures:
+                structures.add(text_orig)
+
+            # Поиск параметров
+            if lemma in self.lemma_parameters:
+                parameters.add(text_orig)
+
+            # Поиск нормативов
+            if token.text.upper() in self.lemma_standards:
+                if token.i + 1 < len(doc) and doc[token.i + 1].like_num:
+                    pass  # Обработка в _extract_standards
+
+        # Прямой поиск в тексте
+        text_lower = text.lower()
+        for material in self.materials_set:
+            if material in text_lower:
+                materials.add(material)
+
+        for phrase in self.material_phrases:
+            if phrase in text_lower:
+                materials.add(phrase)
+
+        # Поиск по маркерам
+        markers = ['материал', 'покрытие', 'изоляция', 'утеплитель', 'плита', 'мат', 'слой', 'жидкость', 'раствор']
+        for sent in doc.sents:
+            sent_text = sent.text.lower()
+            for marker in markers:
+                if marker in sent_text:
+                    for token in sent:
+                        if token.pos_ == 'NOUN' and len(token.text) > 3:
+                            lemma = token.lemma_.lower()
+                            if lemma in self.lemma_materials:
+                                materials.add(token.text)
+
+        return materials, structures, parameters
+
+    def _extract_standards(self, text: str) -> List[str]:
+        """Извлечение стандартов (ГОСТ, СП, СНиП)"""
+        standards = []
+
+        # По паттернам
+        for pattern in self.standard_patterns:
+            matches = re.findall(pattern, text)
+            standards.extend(matches)
+
+        # По ключевым словам
+        for token in re.findall(r'[А-Я]{2,}\s+\d+[\.\d-]*', text):
+            if any(token.startswith(st) for st in self.standards_types):
+                standards.append(token)
+
+        return list(set(standards))
+
+    def _extract_tables(self, text: str) -> List[Dict]:
+        """Извлечение таблиц из текста"""
+        tables = []
+        lines = text.split('\n')
+        in_table = False
+        table_lines = []
+        table_title = ""
+        table_id = ""
+
+        for i, line in enumerate(lines):
+            # Поиск заголовка таблицы
+            match = re.search(r'(?:Таблица|табл\.?)\s+(\d+)\s*[—\-–]\s*([^\n]+)', line, re.IGNORECASE)
+            if match:
+                table_id = match.group(1)
+                table_title = match.group(2).strip()
+                in_table = True
+                table_lines = []
+                continue
+
+            # Поиск таблицы с разделителями
+            if '|' in line and len(line.split('|')) > 2:
+                if not in_table:
+                    in_table = True
+                    table_lines = []
+                    if i > 0 and len(lines[i - 1].strip()) < 100:
+                        table_title = lines[i - 1].strip()
+                table_lines.append(line.strip())
             else:
-                result['standards'].append(token.text)
+                if in_table and table_lines:
+                    tables.append({
+                        'id': table_id or str(len(tables) + 1),
+                        'title': table_title or f"Таблица {len(tables) + 1}",
+                        'content': '\n'.join(table_lines),
+                        'rows': [l for l in table_lines if l.strip()]
+                    })
+                    table_lines = []
+                    in_table = False
+                    table_title = ""
+                    table_id = ""
 
-    # Поиск стандартов по паттернам
-    for pattern in STANDARD_PATTERNS:
+        # Добавляем последнюю таблицу
+        if in_table and table_lines:
+            tables.append({
+                'id': table_id or str(len(tables) + 1),
+                'title': table_title or f"Таблица {len(tables) + 1}",
+                'content': '\n'.join(table_lines),
+                'rows': [l for l in table_lines if l.strip()]
+            })
+
+        return tables
+
+    def _extract_formulas(self, text: str) -> List[Dict]:
+        """Извлечение формул из текста"""
+        formulas = []
+        seen = set()
+
+        patterns = [
+            r'([A-Za-zА-Яа-я][_\w]*)\s*=\s*([^=;\n]+)',
+            r'(?:формул[аы]|по формуле)\s*[:;]\s*([^;\n]+)',
+            r'\(([^)]*[=+\-*/^][^)]*)\)',
+        ]
+
+        for pattern in patterns:
+            matches = re.findall(pattern, text, re.IGNORECASE | re.MULTILINE)
+            for match in matches:
+                if isinstance(match, tuple):
+                    if len(match) >= 2:
+                        var_part, expr_part = match[0], match[1]
+                    else:
+                        continue
+                else:
+                    var_part = None
+                    expr_part = match
+
+                expr_clean = str(expr_part).strip()
+                expr_clean = re.sub(r'\s+', ' ', expr_clean)
+
+                if len(expr_clean) > 3 and expr_clean not in seen:
+                    seen.add(expr_clean)
+                    variables = re.findall(r'[A-Za-zА-Яа-я][_\w]*', expr_clean)
+                    formulas.append({
+                        'raw': expr_clean,
+                        'variables': list(set(variables)),
+                        'has_operator': any(c in expr_clean for c in ['+', '-', '*', '/', '^', '='])
+                    })
+
+        return formulas
+
+    def _extract_numeric_values(self, text: str, pattern: str) -> List[str]:
+        """Извлечение числовых значений по паттерну"""
         matches = re.findall(pattern, text)
-        for match in matches:
-            if match not in result['standards']:
-                result['standards'].append(match)
+        return list(set(matches))
 
-    # Поиск по фразам
-    for phrase in MATERIAL_PHRASES:
-        if phrase in text.lower():
-            result['materials'].add(phrase)
-            result['materials_lemmas'].add(phrase)
+    def parse_multiple(self, file_paths: List[str]) -> Dict[str, Any]:
+        """Парсинг нескольких файлов"""
+        combined_result = {
+            'files': [],
+            'all_materials': set(),
+            'all_structures': set(),
+            'all_parameters': set(),
+            'all_standards': set(),
+            'all_tables': [],
+            'all_formulas': [],
+            'total_stats': {
+                'files': len(file_paths),
+                'characters': 0,
+                'words': 0,
+                'sentences': 0
+            }
+        }
 
-    # Прямой поиск материалов
-    for material in MATERIALS:
-        if material in text.lower():
-            if material not in result['materials_lemmas']:
-                result['materials'].add(material)
-                result['materials_lemmas'].add(material)
+        for file_path in file_paths:
+            result = self.parse(file_path)
+            if 'error' not in result:
+                combined_result['files'].append(result)
+                combined_result['all_materials'].update(result.get('materials', []))
+                combined_result['all_structures'].update(result.get('structures', []))
+                combined_result['all_parameters'].update(result.get('parameters', []))
+                combined_result['all_standards'].update(result.get('standards', []))
+                combined_result['all_tables'].extend(result.get('tables', []))
+                combined_result['all_formulas'].extend(result.get('formulas', []))
 
-    # Поиск биграмм
-    words = text.lower().split()
-    for i in range(len(words) - 1):
-        bigram = f"{words[i]} {words[i + 1]}"
-        if bigram in LEMMA_MATERIALS or bigram in MATERIAL_PHRASES:
-            result['materials'].add(bigram)
-            result['materials_lemmas'].add(bigram)
+                stats = result.get('stats', {})
+                combined_result['total_stats']['characters'] += stats.get('characters', 0)
+                combined_result['total_stats']['words'] += stats.get('words', 0)
+                combined_result['total_stats']['sentences'] += stats.get('sentences', 0)
 
-    # Поиск по маркерам
-    markers = ['материал', 'покрытие', 'изоляция', 'утеплитель', 'плита', 'мат', 'слой', 'жидкость', 'раствор']
-    for sent in doc.sents:
-        sent_text = sent.text.lower()
-        for marker in markers:
-            if marker in sent_text:
-                for token in sent:
-                    if token.pos_ == 'NOUN' and len(token.text) > 3:
-                        lemma = token.lemma_.lower()
-                        if lemma in LEMMA_MATERIALS and lemma not in result['materials_lemmas']:
-                            result['materials'].add(token.text)
-                            result['materials_lemmas'].add(lemma)
+        # Преобразуем множества в списки
+        combined_result['all_materials'] = list(combined_result['all_materials'])
+        combined_result['all_structures'] = list(combined_result['all_structures'])
+        combined_result['all_parameters'] = list(combined_result['all_parameters'])
+        combined_result['all_standards'] = list(combined_result['all_standards'])
 
-    # Поиск материалов в контексте
-    for sent in doc.sents:
-        sent_text = sent.text.lower()
-        for material in MATERIALS:
-            if material in sent_text and material not in result['materials']:
-                result['materials'].add(material)
-                result['materials_lemmas'].add(material)
-
-    # Числовые значения
-    temp_pattern = r'[−-]?\d+(?:[.,]\d+)?\s*°[CС]'
-    result['temperatures'] = list(set(re.findall(temp_pattern, text)))
-
-    thick_pattern = r'\d+(?:[.,]\d+)?\s*мм'
-    result['thicknesses'] = list(set(re.findall(thick_pattern, text)))
-
-    density_pattern = r'\d+(?:[.,]\d+)?\s*кг/м³'
-    result['densities'] = list(set(re.findall(density_pattern, text)))
-
-    speed_pattern = r'\d+(?:[.,]\d+)?\s*м/с'
-    result['speeds'] = list(set(re.findall(speed_pattern, text)))
-
-    flow_pattern = r'\d+(?:[.,]\d+)?\s*м³/ч'
-    result['flows'] = list(set(re.findall(flow_pattern, text)))
-
-    # Преобразуем множества в списки
-    result['materials'] = list(result['materials'])
-    result['structures'] = list(result['structures'])
-    result['parameters'] = list(result['parameters'])
-    result['standards'] = list(set(result['standards']))
-
-    print(f"📊 Найдено материалов (лемм): {len(result['materials_lemmas'])}")
-    print(f"📊 Найдено нормативов: {len(result['standards'])}")
-    return result
-
-def save_to_json(result, output_file):
+        return combined_result
+# УТИЛИТНЫЕ ФУНКЦИИ
+def save_to_json(result: Dict, output_file: Path):
+    """Сохранение результатов парсинга в JSON"""
+    output_file.parent.mkdir(parents=True, exist_ok=True)
     with open(output_file, 'w', encoding='utf-8') as f:
         json.dump(result, f, ensure_ascii=False, indent=2, default=str)
     print(f"💾 Результат сохранен в {output_file}")
+def load_from_json(input_file: Path) -> Dict:
+    """Загрузка результатов парсинга из JSON"""
+    with open(input_file, 'r', encoding='utf-8') as f:
+        return json.load(f)
