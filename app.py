@@ -1,14 +1,3 @@
-# -*- coding: utf-8 -*-
-"""
-Инженерный чат-бот для работы с документацией.
-Интегрирует:
-- QASystem для поиска по документам
-- FormulaEngine для инженерных расчётов
-- AgentLoop для многошаговых рассуждений
-- ErrorHandler для обработки ошибок
-- Экспорт в DOCX и PDF
-"""
-
 import streamlit as st
 from pathlib import Path
 import sys
@@ -25,8 +14,6 @@ from utils.config import RAW_DIR, PROCESSED_DIR
 from core.error_handler import ErrorHandler
 from core.prompts import get_quick_definition
 
-# ========== НАСТРОЙКА СТРАНИЦЫ ==========
-
 st.set_page_config(
     page_title="Инженерный чат-бот",
     page_icon="🏗️",
@@ -37,7 +24,7 @@ st.set_page_config(
 HISTORY_FILE = PROCESSED_DIR / "chat_history.json"
 
 
-# ========== ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ==========
+# ========= ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ =========
 
 def run_async_safely(async_func, *args, **kwargs):
     """Безопасный запуск асинхронной функции в Streamlit"""
@@ -53,9 +40,7 @@ def run_async_safely(async_func, *args, **kwargs):
 
 
 def call_maybe_async(func, *args, **kwargs):
-    """
-    Универсальный вызов функции - работает и с синхронными, и с асинхронными функциями.
-    """
+    """Универсальный вызов sync/async функции"""
     result = func(*args, **kwargs)
     if asyncio.iscoroutine(result):
         return run_async_safely(lambda: result)
@@ -63,17 +48,11 @@ def call_maybe_async(func, *args, **kwargs):
 
 
 def get_initial_message():
-    """Начальное сообщение бота"""
     return [{
         "role": "assistant",
         "content": """🏗️ **Здравствуйте!** Я инженерный помощник по строительной документации.
 
-📖 **База знаний (152 документа):** 
-• ГОСТы (строительные стандарты)
-• СП (Своды правил) 
-• МСН, МСП (межгосударственные нормы)
-• Технические регламенты
-• Методические рекомендации
+📖 **База знаний:** ГОСТы, СП, технические регламенты и методические документы по строительству
 
 **Что я умею:**
 • 📖 Отвечать на вопросы по нормативной документации
@@ -87,29 +66,29 @@ def get_initial_message():
     }]
 
 
-# ========== ИНИЦИАЛИЗАЦИЯ ==========
+# ========= ИНИЦИАЛИЗАЦИЯ =========
 
 def init_session_state():
     """Инициализация состояния сессии"""
-    if 'qa_system' not in st.session_state:
+    if "qa_system" not in st.session_state:
         st.session_state.qa_system = QASystem(use_llm=False)
         idx_path = PROCESSED_DIR / "qa_index"
         if idx_path.exists():
             st.session_state.qa_system.load_index(idx_path)
 
-    if 'formula_engine' not in st.session_state:
+    if "formula_engine" not in st.session_state:
         st.session_state.formula_engine = FormulaEngine(st.session_state.qa_system)
 
-    if 'agent_loop' not in st.session_state:
+    if "agent_loop" not in st.session_state:
         st.session_state.agent_loop = AgentLoop(
             st.session_state.qa_system,
             st.session_state.formula_engine
         )
 
-    if 'error_handler' not in st.session_state:
+    if "error_handler" not in st.session_state:
         st.session_state.error_handler = ErrorHandler(log_level="info")
 
-    if 'messages' not in st.session_state:
+    if "messages" not in st.session_state:
         if HISTORY_FILE.exists():
             try:
                 with open(HISTORY_FILE, "r", encoding="utf-8") as f:
@@ -119,20 +98,23 @@ def init_session_state():
         else:
             st.session_state.messages = get_initial_message()
 
-    if 'current_answer' not in st.session_state:
+    if "current_answer" not in st.session_state:
         st.session_state.current_answer = ""
-    if 'current_sources' not in st.session_state:
+    if "current_sources" not in st.session_state:
         st.session_state.current_sources = []
-    if 'current_tables' not in st.session_state:
+    if "current_tables" not in st.session_state:
         st.session_state.current_tables = []
-    if 'current_formulas' not in st.session_state:
+    if "current_formulas" not in st.session_state:
         st.session_state.current_formulas = []
 
+    # ВАЖНО: уникальный id текущего ответа
+    if "current_response_id" not in st.session_state:
+        st.session_state.current_response_id = 0
 
-# ========== ФУНКЦИИ ЭКСПОРТА ==========
 
-def export_to_docx(answer: str, sources: list, tables: list = None, formulas: list = None,
-                   filename: str = None):
+# ========= ФУНКЦИИ ЭКСПОРТА =========
+
+def export_to_docx(answer: str, sources: list, tables: list = None, formulas: list = None, filename: str = None):
     """Экспорт в DOCX"""
     if filename is None:
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -144,45 +126,45 @@ def export_to_docx(answer: str, sources: list, tables: list = None, formulas: li
 
         doc = Document()
 
-        title = doc.add_heading('Инженерный отчёт', 0)
+        title = doc.add_heading("Инженерный отчёт", 0)
         title.alignment = WD_ALIGN_PARAGRAPH.CENTER
 
         doc.add_paragraph(f"Дата: {datetime.now().strftime('%d.%m.%Y %H:%M')}")
         doc.add_paragraph()
 
-        doc.add_heading('Ответ', level=1)
+        doc.add_heading("Ответ", level=1)
         doc.add_paragraph(answer)
 
         if tables:
-            doc.add_heading('Таблицы', level=1)
+            doc.add_heading("Таблицы", level=1)
             for table in tables[:2]:
-                doc.add_paragraph(f"{table.get('title', 'Таблица')}")
-                content = table.get('content', '')
-                doc.add_paragraph(content)
-                doc.add_paragraph()
+                if isinstance(table, dict):
+                    doc.add_paragraph(table.get("title", "Таблица"))
+                    doc.add_paragraph(table.get("content", ""))
+                    doc.add_paragraph()
 
         if formulas:
-            doc.add_heading('Формулы', level=1)
+            doc.add_heading("Формулы", level=1)
             for formula in formulas[:3]:
                 if isinstance(formula, dict):
-                    raw = formula.get('raw') or formula.get('expression') or formula.get('name', '')
+                    raw = formula.get("raw") or formula.get("expression") or formula.get("name", "")
                     doc.add_paragraph(f"`{raw}`")
-                    if formula.get('variables'):
+                    if formula.get("variables"):
                         doc.add_paragraph(f"Переменные: {', '.join(formula['variables'][:5])}")
                 else:
                     doc.add_paragraph(str(formula))
                 doc.add_paragraph()
 
         if sources:
-            doc.add_heading('Источники', level=1)
+            doc.add_heading("Источники", level=1)
             for src in sources:
                 if isinstance(src, dict):
-                    doc.add_paragraph(src.get('doc_name', 'Документ'), style='List Bullet')
+                    doc.add_paragraph(src.get("doc_name", "Документ"), style="List Bullet")
                 else:
-                    doc.add_paragraph(str(src), style='List Bullet')
+                    doc.add_paragraph(str(src), style="List Bullet")
 
         doc.add_paragraph()
-        doc.add_paragraph('Отчёт сгенерирован автоматически', style='Intense Quote')
+        doc.add_paragraph("Отчёт сгенерирован автоматически", style="Intense Quote")
 
         output_path = PROCESSED_DIR / filename
         output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -198,8 +180,7 @@ def export_to_docx(answer: str, sources: list, tables: list = None, formulas: li
         return None
 
 
-def export_to_pdf(answer: str, sources: list, tables: list = None, formulas: list = None,
-                  filename: str = None):
+def export_to_pdf(answer: str, sources: list, tables: list = None, formulas: list = None, filename: str = None):
     """Экспорт в PDF"""
     if filename is None:
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -254,6 +235,7 @@ def export_to_pdf(answer: str, sources: list, tables: list = None, formulas: lis
             if line.strip():
                 clean_line = line.replace("**", "").replace("*", "")
                 story.append(Paragraph(clean_line, normal_style))
+
         story.append(Spacer(1, 0.2 * inch))
 
         if sources:
@@ -275,38 +257,20 @@ def export_to_pdf(answer: str, sources: list, tables: list = None, formulas: lis
         return None
 
 
-def export_history_to_docx():
-    """Экспорт всей истории в DOCX"""
-    try:
-        from docx import Document
+def render_export_buttons(answer, sources, tables, formulas, key_suffix="current", response_id=None):
+    """
+    Отображение кнопок экспорта.
+    Все widget keys теперь уникальны.
+    """
+    if response_id is None:
+        response_id = st.session_state.get("current_response_id", 0)
 
-        doc = Document()
-        doc.add_heading("Инженерный чат-бот - История", 0)
-        doc.add_paragraph(f"Дата: {datetime.now().strftime('%d.%m.%Y %H:%M')}")
-        doc.add_paragraph()
+    widget_id = f"{key_suffix}_{response_id}"
 
-        for msg in st.session_state.messages:
-            role = "Пользователь" if msg["role"] == "user" else "Ассистент"
-            doc.add_heading(role, level=1)
-            doc.add_paragraph(msg["content"])
-            doc.add_paragraph()
-
-        output_path = PROCESSED_DIR / f"chat_history_{datetime.now().strftime('%Y%m%d_%H%M%S')}.docx"
-        output_path.parent.mkdir(parents=True, exist_ok=True)
-        doc.save(str(output_path))
-        return output_path
-
-    except Exception as e:
-        st.error(f"❌ Ошибка: {e}")
-        return None
-
-
-def render_export_buttons(answer, sources, tables, formulas, key_suffix="current"):
-    """Отображение кнопок экспорта"""
     col1, col2, col3 = st.columns(3)
 
     with col1:
-        if st.button("📄 Экспорт DOCX", key=f"export_docx_{key_suffix}"):
+        if st.button("📄 Экспорт DOCX", key=f"export_docx_{widget_id}"):
             docx_path = export_to_docx(answer, sources, tables, formulas)
             if docx_path and docx_path.exists():
                 with open(docx_path, "rb") as f:
@@ -315,11 +279,11 @@ def render_export_buttons(answer, sources, tables, formulas, key_suffix="current
                         data=f.read(),
                         file_name=docx_path.name,
                         mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-                        key=f"download_docx_{key_suffix}"
+                        key=f"download_docx_{widget_id}"
                     )
 
     with col2:
-        if st.button("📄 Экспорт PDF", key=f"export_pdf_{key_suffix}"):
+        if st.button("📄 Экспорт PDF", key=f"export_pdf_{widget_id}"):
             pdf_path = export_to_pdf(answer, sources, tables, formulas)
             if pdf_path and pdf_path.exists():
                 with open(pdf_path, "rb") as f:
@@ -328,16 +292,16 @@ def render_export_buttons(answer, sources, tables, formulas, key_suffix="current
                         data=f.read(),
                         file_name=pdf_path.name,
                         mime="application/pdf",
-                        key=f"download_pdf_{key_suffix}"
+                        key=f"download_pdf_{widget_id}"
                     )
 
     with col3:
-        if st.button("📋 Копировать", key=f"copy_{key_suffix}"):
+        if st.button("📋 Копировать", key=f"copy_{widget_id}"):
             st.code(answer, language="text")
             st.success("✅ Текст скопирован!")
 
 
-# ========== АВТОЗАГРУЗКА ДОКУМЕНТОВ ==========
+# ========= АВТОЗАГРУЗКА ДОКУМЕНТОВ =========
 
 def auto_load_documents():
     """Автоматическая загрузка и индексация документов"""
@@ -384,10 +348,9 @@ def auto_load_documents():
     return True
 
 
-# ========== ОСНОВНОЙ ИНТЕРФЕЙС ==========
+# ========= ОСНОВНОЙ ИНТЕРФЕЙС =========
 
 def main():
-    """Основная функция приложения"""
     init_session_state()
 
     qa_system = st.session_state.qa_system
@@ -396,9 +359,9 @@ def main():
     error_handler = st.session_state.error_handler
 
     st.title("🏗️ Инженерный помощник проектировщика")
-    st.caption("📄 База: СП 61.13330 (Изоляция), СП 131.13330 (Климатология), СП 60.13330 (ОВК)")
+    st.caption("📄 База знаний: ГОСТы, СП, технические регламенты и методические документы по строительству")
 
-    # ========== SIDEBAR ==========
+    # ========= SIDEBAR =========
     with st.sidebar:
         st.header("📚 О системе")
         st.markdown("""
@@ -486,7 +449,7 @@ def main():
                 for i, err in enumerate(error_handler.errors[-5:]):
                     st.error(f"{i + 1}. {err.get('type', 'Error')}: {err.get('message', '')[:100]}")
 
-    # ========== ОТОБРАЖЕНИЕ СООБЩЕНИЙ ==========
+    # ========= ОТОБРАЖЕНИЕ СООБЩЕНИЙ =========
     for message in st.session_state.messages:
         with st.chat_message(message["role"]):
             st.markdown(message["content"])
@@ -498,10 +461,11 @@ def main():
                         st.session_state.current_sources,
                         st.session_state.current_tables,
                         st.session_state.current_formulas,
-                        key_suffix="last"
+                        key_suffix="last",
+                        response_id=st.session_state.current_response_id
                     )
 
-    # ========== ОБРАБОТКА ВОПРОСА ==========
+    # ========= ОБРАБОТКА ВОПРОСА =========
     if prompt := st.chat_input("Задайте вопрос по строительной документации...", key="main_chat_input"):
         st.session_state.messages.append({"role": "user", "content": prompt})
 
@@ -535,7 +499,6 @@ def main():
 
                     if is_calc:
                         # === РАСЧЁТНЫЙ ЗАПРОС ===
-                        # Универсальный вызов для sync/async
                         result = call_maybe_async(formula_engine.answer_calculation, prompt)
                         response = result.get("answer", "Не удалось выполнить расчёт")
                         sources = result.get("sources", [])
@@ -609,6 +572,10 @@ def main():
                             else:
                                 st.markdown(agent_loop.get_reasoning_chain())
 
+                    # Новый уникальный id ответа
+                    st.session_state.current_response_id += 1
+                    current_id = st.session_state.current_response_id
+
                     # Сохраняем для экспорта
                     st.session_state.current_answer = response
                     st.session_state.current_sources = sources
@@ -622,7 +589,8 @@ def main():
                         sources,
                         tables,
                         formulas,
-                        key_suffix="current"
+                        key_suffix="current",
+                        response_id=current_id
                     )
 
                 except Exception as e:
@@ -636,7 +604,7 @@ def main():
         with open(HISTORY_FILE, "w", encoding="utf-8") as f:
             json.dump(st.session_state.messages, f, ensure_ascii=False, indent=2)
 
-    # ========== FOOTER ==========
+    # ========= FOOTER =========
     st.divider()
     st.caption("💡 Совет: для расчетов указывайте числа и параметры прямо в вопросе")
     st.caption("📧 По всем вопросам обращайтесь к разработчику")

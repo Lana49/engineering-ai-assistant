@@ -1,19 +1,36 @@
-streamlit>=1.55.0
-spacy>=3.8.0
+# Core
+streamlit>=1.28.0
+numpy>=1.24.0
+pandas>=2.0.0
+
+# ML & Embeddings
 sentence-transformers>=2.2.0
 faiss-cpu>=1.7.0
-networkx>=3.0
-matplotlib>=3.5
-plotly>=5.10
+rank-bm25>=0.2.2
+huggingface-hub>=0.20.0
+torch>=2.0.0
+transformers>=4.30.0
+datasets>=2.12.0
+
+# Document parsing
 python-docx>=0.8.11
-pandas>=2.0
-numpy>=1.24
-striprtf
-huggingface_hub
-datasets
-torch
-transformers
-pymupdf
-pdfplumber
-rank-bm25
-altair
+pymupdf>=1.23.0
+striprtf>=0.0.26
+pdfplumber>=0.10.0
+openpyxl>=3.1.0
+docx2txt>=0.8
+camelot-py>=0.11.0
+tabula-py>=2.9.0
+pypandoc>=1.11
+
+# Export
+reportlab>=4.0.0
+
+# NLP
+spacy>=3.8.0
+
+# Visualization
+altair>=5.0.0
+matplotlib>=3.5.0
+plotly>=5.10.0
+networkx>=3.0
