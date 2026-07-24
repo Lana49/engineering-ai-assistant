@@ -6,9 +6,6 @@ from datetime import datetime
 import asyncio
 import os
 
-print(f"Текущая директория: {os.getcwd()}")
-print(f"Права на запись в data/processed: {os.access('data/processed', os.W_OK)}")
-
 sys.path.insert(0, str(Path(__file__).parent))
 
 from core.qa_engine import QASystem
@@ -17,6 +14,15 @@ from core.agent_loop import AgentLoop
 from utils.config import RAW_DIR, PROCESSED_DIR
 from core.error_handler import ErrorHandler
 from core.prompts import get_quick_definition
+from core.table_extractor import patch_qa_system_with_table_extractor
+from core.table_calculator import TableCalculator
+
+# Применяем патч для таблиц
+try:
+    patch_qa_system_with_table_extractor()
+    print("✅ TableExtractor применён")
+except Exception as e:
+    print(f"⚠️ Не удалось применить TableExtractor: {e}")
 
 st.set_page_config(
     page_title="Инженерный чат-бот",
@@ -146,7 +152,6 @@ def init_session_state():
     if "current_formulas" not in st.session_state:
         st.session_state.current_formulas = []
 
-    # ВАЖНО: уникальный id текущего ответа
     if "current_response_id" not in st.session_state:
         st.session_state.current_response_id = 0
 
@@ -298,46 +303,75 @@ def export_to_pdf(answer: str, sources: list, tables: list = None, formulas: lis
 
 def render_export_buttons(answer, sources, tables, formulas, key_suffix="current", response_id=None):
     """
-    Отображение кнопок экспорта.
-    Все widget keys теперь уникальны.
+    Отображение кнопок экспорта с ГАРАНТИРОВАННО уникальными ключами.
     """
     if response_id is None:
         response_id = st.session_state.get("current_response_id", 0)
 
-    widget_id = f"{key_suffix}_{response_id}"
+    import time
+    import random
+
+    if "export_button_counter" not in st.session_state:
+        st.session_state.export_button_counter = 0
+    st.session_state.export_button_counter += 1
+
+    unique_id = (
+        f"{key_suffix}_"
+        f"{response_id}_"
+        f"{int(time.time() * 1000)}_"
+        f"{st.session_state.export_button_counter}_"
+        f"{random.randint(1000, 9999)}"
+    )
 
     col1, col2, col3 = st.columns(3)
 
     with col1:
-        if st.button("📄 Экспорт DOCX", key=f"export_docx_{widget_id}"):
-            docx_path = export_to_docx(answer, sources, tables, formulas)
-            if docx_path and docx_path.exists():
-                with open(docx_path, "rb") as f:
-                    st.download_button(
-                        label="📥 Скачать DOCX",
-                        data=f.read(),
-                        file_name=docx_path.name,
-                        mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-                        key=f"download_docx_{widget_id}"
-                    )
+        if st.button("📄 Экспорт DOCX", key=f"export_docx_{unique_id}"):
+            with st.spinner("Создание DOCX..."):
+                docx_path = export_to_docx(answer, sources, tables, formulas)
+                if docx_path and docx_path.exists():
+                    with open(docx_path, "rb") as f:
+                        st.download_button(
+                            label="📥 Скачать DOCX",
+                            data=f.read(),
+                            file_name=docx_path.name,
+                            mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                            key=f"download_docx_{unique_id}"
+                        )
+                else:
+                    st.error("❌ Ошибка создания DOCX")
 
     with col2:
-        if st.button("📄 Экспорт PDF", key=f"export_pdf_{widget_id}"):
-            pdf_path = export_to_pdf(answer, sources, tables, formulas)
-            if pdf_path and pdf_path.exists():
-                with open(pdf_path, "rb") as f:
-                    st.download_button(
-                        label="📥 Скачать PDF",
-                        data=f.read(),
-                        file_name=pdf_path.name,
-                        mime="application/pdf",
-                        key=f"download_pdf_{widget_id}"
-                    )
+        if st.button("📄 Экспорт PDF", key=f"export_pdf_{unique_id}"):
+            with st.spinner("Создание PDF..."):
+                pdf_path = export_to_pdf(answer, sources, tables, formulas)
+                if pdf_path and pdf_path.exists():
+                    with open(pdf_path, "rb") as f:
+                        st.download_button(
+                            label="📥 Скачать PDF",
+                            data=f.read(),
+                            file_name=pdf_path.name,
+                            mime="application/pdf",
+                            key=f"download_pdf_{unique_id}"
+                        )
+                else:
+                    st.error("❌ Ошибка создания PDF")
 
     with col3:
-        if st.button("📋 Копировать", key=f"copy_{widget_id}"):
-            st.code(answer, language="text")
-            st.success("✅ Текст скопирован!")
+        if st.button("📋 Копировать", key=f"copy_{unique_id}"):
+            import html
+            escaped_answer = html.escape(answer)
+            st.markdown(f"""
+            <script>
+            (function() {{
+                const text = `{escaped_answer}`;
+                navigator.clipboard.writeText(text).then(() => {{
+                    console.log('✅ Скопировано!');
+                }});
+            }})();
+            </script>
+            """, unsafe_allow_html=True)
+            st.success("✅ Текст скопирован в буфер обмена!")
 
 
 # ========= АВТОЗАГРУЗКА ДОКУМЕНТОВ =========
@@ -347,18 +381,15 @@ def auto_load_documents():
     qa_system = st.session_state.qa_system
     idx_path = PROCESSED_DIR / "qa_index"
 
-    # === СНАЧАЛА ПРОВЕРЯЕМ ГОТОВНОСТЬ ===
     if qa_system.is_ready and qa_system.index is not None:
         st.sidebar.success(f"✅ База знаний готова\n📄 {qa_system.index.ntotal} фрагментов")
         return True
 
-    # === ПЫТАЕМСЯ ЗАГРУЗИТЬ ===
     if idx_path.exists():
         if qa_system.load_index(idx_path):
             st.sidebar.success(f"✅ Индекс загружен\n📄 {qa_system.index.ntotal} фрагментов")
             return True
 
-    # === ЕСЛИ НЕТ - СОЗДАЁМ ===
     docs = list(RAW_DIR.glob("*.docx")) + list(RAW_DIR.glob("*.pdf")) + list(RAW_DIR.glob("*.rtf"))
 
     if not docs:
@@ -423,7 +454,6 @@ def main():
         auto_load_documents()
         st.divider()
 
-        # Кнопки управления индексом
         col1, col2 = st.columns(2)
         with col1:
             if st.button("🔄 Перезагрузить индекс", use_container_width=True):
@@ -560,12 +590,86 @@ def main():
                         "что это", "как понимать", "объясните", "поясните"
                     ]
                     table_triggers = ["таблиц", "табл", "покажи таблиц", "выведи таблиц"]
+                    calc_from_table_triggers = [
+                        "по таблице", "из таблицы", "на основе таблицы",
+                        "используя таблицу", "с помощью таблицы"
+                    ]
 
                     is_calc = any(w in prompt_lower for w in calc_triggers)
                     is_def = any(w in prompt_lower for w in def_triggers)
                     is_table = any(w in prompt_lower for w in table_triggers)
+                    is_calc_from_table = any(w in prompt_lower for w in calc_from_table_triggers)
 
-                    if is_calc:
+                    if is_calc_from_table:
+                        # === РАСЧЁТ НА ОСНОВЕ ТАБЛИЦЫ ===
+                        calc = TableCalculator(qa_system)
+
+                        cities = ['москва', 'санкт-петербург', 'новосибирск', 'екатеринбург',
+                                  'казань', 'нижний новгород', 'челябинск', 'омск', 'самара',
+                                  'ростов-на-дону', 'уфа', 'красноярск', 'пермь', 'воронеж',
+                                  'волгоград', 'краснодар', 'сочи', 'владивосток', 'иркутск']
+
+                        found_city = None
+                        for city in cities:
+                            if city in prompt_lower:
+                                found_city = city
+                                break
+
+                        if not found_city:
+                            response = (
+                                "⚠️ Не удалось определить город в запросе.\n\n"
+                                "Поддерживаемые города: Москва, Санкт-Петербург, Новосибирск, "
+                                "Екатеринбург, Казань, Нижний Новгород, Челябинск, Омск, Самара, "
+                                "Уфа, Красноярск, Пермь, Воронеж, Волгоград, Краснодар, Сочи\n\n"
+                                "Примеры:\n"
+                                "- «Рассчитай ГСОП для Москвы по таблице»\n"
+                                "- «Найди в таблице климат для Новосибирска и посчитай ГСОП»"
+                            )
+                        else:
+                            if "вентиляц" in prompt_lower or "расход теплоты" in prompt_lower:
+                                import re
+                                flow_match = re.search(r'(\d+[.,]?\d*)\s*м³/ч', prompt_lower)
+                                if not flow_match:
+                                    flow_match = re.search(r'расход\s*(\d+[.,]?\d*)', prompt_lower)
+                                if flow_match:
+                                    air_flow = float(flow_match.group(1).replace(',', '.'))
+                                    result = calc.calculate_ventilation_from_table(found_city, air_flow)
+                                    response = result['answer']
+                                    sources = [{'doc_name': result.get('source', 'Таблица')}]
+                                else:
+                                    response = (
+                                        f"⚠️ Для расчёта вентиляции укажите расход воздуха (м³/ч)\n\n"
+                                        f"Пример: «Рассчитай вентиляцию для {found_city.title()} с расходом 1000 м³/ч по таблице»"
+                                    )
+                            elif "теплопотер" in prompt_lower:
+                                import re
+                                area_match = re.search(r'площадь\s*(\d+[.,]?\d*)', prompt_lower)
+                                res_match = re.search(r'сопротивление\s*(\d+[.,]?\d*)', prompt_lower)
+                                if not area_match:
+                                    area_match = re.search(r'A\s*=\s*(\d+[.,]?\d*)', prompt_lower)
+                                if not res_match:
+                                    res_match = re.search(r'R\s*=\s*(\d+[.,]?\d*)', prompt_lower)
+                                if area_match and res_match:
+                                    area = float(area_match.group(1).replace(',', '.'))
+                                    resistance = float(res_match.group(1).replace(',', '.'))
+                                    result = calc.calculate_heat_loss_from_table(found_city, area, resistance)
+                                    response = result['answer']
+                                    sources = [{'doc_name': result.get('source', 'Таблица')}]
+                                else:
+                                    response = (
+                                        f"⚠️ Для расчёта теплопотерь укажите:\n"
+                                        f"- площадь (м²)\n"
+                                        f"- сопротивление теплопередаче (м²·°C/Вт)\n\n"
+                                        f"Пример: «Рассчитай теплопотери для {found_city.title()} с площадью 100 м² и сопротивлением 2.5 по таблице»"
+                                    )
+                            else:
+                                result = calc.calculate_gsop_from_table(found_city)
+                                response = result['answer']
+                                sources = [{'doc_name': result.get('source', 'Таблица')}]
+                                if result.get('table'):
+                                    tables = [result['table'].to_dict()]
+
+                    elif is_calc:
                         # === РАСЧЁТНЫЙ ЗАПРОС ===
                         result = call_maybe_async(formula_engine.answer_calculation, prompt)
                         response = result.get("answer", "Не удалось выполнить расчёт")
@@ -613,11 +717,23 @@ def main():
                         if tables:
                             response += "\n\n📊 **Найденные таблицы:**\n"
                             for table in tables[:2]:
-                                response += f"\n**{table.get('title', 'Таблица')}**\n"
-                                content = table.get("content", "")
-                                if len(content) > 500:
-                                    content = content[:500] + "..."
-                                response += f"```\n{content}\n```\n"
+                                if isinstance(table, dict):
+                                    title = table.get("title", "Таблица")
+                                    headers = table.get("headers", [])
+                                    rows = table.get("rows", [])
+                                    response += f"\n**{title}**\n"
+                                    if headers:
+                                        response += "| " + " | ".join(headers[:6]) + " |\n"
+                                        response += "| " + " | ".join(["---"] * len(headers[:6])) + " |\n"
+                                        for row in rows[:5]:
+                                            padded = row + [""] * (len(headers[:6]) - len(row))
+                                            response += "| " + " | ".join(
+                                                str(cell).strip()[:30] for cell in padded[:6]) + " |\n"
+                                    else:
+                                        for row in rows[:5]:
+                                            response += f"- " + " | ".join(row) + "\n"
+                                    if len(rows) > 5:
+                                        response += f"*... и ещё {len(rows) - 5} строк*\n"
 
                     else:
                         # === АГЕНТСКИЙ ЦИКЛ ДЛЯ СЛОЖНЫХ ЗАПРОСОВ ===
@@ -635,8 +751,8 @@ def main():
                     # Показываем цепочку рассуждений
                     with st.sidebar:
                         with st.expander("🔍 Показать цепочку рассуждений"):
-                            if is_calc:
-                                st.markdown(formula_engine.get_reasoning_chain())
+                            if is_calc or is_calc_from_table:
+                                st.markdown("✅ Расчёт выполнен на основе данных из таблицы")
                             else:
                                 st.markdown(agent_loop.get_reasoning_chain())
 
@@ -671,6 +787,7 @@ def main():
         HISTORY_FILE.parent.mkdir(parents=True, exist_ok=True)
         with open(HISTORY_FILE, "w", encoding="utf-8") as f:
             json.dump(st.session_state.messages, f, ensure_ascii=False, indent=2)
+
     # ========= FOOTER =========
     st.divider()
     st.caption("💡 Совет: для расчетов указывайте числа и параметры прямо в вопросе")
