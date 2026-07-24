@@ -1,8 +1,7 @@
-# -*- coding: utf-8 -*-
+# core/formula_engine.py
 """
-Интеллектуальный движок для инженерных расчетов.
-Без eval - безопасные методы расчёта.
-Данные извлекаются из документов через QASystem.
+Движок инженерных расчётов.
+
 Поддерживает:
 - ГСОП (градусо-сутки отопительного периода)
 - Расход теплоты на вентиляцию
@@ -12,15 +11,31 @@
 - Удельный тепловой поток
 """
 
-import re
+from __future__ import annotations
+
 import json
-from typing import Dict, List, Optional, Any
+import re
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any, Dict, List, Optional
+
+
+@dataclass
+class CalculationResult:
+    """Структура результата расчёта."""
+    answer: str
+    sources: List[Dict[str, Any]]
+    formulas: List[Dict[str, Any]]
+    tables: List[Dict[str, Any]]
+    confidence: float = 0.0
+    needs_clarification: bool = False
+    questions: Optional[List[str]] = None
+    query_type: str = "calculation"
 
 
 @dataclass
 class ReasoningStep:
+    """Шаг цепочки рассуждений."""
     step_id: int
     description: str
     result: Any = None
@@ -29,6 +44,7 @@ class ReasoningStep:
 
 @dataclass
 class Material:
+    """Материал с теплофизическими свойствами."""
     name: str
     lambda_value: float
     density: float = 0.0
@@ -38,6 +54,7 @@ class Material:
 
 @dataclass
 class CityClimate:
+    """Климатические данные города."""
     name: str
     t_ot: float
     z_ot: int
@@ -45,28 +62,22 @@ class CityClimate:
     source: str = "Извлечено из документов"
 
 
-@dataclass
-class ExtractedParameter:
-    name: str
-    value: float
-    unit: str
-    source: str
-    confidence: float = 0.9
-
-
 class FormulaEngine:
     """
     Безопасный движок инженерных расчётов без eval.
+    Совместим с async/await интерфейсом.
     """
 
     def __init__(self, qa_system=None):
         self.qa_system = qa_system
+
+        # Инициализация всех атрибутов в __init__
         self.reasoning_steps: List[str] = []
-        self.extracted_params: Dict[str, ExtractedParameter] = {}
         self.materials: Dict[str, Material] = {}
         self.cities: Dict[str, CityClimate] = {}
         self._material_cache: Dict[str, Material] = {}
         self._city_cache: Dict[str, CityClimate] = {}
+        self._table_calculator = None
         self._on_city_not_found = None
         self._on_material_not_found = None
 
@@ -76,10 +87,20 @@ class FormulaEngine:
         # База формул с хендлерами
         self.formulas = self._init_formulas()
 
+        # Список городов для поиска
+        self.city_list = [
+            "москва", "санкт-петербург", "новосибирск", "екатеринбург",
+            "казань", "нижний новгород", "челябинск", "омск", "самара",
+            "ростов-на-дону", "уфа", "красноярск", "пермь", "воронеж",
+            "волгоград", "краснодар", "тюмень", "иркутск", "барнаул",
+            "владивосток", "хабаровск", "томск", "ярославль", "ижевск",
+            "сочи", "астрахань", "тверь", "тула"
+        ]
+
     # ========== ИНИЦИАЛИЗАЦИЯ ФОРМУЛ ==========
 
     def _init_formulas(self) -> Dict[str, Dict]:
-        """База формул с безопасными хендлерами"""
+        """База формул с безопасными хендлерами."""
         return {
             "gsop": {
                 "id": "gsop",
@@ -185,12 +206,15 @@ class FormulaEngine:
 
     # ========== КЭШИРОВАНИЕ ==========
 
-    def _get_cache_path(self) -> Path:
+    @staticmethod
+    def _get_cache_path() -> Path:
+        """Возвращает путь к файлу кэша."""
         cache_dir = Path("cache")
         cache_dir.mkdir(exist_ok=True)
         return cache_dir / "formula_engine_cache.json"
 
-    def _load_cache(self):
+    def _load_cache(self) -> None:
+        """Загружает кэш из файла."""
         cache_path = self._get_cache_path()
         if not cache_path.exists():
             return
@@ -219,10 +243,11 @@ class FormulaEngine:
                 )
                 self._city_cache[key] = self.cities[key]
 
-        except Exception as e:
+        except (json.JSONDecodeError, KeyError, ValueError) as e:
             print(f"⚠️ Ошибка загрузки кэша: {e}")
 
-    def _save_cache(self):
+    def _save_cache(self) -> None:
+        """Сохраняет кэш в файл."""
         try:
             cache_path = self._get_cache_path()
 
@@ -250,12 +275,14 @@ class FormulaEngine:
             with open(cache_path, 'w', encoding='utf-8') as f:
                 json.dump(data, f, ensure_ascii=False, indent=2)
 
-        except Exception as e:
+        except (json.JSONDecodeError, OSError) as e:
             print(f"⚠️ Ошибка сохранения кэша: {e}")
 
-    # ========== ИЗВЛЕЧЕНИЕ ДАННЫХ ИЗ ДОКУМЕНТОВ ==========
+    # ========== ИЗВЛЕЧЕНИЕ ДАННЫХ ==========
 
-    def _extract_value(self, text: str, patterns: List[str], convert=float):
+    @staticmethod
+    def _extract_value(text: str, patterns: List[str], convert=float):
+        """Извлекает значение из текста по паттернам."""
         for pattern in patterns:
             match = re.search(pattern, text, re.IGNORECASE)
             if match:
@@ -266,230 +293,258 @@ class FormulaEngine:
                     continue
         return None
 
-    async def _get_city_data(self, city_name: str) -> Optional[CityClimate]:
-        if not city_name:
-            return None
+    def _extract_city_from_text(self, text: str) -> Optional[str]:
+        """Извлекает название города из текста."""
+        text_lower = text.lower()
+        for city in sorted(self.city_list, key=len, reverse=True):
+            if city in text_lower:
+                return city
+        return None
 
-        if city_name in self._city_cache:
-            return self._city_cache[city_name]
+    @staticmethod
+    def _extract_parameters_from_text(text: str) -> Dict[str, float]:
+        """Извлекает числовые параметры из текста."""
+        t = text.lower().replace(",", ".")
+        params: Dict[str, float] = {}
 
-        if self.qa_system and self.qa_system.is_ready:
-            queries = [
-                f"климат {city_name} СП 131.13330",
-                f"{city_name} температура отопительный период",
+        patterns = {
+            "area": [
+                r"площад[ьяи]\s*(?:=|:)?\s*(\d+(?:\.\d+)?)",
+                r"(\d+(?:\.\d+)?)\s*м2",
+                r"(\d+(?:\.\d+)?)\s*м²",
+            ],
+            "resistance": [
+                r"сопротивлен[^\d]{0,20}(\d+(?:\.\d+)?)",
+                r"\br\s*=\s*(\d+(?:\.\d+)?)",
+            ],
+            "temp_inside": [
+                r"внутр[^\d-]{0,20}(-?\d+(?:\.\d+)?)",
+                r"tв\s*=\s*(-?\d+(?:\.\d+)?)",
+                r"tin\s*=\s*(-?\d+(?:\.\d+)?)",
+            ],
+            "temp_outside": [
+                r"наруж[^\d-]{0,20}(-?\d+(?:\.\d+)?)",
+                r"tн\s*=\s*(-?\d+(?:\.\d+)?)",
+                r"tout\s*=\s*(-?\d+(?:\.\d+)?)",
+            ],
+            "volume": [
+                r"об[ъь]ем[^\d]{0,20}(\d+(?:\.\d+)?)",
+                r"\bv\s*=\s*(\d+(?:\.\d+)?)",
+            ],
+            "airflow": [
+                r"расход[^\d]{0,20}(\d+(?:\.\d+)?)",
+                r"(\d+(?:\.\d+)?)\s*м3/ч",
+                r"(\d+(?:\.\d+)?)\s*м³/ч",
+                r"\bl\s*=\s*(\d+(?:\.\d+)?)",
+            ],
+            "air_changes": [
+                r"кратност[^\d]{0,20}(\d+(?:\.\d+)?)",
+                r"\bn\s*=\s*(\d+(?:\.\d+)?)",
+            ],
+            "lambda": [
+                r"лямбд[^\d]{0,20}(\d+(?:\.\d+)?)",
+                r"lambda\s*=\s*(\d+(?:\.\d+)?)",
+                r"λ\s*=\s*(\d+(?:\.\d+)?)",
+            ],
+            "r_required": [
+                r"требуем[^\d]{0,20}(\d+(?:\.\d+)?)",
+                r"rтр\s*=\s*(\d+(?:\.\d+)?)",
+            ],
+            "r_existing": [
+                r"существующ[^\d]{0,20}(\d+(?:\.\d+)?)",
+                r"rсущ\s*=\s*(\d+(?:\.\d+)?)",
+            ],
+            "temp_ot": [
+                r"t_от\s*=\s*(-?\d+(?:\.\d+)?)",
+                r"средняя температура[^\d-]{0,20}(-?\d+(?:\.\d+)?)",
+            ],
+            "z_ot": [
+                r"z_от\s*=\s*(\d+)",
+                r"продолжительн[^\d]{0,20}(\d+)\s*сут",
             ]
-
-            for query in queries:
-                results = self.qa_system.search(query, top_k=3)
-                for chunk in results:
-                    text = chunk.get('text', '')
-                    doc_name = chunk.get('doc_name', '')
-
-                    t_ot = self._extract_value(text, [
-                        r'средняя температура.*?(-?\d+[.,]?\d*)\s*°С',
-                        r't_от\s*=\s*(-?\d+[.,]?\d*)'
-                    ])
-
-                    z_ot = self._extract_value(text, [
-                        r'продолжительность.*?(\d+)\s*сут',
-                        r'z_от\s*=\s*(\d+)'
-                    ], int)
-
-                    t_n = self._extract_value(text, [
-                        r'температура наружного.*?(-?\d+[.,]?\d*)\s*°С',
-                        r't_н\s*=\s*(-?\d+[.,]?\d*)'
-                    ])
-
-                    if t_ot is not None and z_ot is not None:
-                        city_data = CityClimate(
-                            name=city_name,
-                            t_ot=t_ot,
-                            z_ot=int(z_ot),
-                            t_n=t_n if t_n is not None else t_ot - 20,
-                            source=f"Извлечено из {doc_name}"
-                        )
-                        self._city_cache[city_name] = city_data
-                        self.cities[city_name] = city_data
-                        self._save_cache()
-                        return city_data
-
-        if self._on_city_not_found:
-            return await self._on_city_not_found(city_name)
-
-        return None
-
-    async def _get_material_data(self, material_name: str) -> Optional[Material]:
-        if not material_name:
-            return None
-
-        if material_name in self._material_cache:
-            return self._material_cache[material_name]
-
-        if self.qa_system and self.qa_system.is_ready:
-            queries = [
-                f"{material_name} теплопроводность",
-                f"{material_name} λ Вт/(м·°С)"
-            ]
-
-            for query in queries:
-                results = self.qa_system.search(query, top_k=3)
-                for chunk in results:
-                    text = chunk.get('text', '')
-                    doc_name = chunk.get('doc_name', '')
-
-                    lambda_val = self._extract_value(text, [
-                        rf'{material_name}.*?(\d+[.,]?\d*)\s*Вт/\(м·°С\)',
-                        rf'λ\s*=\s*(\d+[.,]?\d*)\s*[Вв]т/\(м·°С\)'
-                    ])
-
-                    density = self._extract_value(text, [
-                        rf'{material_name}.*?(\d+[.,]?\d*)\s*кг/м³'
-                    ])
-
-                    if lambda_val is not None:
-                        material = Material(
-                            name=material_name,
-                            lambda_value=lambda_val,
-                            density=density or 0,
-                            source=f"Извлечено из {doc_name}"
-                        )
-                        self._material_cache[material_name] = material
-                        self.materials[material_name] = material
-                        self._save_cache()
-                        return material
-
-        if self._on_material_not_found:
-            return await self._on_material_not_found(material_name)
-
-        return None
-
-    # ========== БЕЗОПАСНЫЕ МЕТОДЫ РАСЧЁТА ==========
-
-    def _reset_reasoning(self):
-        self.reasoning_steps = []
-
-    def _add_reasoning(self, text: str):
-        if not hasattr(self, "reasoning_steps") or self.reasoning_steps is None:
-            self.reasoning_steps = []
-        self.reasoning_steps.append(text)
-
-    def get_reasoning_chain(self) -> str:
-        if not getattr(self, "reasoning_steps", None):
-            return "🔍 Цепочка расчёта пуста."
-        return "\n".join([f"{i + 1}. {step}" for i, step in enumerate(self.reasoning_steps)])
-
-    def _extract_number_after_keywords(self, query: str, keywords: list):
-        query_lower = query.lower()
-        for keyword in keywords:
-            pattern = rf"{keyword}\s*[:=]?\s*(-?\d+[.,]?\d*)"
-            match = re.search(pattern, query_lower)
-            if match:
-                return float(match.group(1).replace(",", "."))
-        return None
-
-    def _extract_all_numbers(self, query: str) -> list:
-        raw_numbers = re.findall(r"-?\d+[.,]?\d*", query)
-        values = []
-        for item in raw_numbers:
-            try:
-                values.append(float(item.replace(",", ".")))
-            except ValueError:
-                continue
-        return values
-
-    def _normalize_params(self, params: dict) -> dict:
-        if not params:
-            return {}
-
-        normalized = dict(params)
-
-        alias_map = {
-            "t_в": "t_v", "tв": "t_v", "tv": "t_v", "t_v": "t_v",
-            "t_от": "t_ot", "tот": "t_ot", "tot": "t_ot", "t_ot": "t_ot",
-            "z_от": "z_ot", "zот": "z_ot", "zot": "z_ot", "z_ot": "z_ot",
-            "t_н": "t_n", "tн": "t_n", "tn": "t_n", "t_n": "t_n",
-            "l": "L", "L": "L",
-            "a": "A", "A": "A",
-            "r": "R", "R": "R",
-            "δ": "delta", "delta": "delta",
-            "λ": "lambda_value", "lambda": "lambda_value", "lambda_value": "lambda_value",
-            "r_тр": "R_tr", "rтр": "R_tr", "r_tr": "R_tr", "R_tr": "R_tr",
-            "q": "Q", "Q": "Q"
         }
 
-        result = {}
-        for key, value in normalized.items():
-            norm_key = alias_map.get(str(key), str(key))
-            result[norm_key] = value
-
-        return result
-
-    def _parse_params_from_query(self, query: str) -> dict:
-        params = {}
-
-        extracted_pairs = [
-            ("t_v", self._extract_number_after_keywords(query, [r"t_в", r"tв", r"t_v", r"tv", r"внутренняя температура", r"внутри"])),
-            ("t_ot", self._extract_number_after_keywords(query, [r"t_от", r"tот", r"t_ot", r"tot", r"средняя температура", r"отопительного периода"])),
-            ("z_ot", self._extract_number_after_keywords(query, [r"z_от", r"zот", r"z_ot", r"zot", r"продолжительность", r"сут"])),
-            ("L", self._extract_number_after_keywords(query, [r"\bl\b", r"расход воздуха", r"воздух"])),
-            ("t_n", self._extract_number_after_keywords(query, [r"t_н", r"tн", r"t_n", r"tn", r"наружная температура", r"снаружи"])),
-            ("A", self._extract_number_after_keywords(query, [r"\ba\b", r"площадь"])),
-            ("delta_t", self._extract_number_after_keywords(query, [r"delta_t", r"Δt", r"дельта t", r"разность температур"])),
-            ("R", self._extract_number_after_keywords(query, [r"\br\b", r"сопротивление"])),
-            ("delta", self._extract_number_after_keywords(query, [r"δ", r"delta", r"толщина"])),
-            ("lambda_value", self._extract_number_after_keywords(query, [r"λ", r"lambda", r"теплопроводность"])),
-            ("R_tr", self._extract_number_after_keywords(query, [r"r_тр", r"r_tr", r"требуемое сопротивление"]))
-        ]
-
-        for key, value in extracted_pairs:
-            if value is not None:
-                params[key] = value
-
-        all_numbers = self._extract_all_numbers(query)
-        if all_numbers:
-            params["_all_numbers"] = all_numbers
+        for key, pats in patterns.items():
+            for pat in pats:
+                match = re.search(pat, t, re.IGNORECASE)
+                if match:
+                    try:
+                        params[key] = float(match.group(1))
+                        break
+                    except (ValueError, TypeError):
+                        pass
 
         return params
 
-    def _autofill_gsop_params(self, params: dict) -> dict:
-        filled = dict(params)
-        nums = filled.get("_all_numbers", [])
+    # ========== ЦЕПОЧКА РАССУЖДЕНИЙ ==========
 
-        ordered_keys = ["t_v", "t_ot", "z_ot"]
-        if len(nums) >= 3:
-            for idx, key in enumerate(ordered_keys):
-                if key not in filled and idx < len(nums):
-                    filled[key] = nums[idx]
+    def _reset_reasoning(self) -> None:
+        """Сбрасывает цепочку рассуждений."""
+        self.reasoning_steps = []
 
-        return filled
+    def _add_reasoning(self, text: str) -> None:
+        """Добавляет шаг в цепочку рассуждений."""
+        self.reasoning_steps.append(text)
 
-    def _autofill_ventilation_params(self, params: dict) -> dict:
-        filled = dict(params)
-        nums = filled.get("_all_numbers", [])
+    def get_reasoning_chain(self) -> str:
+        """Возвращает цепочку рассуждений."""
+        if not self.reasoning_steps:
+            return "🔍 Цепочка расчёта пуста."
+        return "\n".join([f"{i + 1}. {step}" for i, step in enumerate(self.reasoning_steps)])
 
-        ordered_keys = ["L", "t_v", "t_n"]
-        if len(nums) >= 3:
-            for idx, key in enumerate(ordered_keys):
-                if key not in filled:
-                    filled[key] = nums[idx]
+    # ========== ОПРЕДЕЛЕНИЕ ТИПА РАСЧЁТА ==========
 
-        return filled
+    def _detect_formula_key(self, query: str) -> Optional[str]:
+        """Определяет тип расчёта по запросу."""
+        query_lower = query.lower()
 
-    def _autofill_heat_loss_params(self, params: dict) -> dict:
-        filled = dict(params)
-        nums = filled.get("_all_numbers", [])
+        for formula_key, meta in self.formulas.items():
+            aliases = meta.get("aliases", [])
+            if any(alias in query_lower for alias in aliases):
+                return formula_key
 
-        ordered_keys = ["A", "delta_t", "R"]
-        if len(nums) >= 3:
-            for idx, key in enumerate(ordered_keys):
-                if key not in filled:
-                    filled[key] = nums[idx]
+        if "гсоп" in query_lower or "градусо" in query_lower:
+            return "gsop"
 
-        return filled
+        if "вентиляц" in query_lower or "расход теплоты" in query_lower or "приточ" in query_lower:
+            return "ventilation_heat"
 
-    def _build_missing_params_response(self, formula_meta: dict, params: dict) -> dict:
+        if "теплопотер" in query_lower or "ограждени" in query_lower:
+            return "heat_loss"
+
+        if "сопротивление" in query_lower and "слой" in query_lower:
+            return "thermal_resistance_layer"
+
+        if "изоляция" in query_lower or "утеплитель" in query_lower:
+            return "required_insulation_thickness"
+
+        return None
+
+    # ========== ОСНОВНОЙ МЕТОД РАСЧЁТА ==========
+
+    async def answer_calculation(
+        self,
+        query: str,
+        parameters: Optional[Dict[str, float]] = None,
+    ) -> Dict[str, Any]:
+        """
+        Главный async-метод для выполнения расчёта.
+        """
+        self._reset_reasoning()
+        self._add_reasoning(f"Получен запрос: {query}")
+
+        try:
+            parameters = parameters or {}
+
+            # Извлекаем параметры из текста
+            extracted_params = self._extract_parameters_from_text(query)
+            merged_params = {**extracted_params, **parameters}
+
+            # Определяем тип расчёта
+            formula_key = self._detect_formula_key(query)
+
+            if not formula_key:
+                self._add_reasoning("Формула не распознана")
+                return self._build_error_response(
+                    "⚠️ Не удалось определить тип расчёта.\n\n"
+                    "Поддерживаемые расчёты:\n"
+                    "- ГСОП (градусо-сутки)\n"
+                    "- Расход теплоты на вентиляцию\n"
+                    "- Теплопотери через ограждение\n"
+                    "- Термическое сопротивление слоя\n"
+                    "- Требуемая толщина изоляции\n"
+                    "- Удельный тепловой поток"
+                )
+
+            formula_meta = self.formulas[formula_key]
+            self._add_reasoning(f"Определена формула: {formula_meta['name']}")
+
+            # Проверяем наличие обязательных параметров
+            required = formula_meta.get("required_params", [])
+            missing = [p for p in required if p not in merged_params]
+
+            if missing:
+                self._add_reasoning(f"Не хватает параметров: {', '.join(missing)}")
+                return self._build_missing_params_response(formula_meta, missing)
+
+            # Выполняем расчёт
+            handler = formula_meta.get("handler")
+            if handler is None:
+                raise ValueError(f"Для формулы '{formula_key}' не задан handler")
+
+            # Пробуем табличный расчёт для ГСОП
+            if formula_key == "gsop":
+                table_result = await self._try_table_calculation(query)
+                if table_result:
+                    return table_result
+
+            result = handler(merged_params, formula_meta)
+
+            if not result.get("reasoning"):
+                result["reasoning"] = self.get_reasoning_chain()
+
+            return self._format_result(result, formula_meta)
+
+        except (ValueError, TypeError, ZeroDivisionError) as e:
+            self._add_reasoning(f"Ошибка расчёта: {e}")
+            return {
+                "answer": f"❌ Ошибка расчёта: {e}",
+                "sources": [],
+                "tables": [],
+                "formulas": [],
+                "confidence": 0.0,
+                "query_type": "calculation",
+                "needs_clarification": False,
+                "questions": []
+            }
+
+    async def _try_table_calculation(
+        self,
+        query: str,
+    ) -> Optional[Dict[str, Any]]:
+        """Пробует выполнить расчёт через табличный калькулятор."""
+        city = self._extract_city_from_text(query)
+
+        if not city:
+            return None
+
+        try:
+            from core.table_calculator import TableCalculator
+
+            if self._table_calculator is None:
+                self._table_calculator = TableCalculator(self.qa_system)
+
+            table_result = self._table_calculator.calculate_gsop_from_table(city)
+
+            if isinstance(table_result, dict) and table_result.get("answer"):
+                return table_result
+
+        except (ImportError, AttributeError, ValueError) as e:
+            self._add_reasoning(f"Табличный расчёт не удался: {e}")
+
+        return None
+
+    @staticmethod
+    def _build_error_response(message: str) -> Dict[str, Any]:
+        """Создаёт ответ с ошибкой."""
+        return {
+            "answer": message,
+            "sources": [],
+            "tables": [],
+            "formulas": [],
+            "confidence": 0.0,
+            "query_type": "calculation",
+            "needs_clarification": True,
+            "questions": ["Уточните, какой именно расчёт требуется."]
+        }
+
+    @staticmethod
+    def _build_missing_params_response(
+        formula_meta: Dict[str, Any],
+        missing: List[str]
+    ) -> Dict[str, Any]:
+        """Создаёт ответ с сообщением о недостающих параметрах."""
         required = formula_meta.get("required_params", [])
-        missing = [p for p in required if p not in params]
 
         answer = (
             f"⚠️ Недостаточно данных для расчёта «{formula_meta['name']}».\n\n"
@@ -498,41 +553,51 @@ class FormulaEngine:
             f"📚 Источник: {formula_meta['source']}"
         )
 
-        if formula_meta.get("legend"):
-            answer += f"\n\n**Обозначения:**\n{formula_meta['legend']}"
-
-        self._add_reasoning(f"Не хватает параметров: {', '.join(missing)}")
-
         return {
             "answer": answer,
-            "formula": {
-                "raw": formula_meta["expression"],
-                "name": formula_meta["name"],
-                "source": formula_meta["source"]
-            },
-            "params": params,
-            "result": None,
-            "reasoning": self.get_reasoning_chain(),
-            "source": formula_meta["source"],
-            "sources": [{"doc_name": formula_meta["source"]}],
+            "sources": [{"doc_name": formula_meta['source']}],
             "tables": [],
             "formulas": [{
+                "raw": formula_meta['expression'],
+                "name": formula_meta['name'],
+                "source": formula_meta['source']
+            }],
+            "confidence": 0.3,
+            "query_type": "calculation",
+            "needs_clarification": True,
+            "questions": [f"Укажите: {', '.join(missing)}"]
+        }
+
+    @staticmethod
+    def _format_result(result: Dict, formula_meta: Dict) -> Dict[str, Any]:
+        """Форматирует результат расчёта."""
+        if "sources" not in result:
+            source = result.get("source", formula_meta.get("source", ""))
+            result["sources"] = [{"doc_name": source}] if source else []
+
+        if "tables" not in result:
+            result["tables"] = []
+
+        if "formulas" not in result:
+            result["formulas"] = [{
                 "raw": formula_meta["expression"],
                 "name": formula_meta["name"],
                 "source": formula_meta["source"]
             }]
-        }
+
+        result["query_type"] = "calculation"
+        result["needs_clarification"] = False
+        result["questions"] = []
+
+        return result
+
+    # ========== ХЕНДЛЕРЫ РАСЧЁТОВ ==========
 
     def _calc_gsop(self, params: dict, formula_meta: dict) -> dict:
-        params = self._autofill_gsop_params(params)
-
-        required = formula_meta["required_params"]
-        if any(p not in params for p in required):
-            return self._build_missing_params_response(formula_meta, params)
-
+        """Расчёт ГСОП."""
         t_v = float(params["t_v"])
-        t_ot = float(params["t_ot"])
-        z_ot = float(params["z_ot"])
+        t_ot = float(params.get("t_ot", params.get("temp_ot", 0)))
+        z_ot = float(params.get("z_ot", params.get("zot", 0)))
 
         self._add_reasoning(f"Определены параметры: t_v={t_v}, t_ot={t_ot}, z_ot={z_ot}")
         self._add_reasoning("Применена формула ГСОП = (t_в - t_от) × z_от")
@@ -554,130 +619,78 @@ class FormulaEngine:
 
         return {
             "answer": answer,
-            "formula": {
-                "raw": formula_meta["expression"],
-                "name": formula_meta["name"],
-                "source": formula_meta["source"]
-            },
             "params": {"t_v": t_v, "t_ot": t_ot, "z_ot": z_ot},
             "result": result_value,
-            "reasoning": self.get_reasoning_chain(),
-            "source": formula_meta["source"],
-            "sources": [{"doc_name": formula_meta["source"]}],
-            "tables": [],
-            "formulas": [{
-                "raw": formula_meta["expression"],
-                "name": formula_meta["name"],
-                "source": formula_meta["source"]
-            }]
+            "source": formula_meta["source"]
         }
 
     def _calc_ventilation_heat(self, params: dict, formula_meta: dict) -> dict:
-        params = self._autofill_ventilation_params(params)
-
-        required = formula_meta["required_params"]
-        if any(p not in params for p in required):
-            return self._build_missing_params_response(formula_meta, params)
-
-        L = float(params["L"])
+        """Расчёт расхода теплоты на вентиляцию."""
+        air_flow = float(params["L"])
         t_v = float(params["t_v"])
         t_n = float(params["t_n"])
 
-        self._add_reasoning(f"Определены параметры: L={L}, t_v={t_v}, t_n={t_n}")
+        self._add_reasoning(f"Определены параметры: air_flow={air_flow}, t_v={t_v}, t_n={t_n}")
         self._add_reasoning("Применена формула Q_в = 0.335 × L × (t_в - t_н)")
 
-        result_value = 0.335 * L * (t_v - t_n)
+        result_value = 0.335 * air_flow * (t_v - t_n)
 
-        self._add_reasoning(f"Подстановка: 0.335 × {L} × ({t_v} - ({t_n})) = {result_value}")
+        self._add_reasoning(f"Подстановка: 0.335 × {air_flow} × ({t_v} - ({t_n})) = {result_value}")
 
         answer = (
             f"💨 **Расход теплоты на вентиляцию = {result_value:.2f} {formula_meta['unit']}**\n\n"
             f"📐 **Формула:** {formula_meta['expression']}\n"
             f"📊 **Исходные данные:**\n"
-            f"- L = {L} м³/ч\n"
+            f"- L = {air_flow} м³/ч\n"
             f"- t_в = {t_v} °C\n"
             f"- t_н = {t_n} °C\n\n"
-            f"🔢 **Подстановка:** 0.335 × {L} × ({t_v} - ({t_n})) = {result_value:.2f}\n\n"
+            f"🔢 **Подстановка:** 0.335 × {air_flow} × ({t_v} - ({t_n})) = {result_value:.2f}\n\n"
             f"📚 **Источник:** {formula_meta['source']}"
         )
 
         return {
             "answer": answer,
-            "formula": {
-                "raw": formula_meta["expression"],
-                "name": formula_meta["name"],
-                "source": formula_meta["source"]
-            },
-            "params": {"L": L, "t_v": t_v, "t_n": t_n},
+            "params": {"L": air_flow, "t_v": t_v, "t_n": t_n},
             "result": result_value,
-            "reasoning": self.get_reasoning_chain(),
-            "source": formula_meta["source"],
-            "sources": [{"doc_name": formula_meta["source"]}],
-            "tables": [],
-            "formulas": [{
-                "raw": formula_meta["expression"],
-                "name": formula_meta["name"],
-                "source": formula_meta["source"]
-            }]
+            "source": formula_meta["source"]
         }
 
     def _calc_heat_loss(self, params: dict, formula_meta: dict) -> dict:
-        params = self._autofill_heat_loss_params(params)
-
-        required = formula_meta["required_params"]
-        if any(p not in params for p in required):
-            return self._build_missing_params_response(formula_meta, params)
-
-        A = float(params["A"])
+        """Расчёт теплопотерь через ограждение."""
+        area = float(params["A"])
         delta_t = float(params["delta_t"])
-        R = float(params["R"])
+        resistance = float(params["R"])
 
-        if R == 0:
+        if resistance == 0:
             raise ValueError("Сопротивление R не может быть равно 0")
 
-        self._add_reasoning(f"Определены параметры: A={A}, delta_t={delta_t}, R={R}")
+        self._add_reasoning(f"Определены параметры: area={area}, delta_t={delta_t}, resistance={resistance}")
         self._add_reasoning("Применена формула Q = (A × Δt) / R")
 
-        result_value = (A * delta_t) / R
+        result_value = (area * delta_t) / resistance
 
-        self._add_reasoning(f"Подстановка: ({A} × {delta_t}) / {R} = {result_value}")
+        self._add_reasoning(f"Подстановка: ({area} × {delta_t}) / {resistance} = {result_value}")
 
         answer = (
             f"🔥 **Теплопотери через ограждение = {result_value:.2f} {formula_meta['unit']}**\n\n"
             f"📐 **Формула:** {formula_meta['expression']}\n"
             f"📊 **Исходные данные:**\n"
-            f"- A = {A} м²\n"
+            f"- A = {area} м²\n"
             f"- Δt = {delta_t} °C\n"
-            f"- R = {R} м²·°C/Вт\n\n"
-            f"🔢 **Подстановка:** ({A} × {delta_t}) / {R} = {result_value:.2f}\n\n"
+            f"- R = {resistance} м²·°C/Вт\n\n"
+            f"🔢 **Подстановка:** ({area} × {delta_t}) / {resistance} = {result_value:.2f}\n\n"
             f"📚 **Источник:** {formula_meta['source']}"
         )
 
         return {
             "answer": answer,
-            "formula": {
-                "raw": formula_meta["expression"],
-                "name": formula_meta["name"],
-                "source": formula_meta["source"]
-            },
-            "params": {"A": A, "delta_t": delta_t, "R": R},
+            "params": {"A": area, "delta_t": delta_t, "R": resistance},
             "result": result_value,
-            "reasoning": self.get_reasoning_chain(),
-            "source": formula_meta["source"],
-            "sources": [{"doc_name": formula_meta["source"]}],
-            "tables": [],
-            "formulas": [{
-                "raw": formula_meta["expression"],
-                "name": formula_meta["name"],
-                "source": formula_meta["source"]
-            }]
+            "source": formula_meta["source"]
         }
 
     def _calc_thermal_resistance_layer(self, params: dict, formula_meta: dict) -> dict:
-        required = formula_meta["required_params"]
-        if any(p not in params for p in required):
-            return self._build_missing_params_response(formula_meta, params)
-
+        """Расчёт сопротивления слоя."""
         delta = float(params["delta"])
         lambda_value = float(params["lambda_value"])
 
@@ -703,224 +716,77 @@ class FormulaEngine:
 
         return {
             "answer": answer,
-            "formula": {
-                "raw": formula_meta["expression"],
-                "name": formula_meta["name"],
-                "source": formula_meta["source"]
-            },
             "params": {"delta": delta, "lambda_value": lambda_value},
             "result": result_value,
-            "reasoning": self.get_reasoning_chain(),
-            "source": formula_meta["source"],
-            "sources": [{"doc_name": formula_meta["source"]}],
-            "tables": [],
-            "formulas": [{
-                "raw": formula_meta["expression"],
-                "name": formula_meta["name"],
-                "source": formula_meta["source"]
-            }]
+            "source": formula_meta["source"]
         }
 
     def _calc_required_insulation_thickness(self, params: dict, formula_meta: dict) -> dict:
-        required = formula_meta["required_params"]
-        if any(p not in params for p in required):
-            return self._build_missing_params_response(formula_meta, params)
-
-        R_tr = float(params["R_tr"])
+        """Расчёт требуемой толщины изоляции."""
+        r_required = float(params["R_tr"])
         lambda_value = float(params["lambda_value"])
 
-        self._add_reasoning(f"Определены параметры: R_tr={R_tr}, lambda={lambda_value}")
+        self._add_reasoning(f"Определены параметры: r_required={r_required}, lambda={lambda_value}")
         self._add_reasoning("Применена формула δ = R_тр × λ")
 
-        result_value = R_tr * lambda_value
+        result_value = r_required * lambda_value
         result_mm = result_value * 1000
 
-        self._add_reasoning(f"Подстановка: {R_tr} × {lambda_value} = {result_value}")
+        self._add_reasoning(f"Подстановка: {r_required} × {lambda_value} = {result_value}")
 
         answer = (
             f"📏 **Требуемая толщина изоляции = {result_value:.3f} м ({result_mm:.0f} мм)**\n\n"
             f"📐 **Формула:** {formula_meta['expression']}\n"
             f"📊 **Исходные данные:**\n"
-            f"- R_тр = {R_tr} м²·°C/Вт\n"
+            f"- R_тр = {r_required} м²·°C/Вт\n"
             f"- λ = {lambda_value} Вт/(м·°C)\n\n"
-            f"🔢 **Подстановка:** {R_tr} × {lambda_value} = {result_value:.3f} м\n\n"
+            f"🔢 **Подстановка:** {r_required} × {lambda_value} = {result_value:.3f} м\n\n"
             f"📚 **Источник:** {formula_meta['source']}"
         )
 
         return {
             "answer": answer,
-            "formula": {
-                "raw": formula_meta["expression"],
-                "name": formula_meta["name"],
-                "source": formula_meta["source"]
-            },
-            "params": {"R_tr": R_tr, "lambda_value": lambda_value},
+            "params": {"R_tr": r_required, "lambda_value": lambda_value},
             "result": result_value,
-            "reasoning": self.get_reasoning_chain(),
-            "source": formula_meta["source"],
-            "sources": [{"doc_name": formula_meta["source"]}],
-            "tables": [],
-            "formulas": [{
-                "raw": formula_meta["expression"],
-                "name": formula_meta["name"],
-                "source": formula_meta["source"]
-            }]
+            "source": formula_meta["source"]
         }
 
     def _calc_pipe_surface_heat_flux(self, params: dict, formula_meta: dict) -> dict:
-        required = formula_meta["required_params"]
-        if any(p not in params for p in required):
-            return self._build_missing_params_response(formula_meta, params)
+        """Расчёт удельного теплового потока."""
+        heat_flow = float(params["Q"])
+        length = float(params["L"])
 
-        Q = float(params["Q"])
-        L = float(params["L"])
-
-        if L == 0:
+        if length == 0:
             raise ValueError("Длина не может быть равна 0")
 
-        self._add_reasoning(f"Определены параметры: Q={Q}, L={L}")
+        self._add_reasoning(f"Определены параметры: heat_flow={heat_flow}, length={length}")
         self._add_reasoning("Применена формула q = Q / L")
 
-        result_value = Q / L
+        result_value = heat_flow / length
 
-        self._add_reasoning(f"Подстановка: {Q} / {L} = {result_value}")
+        self._add_reasoning(f"Подстановка: {heat_flow} / {length} = {result_value}")
 
         answer = (
             f"🔥 **Удельный тепловой поток = {result_value:.2f} {formula_meta['unit']}**\n\n"
             f"📐 **Формула:** {formula_meta['expression']}\n"
             f"📊 **Исходные данные:**\n"
-            f"- Q = {Q} Вт\n"
-            f"- L = {L} м\n\n"
-            f"🔢 **Подстановка:** {Q} / {L} = {result_value:.2f}\n\n"
+            f"- Q = {heat_flow} Вт\n"
+            f"- L = {length} м\n\n"
+            f"🔢 **Подстановка:** {heat_flow} / {length} = {result_value:.2f}\n\n"
             f"📚 **Источник:** {formula_meta['source']}"
         )
 
         return {
             "answer": answer,
-            "formula": {
-                "raw": formula_meta["expression"],
-                "name": formula_meta["name"],
-                "source": formula_meta["source"]
-            },
-            "params": {"Q": Q, "L": L},
+            "params": {"Q": heat_flow, "L": length},
             "result": result_value,
-            "reasoning": self.get_reasoning_chain(),
-            "source": formula_meta["source"],
-            "sources": [{"doc_name": formula_meta["source"]}],
-            "tables": [],
-            "formulas": [{
-                "raw": formula_meta["expression"],
-                "name": formula_meta["name"],
-                "source": formula_meta["source"]
-            }]
+            "source": formula_meta["source"]
         }
-
-    # ========== ОСНОВНОЙ МЕТОД ==========
-
-    def _detect_formula_key(self, query: str):
-        query_lower = query.lower()
-
-        for formula_key, meta in self.formulas.items():
-            aliases = meta.get("aliases", [])
-            if any(alias in query_lower for alias in aliases):
-                return formula_key
-
-        if "гсоп" in query_lower or "градусо" in query_lower:
-            return "gsop"
-
-        if "вентиляц" in query_lower or "расход теплоты" in query_lower or "приточ" in query_lower:
-            return "ventilation_heat"
-
-        if "теплопотер" in query_lower or "ограждени" in query_lower:
-            return "heat_loss"
-
-        if "сопротивление" in query_lower and "слой" in query_lower:
-            return "thermal_resistance_layer"
-
-        if "изоляция" in query_lower or "утеплитель" in query_lower:
-            return "required_insulation_thickness"
-
-        return None
-
-    async def answer_calculation(self, query: str) -> dict:
-        self._reset_reasoning()
-        self._add_reasoning(f"Получен запрос: {query}")
-
-        try:
-            formula_key = self._detect_formula_key(query)
-            if not formula_key:
-                self._add_reasoning("Формула не распознана")
-                return {
-                    "answer": (
-                        "⚠️ Не удалось определить тип расчёта.\n\n"
-                        "Поддерживаемые расчёты:\n"
-                        "- ГСОП (градусо-сутки)\n"
-                        "- Расход теплоты на вентиляцию\n"
-                        "- Теплопотери через ограждение\n"
-                        "- Термическое сопротивление слоя\n"
-                        "- Требуемая толщина изоляции\n"
-                        "- Удельный тепловой поток"
-                    ),
-                    "formula": None,
-                    "params": {},
-                    "result": None,
-                    "reasoning": self.get_reasoning_chain(),
-                    "source": "",
-                    "sources": [],
-                    "tables": [],
-                    "formulas": []
-                }
-
-            formula_meta = self.formulas[formula_key]
-            self._add_reasoning(f"Определена формула: {formula_meta['name']}")
-
-            params = self._parse_params_from_query(query)
-            params = self._normalize_params(params)
-            self._add_reasoning(f"Извлечены параметры: {params}")
-
-            handler = formula_meta.get("handler")
-            if handler is None:
-                raise ValueError(f"Для формулы '{formula_key}' не задан handler")
-
-            result = handler(params, formula_meta)
-
-            if not result.get("reasoning"):
-                result["reasoning"] = self.get_reasoning_chain()
-
-            if "sources" not in result:
-                source = result.get("source", formula_meta.get("source", ""))
-                result["sources"] = [{"doc_name": source}] if source else []
-
-            if "tables" not in result:
-                result["tables"] = []
-
-            if "formulas" not in result:
-                result["formulas"] = [{
-                    "raw": formula_meta["expression"],
-                    "name": formula_meta["name"],
-                    "source": formula_meta["source"]
-                }]
-
-            return result
-
-        except Exception as e:
-            self._add_reasoning(f"Ошибка расчёта: {e}")
-            return {
-                "answer": f"❌ Ошибка расчёта: {e}",
-                "formula": None,
-                "params": {},
-                "result": None,
-                "reasoning": self.get_reasoning_chain(),
-                "source": "",
-                "sources": [],
-                "tables": [],
-                "formulas": []
-            }
 
     # ========== ПУБЛИЧНЫЕ МЕТОДЫ ДЛЯ APP.PY ==========
 
     def get_available_formulas(self) -> list:
-        """Возвращает список формул для отображения в sidebar"""
+        """Возвращает список формул для отображения в sidebar."""
         return [
             {
                 "id": item["id"],
@@ -933,20 +799,18 @@ class FormulaEngine:
             for item in self.formulas.values()
         ]
 
-    def get_reasoning_chain(self) -> str:
-        """Возвращает цепочку рассуждений"""
-        if not getattr(self, "reasoning_steps", None):
-            return "🔍 Цепочка расчёта пуста."
-        return "\n".join([f"{i + 1}. {step}" for i, step in enumerate(self.reasoning_steps)])
-
-    def set_city_callback(self, callback):
-        self._on_city_not_found = callback
-
-    def set_material_callback(self, callback):
-        self._on_material_not_found = callback
-
     def get_materials(self) -> List[Dict]:
+        """Возвращает список материалов."""
         return [{'key': k, 'name': v.name, 'lambda': v.lambda_value} for k, v in self.materials.items()]
 
     def get_cities(self) -> List[Dict]:
+        """Возвращает список городов с климатическими данными."""
         return [{'key': k, 'name': v.name, 't_ot': v.t_ot, 'z_ot': v.z_ot} for k, v in self.cities.items()]
+
+    def set_city_callback(self, callback):
+        """Устанавливает callback для случая, когда город не найден."""
+        self._on_city_not_found = callback
+
+    def set_material_callback(self, callback):
+        """Устанавливает callback для случая, когда материал не найден."""
+        self._on_material_not_found = callback

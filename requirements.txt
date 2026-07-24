@@ -14,13 +14,11 @@ datasets>=2.12.0
 
 # Document parsing
 python-docx>=0.8.11
-pymupdf>=1.23.0
+PyMuPDF>=1.23.0
 striprtf>=0.0.26
 pdfplumber>=0.10.0
 openpyxl>=3.1.0
 docx2txt>=0.8
-camelot-py>=0.11.0
-tabula-py>=2.9.0
 pypandoc>=1.11
 
 # Export

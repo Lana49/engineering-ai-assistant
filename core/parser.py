@@ -1,211 +1,33 @@
-# -*- coding: utf-8 -*-
+# core/parser.py
 """
-Парсер строительной документации.
-Извлекает:
-- Материалы и их свойства
-- Конструкции
-- Параметры (температура, толщина, плотность и т.д.)
-- Стандарты (ГОСТ, СП, СНиП)
-- Таблицы
-- Формулы
-- Разделы документа
-- Числовые данные с единицами измерения
+Универсальный парсер документов для инженерной базы знаний.
+
+Поддерживает:
+- .txt, .md
+- .pdf (через PyMuPDF)
+- .docx (через python-docx)
+- .html / .htm
+- .json
+- .csv
+- .rtf (через striprtf)
 """
 
-import spacy
+from __future__ import annotations
+
 import re
-import json
-from pathlib import Path
-from typing import Dict, List, Set, Optional, Any, Tuple
-from collections import defaultdict
 from dataclasses import dataclass, field
-
-
-# ========== ЗАГРУЗКА МОДЕЛИ SPACY ==========
-
-def load_spacy_model():
-    """Загрузка модели spaCy с автоматической установкой"""
-    try:
-        nlp = spacy.load('ru_core_news_md')
-        print("✅ Модель ru_core_news_md загружена")
-        return nlp
-    except Exception:
-        try:
-            nlp = spacy.load('ru_core_news_sm')
-            print("✅ Модель ru_core_news_sm загружена")
-            return nlp
-        except Exception:
-            import os
-            os.system('python -m spacy download ru_core_news_md')
-            nlp = spacy.load('ru_core_news_md')
-            print("✅ Модель ru_core_news_md загружена автоматически")
-            return nlp
-
-
-nlp = load_spacy_model()
-
-
-# ========== РАСШИРЕННЫЙ СЛОВАРЬ МАТЕРИАЛОВ ==========
-
-MATERIALS = {
-    # Металлы и сплавы
-    'железо', 'железобетон', 'металл', 'сталь', 'алюминий', 'чугун', 'медь',
-    'латунь', 'бронза', 'титан', 'свинец', 'цинк', 'сплав', 'нихром', 'инвар',
-    'оцинкованная сталь', 'нержавеющая сталь', 'сталь углеродистая',
-    'сталь легированная', 'сталь низколегированная', 'сталь высоколегированная',
-    'сталь коррозионно-стойкая', 'сталь жаропрочная', 'сталь инструментальная',
-
-    # Бетоны и растворы
-    'бетон', 'асфальтобетон', 'цемент', 'цементобетон', 'армопенобетон',
-    'пенобетон', 'газобетон', 'керамзитобетон', 'шлакобетон', 'раствор',
-    'полистиролбетон', 'газосиликат', 'пеносиликат', 'фибробетон', 'силикатобетон',
-    'жаростойкий бетон', 'кислотоупорный бетон', 'гидротехнический бетон',
-
-    # Минераловатные материалы
-    'минеральная вата', 'каменная вата', 'стекловолокно', 'стекловата',
-    'базальтовое волокно', 'шлаковата', 'войлок', 'маты минераловатные',
-    'плиты минераловатные', 'цилиндры минераловатные', 'полуцилиндры минераловатные',
-    'сегменты минераловатные', 'прошивные маты', 'рулонированные маты',
-    'ламелла-маты', 'иглопробивные маты', 'холсты', 'рулонное стекловолокно',
-
-    # Полимерные материалы
-    'пенополиуретан', 'пенополистирол', 'пенополиэтилен', 'пенопласт',
-    'пеностекло', 'пенополимерминерал', 'вспененный каучук', 'поропласт', 'полимербетон',
-    'пенополиизоцианурат', 'экструзионный пенополистирол', 'вспененный пенополистирол',
-    'вспененный полиэтилен', 'полиэтилен высокого давления', 'полиэтилен низкого давления',
-    'полипропилен', 'поливинилхлорид', 'ПВХ', 'фторопласт', 'капролон', 'полиамид',
-
-    # Керамические и композитные
-    'керамзит', 'перлит', 'перлитоцемент', 'совелит', 'керамика',
-    'огнеупорная керамика', 'керамогранит', 'керамблок', 'вермикулит', 'вспученный вермикулит',
-    'аглопорит', 'шунгизит', 'туф', 'пемза',
-
-    # Асбестосодержащие
-    'асбест', 'асбестоцемент', 'хризотиловое волокно', 'асбестовые шнуры',
-    'асбестосодержащие материалы', 'асбестоцементные листы', 'асбестовая бумага',
-    'асбестовый картон', 'асбестовая ткань',
-
-    # Рулонные и пленочные материалы
-    'стеклоткань', 'стеклохолст', 'фольга', 'алюминиевая фольга',
-    'полиэтиленовая пленка', 'рубероид', 'битумный лак', 'битум', 'стеклопластик',
-    'стеклорогожа', 'лакостеклоткань', 'стекловолокнистое полотно', 'кэшированный материал',
-    'полимерная плёнка', 'армированная плёнка', 'термоусадочная плёнка', 'пароизоляционная плёнка',
-
-    # Штукатурные
-    'штукатурка', 'декоративная штукатурка', 'гипсовая штукатурка', 'цементная штукатурка',
-    'известковая штукатурка', 'полимерная штукатурка',
-
-    # Древесные
-    'дерево', 'древесина', 'фанера', 'ДСП', 'ОСП', 'МДФ', 'брус', 'доска', 'пиломатериалы',
-    'бревно', 'клееный брус', 'древесно-стружечная плита', 'древесно-волокнистая плита',
-    'ДВП', 'ЛДСП', 'ЛВЛ',
-
-    # Утеплители
-    'утеплитель', 'теплоизоляция', 'гидроизоляция', 'пароизоляция', 'звукоизоляция',
-    'теплоизоляционный материал', 'гидроизоляционный материал', 'пароизоляционный материал',
-    'вспененный полимер', 'эковата', 'пенофол', 'изолон', 'пеноизол',
-
-    # Покрытия
-    'краска', 'эмаль', 'лак', 'грунтовка', 'антикоррозийное покрытие',
-    'полимерное покрытие', 'порошковая краска', 'мастика', 'герметик',
-    'клей', 'силиконовый герметик', 'акриловый герметик', 'полиуретановый герметик',
-
-    # Жидкости и теплоносители
-    'вода', 'теплоноситель', 'хладагент', 'фреон', 'антифриз',
-    'этиленгликоль', 'пропиленгликоль',
-
-    # Прочие
-    'пенопластовые изделия', 'пенополиуретановые изделия', 'полистиролбетонные блоки',
-    'газосиликатные блоки', 'пеносиликатные блоки', 'перлитовый песок', 'вермикулитовый песок',
-    'шлак', 'зола', 'шлакопортландцемент', 'пуццолановый цемент', 'глинозёмистый цемент',
-    'магнезиальный цемент', 'гипс', 'гипсокартон', 'гипсоволокнистый лист', 'ГВЛ',
-    'стекломагниевый лист', 'СМЛ', 'целлюлозно-волокнистый утеплитель'
-}
-
-MATERIAL_PHRASES = {
-    'оцинкованная сталь', 'нержавеющая сталь', 'каменная вата', 'минеральная вата',
-    'базальтовое волокно', 'вспененный каучук', 'алюминиевая фольга',
-    'полиэтиленовая пленка', 'стекловолокнистое полотно', 'битумный лак',
-    'кэшированный материал', 'перлитоцементные плиты', 'совелитовые плиты',
-    'пенополиуретан', 'пенополистирол', 'пенополиэтилен', 'пенополимерминерал',
-    'антикоррозийное покрытие', 'теплоизоляционный материал', 'гидроизоляционный материал',
-    'пароизоляционный материал', 'полимерное покрытие', 'порошковая краска',
-    'асбестовые шнуры', 'асбестоцементные листы', 'минераловатные плиты',
-    'минераловатные маты', 'минераловатные цилиндры', 'рулонированные маты',
-    'прошивные маты', 'иглопробивные маты', 'древесно-стружечная плита',
-    'вспененный полиэтилен', 'экструзионный пенополистирол', 'гипсокартон',
-    'стекломагниевый лист', 'пенопластовые изделия', 'водный раствор',
-    'незамерзающая жидкость', 'охлаждающая жидкость'
-}
-
-# ========== СЛОВАРИ ДЛЯ ГОСТОВ И СП ==========
-
-STANDARDS_TYPES = {
-    'ГОСТ', 'ГОСТ Р', 'ГОСТ РВ', 'СП', 'СНиП', 'СанПиН', 'ТУ',
-    'МСН', 'МСП', 'СТО', 'ЕН', 'ISO', 'ВСН', 'ТСН', 'СН',
-    'Технический регламент', 'Методические рекомендации'
-}
-
-STANDARD_PATTERNS = [
-    r'(ГОСТ Р\s+\d+(?:\.\d+)*-\d{4})',
-    r'(ГОСТ\s+\d+(?:\.\d+)*-\d{4})',
-    r'(СП\s+\d+(?:\.\d+)*\.\d{4})',
-    r'(СНиП\s+\d+(?:\.\d+)*-\d{2}-\d{2})',
-    r'(СанПиН\s+\d+(?:\.\d+)*\.\d+\.\d+\.\d+)',
-    r'(ТУ\s+\d+(?:\.\d+)*-\d+(?:-\d+)?)',
-    r'(МСН\s+\d+(?:\.\d+)*-\d{2})',
-    r'(СТО\s+\d+(?:\.\d+)*-\d{4})',
-]
-
-# ========== СЛОВАРИ КОНСТРУКЦИЙ И ПАРАМЕТРОВ ==========
-
-CONSTRUCTION_TERMS = {
-    'материалы': MATERIALS,
-    'конструкции': {
-        'здание', 'помещение', 'фундамент', 'стена', 'перекрытие', 'фасад', 'кровля',
-        'эстакада', 'галерея', 'тоннель',
-        'теплоизоляционная конструкция', 'покровный слой', 'пароизоляционный слой',
-        'предохранительный слой', 'выравнивающий слой', 'теплоизоляционный слой',
-        'опорные элементы', 'разгружающие устройства', 'крепление', 'температурный шов',
-        'фланцевое соединение', 'компенсатор', 'многослойная конструкция',
-        'съемная конструкция', 'опорные конструкции', 'крепежные детали', 'изоляция',
-        'трубопровод', 'газоход', 'воздуховод', 'канал', 'оборудование',
-        'система отопления', 'система вентиляции', 'кондиционер', 'вентилятор',
-        'калорифер', 'теплообменник', 'радиатор', 'конвектор', 'насос', 'клапан',
-        'воздухораспределитель', 'чиллер', 'фанкойл', 'рекуператор', 'тепловой пункт',
-        'метеорологическая станция'
-    },
-    'параметры': {
-        'толщина стенок', 'плотность', 'теплопроводность', 'коэффициент теплопроводности',
-        'паропроницаемость', 'температуростойкость', 'уплотнение', 'коэффициент уплотнения',
-        'горючесть', 'группа горючести', 'температура применения', 'срок эксплуатации',
-        'толщина изоляции', 'потери', 'плотность теплового потока', 'термическое сопротивление',
-        'температура воздуха', 'энтальпия', 'солнечная радиация', 'влажность',
-        'скорость ветра', 'осадки', 'градусо-сутки', 'расход воздуха', 'расход теплоты',
-        'кратность воздухообмена', 'аэродинамическое сопротивление', 'микроклимат',
-        'барометрическое давление', 'обеспеченность'
-    },
-    'нормативы': {
-        'ГОСТ', 'СНиП', 'СП', 'ТУ', 'ГОСТ Р', 'СанПиН', 'ВСН', 'ТСН', 'СТО', 'ЕН', 'ISO'
-    }
-}
-
-# ========== СОЗДАНИЕ ЛЕММ ==========
-
-LEMMA_MATERIALS = {term.lower() for term in CONSTRUCTION_TERMS['материалы']}
-LEMMA_STRUCTURES = {term.lower() for term in CONSTRUCTION_TERMS['конструкции']}
-LEMMA_PARAMETERS = {term.lower() for term in CONSTRUCTION_TERMS['параметры']}
-LEMMA_STANDARDS = CONSTRUCTION_TERMS['normatives']
+from pathlib import Path
+from typing import Any, Dict, List, Optional
 
 
 # ========== ФУНКЦИИ ЧТЕНИЯ ФАЙЛОВ ==========
 
 def read_docx(file_path: str) -> str:
-    """Чтение DOCX файла"""
+    """Чтение DOCX файла."""
     try:
         from docx import Document
         doc = Document(file_path)
-        return '\n'.join([paragraph.text for paragraph in doc.paragraphs])
+        return "\n".join(paragraph.text for paragraph in doc.paragraphs)
     except ImportError:
         print("⚠️ Для работы с DOCX установите python-docx: pip install python-docx")
         return ""
@@ -215,16 +37,16 @@ def read_docx(file_path: str) -> str:
 
 
 def read_pdf(file_path: str) -> str:
-    """Чтение PDF файла"""
+    """Чтение PDF файла через PyMuPDF."""
     try:
-        import fitz
-        doc = fitz.open(file_path)
+        import pymupdf
+        doc = pymupdf.open(file_path)
         text = ""
         for page in doc:
             text += page.get_text()
         return text
     except ImportError:
-        print("⚠️ Для работы с PDF установите PyMuPDF: pip install pymupdf")
+        print("⚠️ Для работы с PDF установите PyMuPDF: pip install PyMuPDF")
         return ""
     except Exception as e:
         print(f"❌ Ошибка при чтении PDF {file_path}: {e}")
@@ -232,10 +54,10 @@ def read_pdf(file_path: str) -> str:
 
 
 def read_rtf(file_path: str) -> str:
-    """Чтение RTF файла"""
+    """Чтение RTF файла."""
     try:
         from striprtf.striprtf import rtf_to_text
-        with open(file_path, 'r', encoding='utf-8', errors='replace') as f:
+        with open(file_path, "r", encoding="utf-8", errors="replace") as f:
             rtf_content = f.read()
         return rtf_to_text(rtf_content).strip()
     except ImportError:
@@ -247,7 +69,7 @@ def read_rtf(file_path: str) -> str:
 
 
 def read_file(file_path: str) -> str:
-    """Универсальное чтение файла"""
+    """Универсальное чтение файла."""
     file_path = str(file_path)
     if file_path.endswith('.docx') or file_path.endswith('.doc'):
         return read_docx(file_path)
@@ -264,353 +86,389 @@ def read_file(file_path: str) -> str:
             return ""
 
 
+# ========== DATACLASS ДЛЯ ДОКУМЕНТА ==========
+
+@dataclass
+class ParsedDocument:
+    """Структура обработанного документа."""
+    doc_name: str
+    file_path: str
+    file_type: str
+    text: str
+    chunks: List[Dict[str, Any]] = field(default_factory=list)
+    metadata: Dict[str, Any] = field(default_factory=dict)
+
+
 # ========== ОСНОВНОЙ КЛАСС ПАРСЕРА ==========
 
 class DocumentParser:
-    """Парсер строительной документации"""
+    """
+    Универсальный парсер документов для инженерной базы знаний.
+    """
 
-    def __init__(self, nlp_model=None):
-        self.nlp = nlp_model or nlp
-        self.materials_set = MATERIALS
-        self.material_phrases = MATERIAL_PHRASES
-        self.standards_types = STANDARDS_TYPES
-        self.standard_patterns = STANDARD_PATTERNS
-        self.construction_terms = CONSTRUCTION_TERMS
-        self.lemma_materials = LEMMA_MATERIALS
-        self.lemma_structures = LEMMA_STRUCTURES
-        self.lemma_parameters = LEMMA_PARAMETERS
-        self.lemma_standards = LEMMA_STANDARDS
+    def __init__(
+        self,
+        chunk_size: int = 1200,
+        chunk_overlap: int = 200,
+        min_chunk_size: int = 120,
+    ):
+        self.chunk_size = max(300, chunk_size)
+        self.chunk_overlap = max(0, min(chunk_overlap, self.chunk_size // 2))
+        self.min_chunk_size = max(50, min_chunk_size)
 
-    def parse(self, file_path: str, max_chars: int = 500000) -> Dict[str, Any]:
-        """
-        Парсинг документа
+    def parse_file(self, file_path: str | Path) -> Dict[str, Any]:
+        """Парсит один файл и возвращает структурированный результат."""
+        path = Path(file_path)
 
-        Args:
-            file_path: Путь к файлу
-            max_chars: Максимальное количество символов для обработки
+        if not path.exists():
+            raise FileNotFoundError(f"Файл не найден: {path}")
 
-        Returns:
-            Dict с извлечёнными данными
-        """
-        print(f"📖 Чтение файла: {file_path}")
+        text = read_file(str(path))
+        text = self._normalize_text(text)
 
-        text = read_file(file_path)
-        if not text:
-            return {"error": f"Не удалось прочитать файл {file_path}"}
+        chunks = self.split_into_chunks(text, doc_name=path.name)
+        metadata = self._build_metadata(path, text, chunks)
 
-        print(f"✅ Загружено {len(text)} символов")
-
-        # Ограничиваем текст для обработки
-        text_to_process = text[:max_chars]
-        doc = self.nlp(text_to_process)
-
-        result = {
-            'file': str(file_path),
-            'full_text': text[:10000] + "..." if len(text) > 10000 else text,
-            'stats': {
-                'characters': len(text),
-                'words': len([t for t in doc if not t.is_space]),
-                'sentences': len(list(doc.sents))
-            },
-            'materials': set(),
-            'structures': set(),
-            'parameters': set(),
-            'materials_lemmas': set(),
-            'structures_lemmas': set(),
-            'parameters_lemmas': set(),
-            'standards': [],
-            'temperatures': [],
-            'thicknesses': [],
-            'densities': [],
-            'speeds': [],
-            'flows': [],
-            'sections': {},
-            'tables': [],
-            'formulas': []
+        return {
+            "doc_name": path.name,
+            "file_path": str(path),
+            "file_type": path.suffix.lstrip("."),
+            "text": text,
+            "chunks": chunks,
+            "metadata": metadata,
         }
 
-        # Поиск разделов
-        result['sections'] = self._extract_sections(text)
+    def parse_directory(
+        self,
+        directory: str | Path,
+        recursive: bool = True,
+        allowed_extensions: Optional[List[str]] = None,
+    ) -> List[Dict[str, Any]]:
+        """Парсит все файлы в директории."""
+        base = Path(directory)
+        if not base.exists():
+            raise FileNotFoundError(f"Папка не найдена: {base}")
 
-        # Поиск терминов
-        materials, structures, parameters = self._extract_terms(doc, text)
-        result['materials'] = list(materials)
-        result['structures'] = list(structures)
-        result['parameters'] = list(parameters)
+        allowed = {
+            ext.lower()
+            for ext in (
+                allowed_extensions
+                or [".txt", ".md", ".pdf", ".docx", ".html", ".htm", ".json", ".csv", ".rtf"]
+            )
+        }
 
-        # Поиск стандартов
-        result['standards'] = self._extract_standards(text)
+        pattern = "**/*" if recursive else "*"
+        results: List[Dict[str, Any]] = []
 
-        # Поиск таблиц
-        result['tables'] = self._extract_tables(text)
+        for path in sorted(base.glob(pattern)):
+            if not path.is_file():
+                continue
+            if path.suffix.lower() not in allowed:
+                continue
 
-        # Поиск формул
-        result['formulas'] = self._extract_formulas(text)
+            try:
+                results.append(self.parse_file(path))
+            except Exception as exc:
+                results.append(
+                    {
+                        "doc_name": path.name,
+                        "file_path": str(path),
+                        "file_type": path.suffix.lstrip("."),
+                        "text": "",
+                        "chunks": [],
+                        "metadata": {
+                            "error": str(exc),
+                            "parsed": False,
+                        },
+                    }
+                )
 
-        # Числовые значения
-        result['temperatures'] = self._extract_numeric_values(text, r'[−-]?\d+(?:[.,]\d+)?\s*°[CС]')
-        result['thicknesses'] = self._extract_numeric_values(text, r'\d+(?:[.,]\d+)?\s*мм')
-        result['densities'] = self._extract_numeric_values(text, r'\d+(?:[.,]\d+)?\s*кг/м³')
-        result['speeds'] = self._extract_numeric_values(text, r'\d+(?:[.,]\d+)?\s*м/с')
-        result['flows'] = self._extract_numeric_values(text, r'\d+(?:[.,]\d+)?\s*м³/ч')
+        return results
 
-        # Преобразуем множества в списки
-        result['materials'] = list(result['materials'])
-        result['structures'] = list(result['structures'])
-        result['parameters'] = list(result['parameters'])
-        result['standards'] = list(set(result['standards']))
+    def split_into_chunks(self, text: str, doc_name: str = "") -> List[Dict[str, Any]]:
+        """Разбивает текст на смысловые фрагменты с перекрытием."""
+        text = self._normalize_text(text)
+        if not text:
+            return []
 
-        print(f"📊 Найдено материалов: {len(result['materials'])}")
-        print(f"📊 Найдено стандартов: {len(result['standards'])}")
-        print(f"📊 Найдено таблиц: {len(result['tables'])}")
-        print(f"📊 Найдено формул: {len(result['formulas'])}")
+        paragraphs = self._split_paragraphs(text)
+        chunks: List[Dict[str, Any]] = []
+
+        current = ""
+        chunk_id = 0
+        start_char = 0
+
+        for paragraph in paragraphs:
+            paragraph = paragraph.strip()
+            if not paragraph:
+                continue
+
+            candidate = f"{current}\n\n{paragraph}".strip() if current else paragraph
+
+            if len(candidate) <= self.chunk_size:
+                current = candidate
+                continue
+
+            if current:
+                chunks.append(
+                    self._make_chunk(
+                        chunk_id=chunk_id,
+                        doc_name=doc_name,
+                        text=current,
+                        start_char=start_char,
+                    )
+                )
+                start_char += len(current)
+                chunk_id += 1
+
+                overlap_text = current[-self.chunk_overlap:] if self.chunk_overlap else ""
+                overlap_text = self._smart_overlap(overlap_text)
+                current = (
+                    f"{overlap_text}\n\n{paragraph}".strip()
+                    if overlap_text
+                    else paragraph
+                )
+            else:
+                sentence_parts = self._split_long_text(paragraph)
+                for part in sentence_parts:
+                    if len(part.strip()) >= self.min_chunk_size:
+                        chunks.append(
+                            self._make_chunk(
+                                chunk_id=chunk_id,
+                                doc_name=doc_name,
+                                text=part.strip(),
+                                start_char=start_char,
+                            )
+                        )
+                        start_char += len(part)
+                        chunk_id += 1
+                current = ""
+
+        if current and len(current.strip()) >= self.min_chunk_size:
+            chunks.append(
+                self._make_chunk(
+                    chunk_id=chunk_id,
+                    doc_name=doc_name,
+                    text=current.strip(),
+                    start_char=start_char,
+                )
+            )
+
+        return chunks
+
+    def _make_chunk(
+        self, chunk_id: int, doc_name: str, text: str, start_char: int
+    ) -> Dict[str, Any]:
+        """Создаёт структурированный фрагмент с метаданными."""
+        formulas = self.extract_formulas(text)
+        table_like = self.detect_table_like_content(text)
+
+        return {
+            "chunk_id": chunk_id,
+            "doc_name": doc_name,
+            "docname": doc_name,  # для обратной совместимости
+            "text": text.strip(),
+            "start_char": start_char,
+            "end_char": start_char + len(text),
+            "char_count": len(text),
+            "word_count": len(text.split()),
+            "has_formula": len(formulas) > 0,
+            "has_table_like_content": table_like,
+            "formulas": formulas,
+        }
+
+    # ========== СТАТИЧЕСКИЕ МЕТОДЫ ==========
+
+    @staticmethod
+    def _normalize_text(text: str) -> str:
+        """Нормализует текст: удаляет лишние пробелы и символы."""
+        if not text:
+            return ""
+
+        text = text.replace("\x00", " ")
+        text = text.replace("\r\n", "\n").replace("\r", "\n")
+        text = text.replace("\t", " ")
+        text = re.sub(r"[ ]{2,}", " ", text)
+        text = re.sub(r"\n{3,}", "\n\n", text)
+        return text.strip()
+
+    def _split_paragraphs(self, text: str) -> List[str]:
+        """Разбивает текст на параграфы."""
+        parts = re.split(r"\n\s*\n", text)
+        result: List[str] = []
+
+        for part in parts:
+            part = part.strip()
+            if not part:
+                continue
+
+            if len(part) > self.chunk_size * 1.5:
+                result.extend(self._split_long_text(part))
+            else:
+                result.append(part)
 
         return result
 
-    def _extract_sections(self, text: str) -> Dict[str, str]:
-        """Извлечение разделов документа"""
-        sections = {}
+    def _split_long_text(self, text: str) -> List[str]:
+        """Разбивает длинный текст на предложения."""
+        sentences = re.split(r"(?<=[.!?;:])\s+", text)
+        if len(sentences) <= 1:
+            return self._hard_split(text)
+
+        result: List[str] = []
+        current = ""
+
+        for sentence in sentences:
+            sentence = sentence.strip()
+            if not sentence:
+                continue
+
+            candidate = f"{current} {sentence}".strip() if current else sentence
+            if len(candidate) <= self.chunk_size:
+                current = candidate
+            else:
+                if current:
+                    result.append(current.strip())
+                    overlap = current[-self.chunk_overlap:] if self.chunk_overlap else ""
+                    overlap = self._smart_overlap(overlap)
+                    current = f"{overlap} {sentence}".strip() if overlap else sentence
+                else:
+                    result.extend(self._hard_split(sentence))
+                    current = ""
+
+        if current.strip():
+            result.append(current.strip())
+
+        return result
+
+    def _hard_split(self, text: str) -> List[str]:
+        """Принудительно разбивает текст на части."""
+        parts: List[str] = []
+        start = 0
+
+        while start < len(text):
+            end = min(start + self.chunk_size, len(text))
+            if end < len(text):
+                split_pos = text.rfind(" ", start, end)
+                if split_pos > start + self.min_chunk_size:
+                    end = split_pos
+
+            part = text[start:end].strip()
+            if part:
+                parts.append(part)
+
+            if end >= len(text):
+                break
+
+            start = max(end - self.chunk_overlap, start + 1)
+
+        return parts
+
+    @staticmethod
+    def _smart_overlap(text: str) -> str:
+        """Умное перекрытие для фрагментов."""
+        text = text.strip()
+        if not text:
+            return ""
+
+        split_pos = text.find(" ")
+        if 0 < split_pos < len(text) // 2:
+            text = text[split_pos + 1:].strip()
+
+        return text
+
+    @staticmethod
+    def extract_formulas(text: str) -> List[Dict[str, Any]]:
+        """Извлекает формулы из текста по паттернам."""
+        formulas: List[Dict[str, Any]] = []
+
         patterns = [
-            r'\n(\d+(?:\.\d+)*)\s+([А-ЯЁ][^\n]{5,100})',
-            r'\n(Раздел|Глава|Приложение)\s+(\d+[\.\s]+)([А-ЯЁ][^\n]{5,100})',
+            r"[A-Za-zА-Яа-яλΔQqRrtTVGLcpnρ]+\s*=\s*[^.\n]{3,120}",
+            r"\([^)\n]*[=+\-*/][^)\n]*\)",
         ]
 
         for pattern in patterns:
-            for match in re.finditer(pattern, text[:50000]):
-                groups = match.groups()
-                if len(groups) >= 2:
-                    num = groups[0] if groups[0] else groups[1]
-                    title = groups[1] if len(groups) == 2 else groups[2]
-                    if num and title:
-                        sections[num.strip()] = title.strip()[:80]
+            for match in re.findall(pattern, text):
+                raw = match.strip()
+                if len(raw) < 4:
+                    continue
 
-        return sections
+                formulas.append(
+                    {
+                        "raw": raw,
+                        "variables": list(
+                            sorted(set(re.findall(r"[A-Za-zА-Яа-яλΔ]+", raw)))
+                        ),
+                        "has_operator": any(
+                            op in raw for op in ["=", "+", "-", "*", "/", "^"]
+                        ),
+                    }
+                )
 
-    def _extract_terms(self, doc, text: str) -> Tuple[Set[str], Set[str], Set[str]]:
-        """Извлечение материалов, конструкций и параметров"""
-        materials = set()
-        structures = set()
-        parameters = set()
-
-        # Обработка токенов
-        for token in doc:
-            if token.is_punct or token.is_space:
-                continue
-
-            lemma = token.lemma_.lower()
-            text_orig = token.text
-
-            # Поиск материалов
-            if lemma in self.lemma_materials or text_orig in self.materials_set:
-                materials.add(text_orig)
-
-            # Поиск биграмм
-            if token.i + 1 < len(doc):
-                bigram = f"{token.text} {doc[token.i + 1].text}".lower()
-                if bigram in self.lemma_materials or bigram in self.material_phrases:
-                    materials.add(bigram)
-
-            # Поиск триграмм
-            if token.i + 2 < len(doc):
-                trigram = f"{token.text} {doc[token.i + 1].text} {doc[token.i + 2].text}".lower()
-                if trigram in self.material_phrases:
-                    materials.add(trigram)
-
-            # Поиск конструкций
-            if lemma in self.lemma_structures:
-                structures.add(text_orig)
-
-            # Поиск параметров
-            if lemma in self.lemma_parameters:
-                parameters.add(text_orig)
-
-            # Поиск нормативов
-            if token.text.upper() in self.lemma_standards:
-                if token.i + 1 < len(doc) and doc[token.i + 1].like_num:
-                    pass  # Обработка в _extract_standards
-
-        # Прямой поиск в тексте
-        text_lower = text.lower()
-        for material in self.materials_set:
-            if material in text_lower:
-                materials.add(material)
-
-        for phrase in self.material_phrases:
-            if phrase in text_lower:
-                materials.add(phrase)
-
-        # Поиск по маркерам
-        markers = ['материал', 'покрытие', 'изоляция', 'утеплитель', 'плита', 'мат', 'слой', 'жидкость', 'раствор']
-        for sent in doc.sents:
-            sent_text = sent.text.lower()
-            for marker in markers:
-                if marker in sent_text:
-                    for token in sent:
-                        if token.pos_ == 'NOUN' and len(token.text) > 3:
-                            lemma = token.lemma_.lower()
-                            if lemma in self.lemma_materials:
-                                materials.add(token.text)
-
-        return materials, structures, parameters
-
-    def _extract_standards(self, text: str) -> List[str]:
-        """Извлечение стандартов (ГОСТ, СП, СНиП)"""
-        standards = []
-
-        # По паттернам
-        for pattern in self.standard_patterns:
-            matches = re.findall(pattern, text)
-            standards.extend(matches)
-
-        # По ключевым словам
-        for token in re.findall(r'[А-Я]{2,}\s+\d+[\.\d-]*', text):
-            if any(token.startswith(st) for st in self.standards_types):
-                standards.append(token)
-
-        return list(set(standards))
-
-    def _extract_tables(self, text: str) -> List[Dict]:
-        """Извлечение таблиц из текста"""
-        tables = []
-        lines = text.split('\n')
-        in_table = False
-        table_lines = []
-        table_title = ""
-        table_id = ""
-
-        for i, line in enumerate(lines):
-            # Поиск заголовка таблицы
-            match = re.search(r'(?:Таблица|табл\.?)\s+(\d+)\s*[—\-–]\s*([^\n]+)', line, re.IGNORECASE)
-            if match:
-                table_id = match.group(1)
-                table_title = match.group(2).strip()
-                in_table = True
-                table_lines = []
-                continue
-
-            # Поиск таблицы с разделителями
-            if '|' in line and len(line.split('|')) > 2:
-                if not in_table:
-                    in_table = True
-                    table_lines = []
-                    if i > 0 and len(lines[i - 1].strip()) < 100:
-                        table_title = lines[i - 1].strip()
-                table_lines.append(line.strip())
-            else:
-                if in_table and table_lines:
-                    tables.append({
-                        'id': table_id or str(len(tables) + 1),
-                        'title': table_title or f"Таблица {len(tables) + 1}",
-                        'content': '\n'.join(table_lines),
-                        'rows': [l for l in table_lines if l.strip()]
-                    })
-                    table_lines = []
-                    in_table = False
-                    table_title = ""
-                    table_id = ""
-
-        # Добавляем последнюю таблицу
-        if in_table and table_lines:
-            tables.append({
-                'id': table_id or str(len(tables) + 1),
-                'title': table_title or f"Таблица {len(tables) + 1}",
-                'content': '\n'.join(table_lines),
-                'rows': [l for l in table_lines if l.strip()]
-            })
-
-        return tables
-
-    def _extract_formulas(self, text: str) -> List[Dict]:
-        """Извлечение формул из текста"""
-        formulas = []
+        unique: List[Dict[str, Any]] = []
         seen = set()
 
-        patterns = [
-            r'([A-Za-zА-Яа-я][_\w]*)\s*=\s*([^=;\n]+)',
-            r'(?:формул[аы]|по формуле)\s*[:;]\s*([^;\n]+)',
-            r'\(([^)]*[=+\-*/^][^)]*)\)',
-        ]
+        for item in formulas:
+            key = item["raw"]
+            if key not in seen:
+                seen.add(key)
+                unique.append(item)
 
-        for pattern in patterns:
-            matches = re.findall(pattern, text, re.IGNORECASE | re.MULTILINE)
-            for match in matches:
-                if isinstance(match, tuple):
-                    if len(match) >= 2:
-                        var_part, expr_part = match[0], match[1]
-                    else:
-                        continue
-                else:
-                    var_part = None
-                    expr_part = match
+        return unique[:20]
 
-                expr_clean = str(expr_part).strip()
-                expr_clean = re.sub(r'\s+', ' ', expr_clean)
+    @staticmethod
+    def detect_table_like_content(text: str) -> bool:
+        """Определяет, содержит ли текст табличное содержимое."""
+        if "|" in text:
+            return True
 
-                if len(expr_clean) > 3 and expr_clean not in seen:
-                    seen.add(expr_clean)
-                    variables = re.findall(r'[A-Za-zА-Яа-я][_\w]*', expr_clean)
-                    formulas.append({
-                        'raw': expr_clean,
-                        'variables': list(set(variables)),
-                        'has_operator': any(c in expr_clean for c in ['+', '-', '*', '/', '^', '='])
-                    })
+        lines = [line.strip() for line in text.splitlines() if line.strip()]
+        if len(lines) < 2:
+            return False
 
-        return formulas
+        tabular_lines = 0
+        for line in lines[:12]:
+            if re.search(r"\s{2,}", line):
+                tabular_lines += 1
+            elif len(re.findall(r"\d+", line)) >= 3:
+                tabular_lines += 1
 
-    def _extract_numeric_values(self, text: str, pattern: str) -> List[str]:
-        """Извлечение числовых значений по паттерну"""
-        matches = re.findall(pattern, text)
-        return list(set(matches))
+        return tabular_lines >= 2
 
-    def parse_multiple(self, file_paths: List[str]) -> Dict[str, Any]:
-        """Парсинг нескольких файлов"""
-        combined_result = {
-            'files': [],
-            'all_materials': set(),
-            'all_structures': set(),
-            'all_parameters': set(),
-            'all_standards': set(),
-            'all_tables': [],
-            'all_formulas': [],
-            'total_stats': {
-                'files': len(file_paths),
-                'characters': 0,
-                'words': 0,
-                'sentences': 0
-            }
+    @staticmethod
+    def _build_metadata(
+        path: Path, text: str, chunks: List[Dict[str, Any]]
+    ) -> Dict[str, Any]:
+        """Собирает метаданные документа."""
+        return {
+            "parsed": True,
+            "file_name": path.name,
+            "file_stem": path.stem,
+            "suffix": path.suffix.lower(),
+            "size_bytes": path.stat().st_size,
+            "char_count": len(text),
+            "word_count": len(text.split()),
+            "chunk_count": len(chunks),
+            "has_formulas": any(chunk.get("has_formula") for chunk in chunks),
+            "has_table_like_content": any(
+                chunk.get("has_table_like_content") for chunk in chunks
+            ),
         }
 
-        for file_path in file_paths:
-            result = self.parse(file_path)
-            if 'error' not in result:
-                combined_result['files'].append(result)
-                combined_result['all_materials'].update(result.get('materials', []))
-                combined_result['all_structures'].update(result.get('structures', []))
-                combined_result['all_parameters'].update(result.get('parameters', []))
-                combined_result['all_standards'].update(result.get('standards', []))
-                combined_result['all_tables'].extend(result.get('tables', []))
-                combined_result['all_formulas'].extend(result.get('formulas', []))
 
-                stats = result.get('stats', {})
-                combined_result['total_stats']['characters'] += stats.get('characters', 0)
-                combined_result['total_stats']['words'] += stats.get('words', 0)
-                combined_result['total_stats']['sentences'] += stats.get('sentences', 0)
+# ========== УДОБНЫЕ ФУНКЦИИ ДЛЯ ВЫЗОВА ==========
 
-        # Преобразуем множества в списки
-        combined_result['all_materials'] = list(combined_result['all_materials'])
-        combined_result['all_structures'] = list(combined_result['all_structures'])
-        combined_result['all_parameters'] = list(combined_result['all_parameters'])
-        combined_result['all_standards'] = list(combined_result['all_standards'])
+def parse_file(file_path: str | Path, **kwargs) -> Dict[str, Any]:
+    """Удобная функция для парсинга одного файла."""
+    parser = DocumentParser(**kwargs)
+    return parser.parse_file(file_path)
 
-        return combined_result
-# УТИЛИТНЫЕ ФУНКЦИИ
-def save_to_json(result: Dict, output_file: Path):
-    """Сохранение результатов парсинга в JSON"""
-    output_file.parent.mkdir(parents=True, exist_ok=True)
-    with open(output_file, 'w', encoding='utf-8') as f:
-        json.dump(result, f, ensure_ascii=False, indent=2, default=str)
-    print(f"💾 Результат сохранен в {output_file}")
-def load_from_json(input_file: Path) -> Dict:
-    """Загрузка результатов парсинга из JSON"""
-    with open(input_file, 'r', encoding='utf-8') as f:
-        return json.load(f)
+
+def parse_directory(directory: str | Path, **kwargs) -> List[Dict[str, Any]]:
+    """Удобная функция для парсинга директории."""
+    parser = DocumentParser(
+        chunk_size=kwargs.pop("chunk_size", 1200),
+        chunk_overlap=kwargs.pop("chunk_overlap", 200),
+        min_chunk_size=kwargs.pop("min_chunk_size", 120),
+    )
+    return parser.parse_directory(directory, **kwargs)

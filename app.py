@@ -1,34 +1,46 @@
-import streamlit as st
-from pathlib import Path
-import sys
-import json
-from datetime import datetime
+# -*- coding: utf-8 -*-
+"""
+Инженерный чат-бот для работы с документацией.
+Интегрирует:
+- QASystem для поиска по документам
+- FormulaEngine для инженерных расчётов
+- AgentLoop для многошаговых рассуждений
+- ErrorHandler для обработки ошибок
+- Экспорт в DOCX и PDF
+- Извлечение таблиц и расчёты по таблицам
+"""
+
 import asyncio
-import os
+import json
+import sys
+from datetime import datetime
+from pathlib import Path
+
+import streamlit as st
 
 sys.path.insert(0, str(Path(__file__).parent))
 
-from core.qa_engine import QASystem
-from core.formula_engine import FormulaEngine
 from core.agent_loop import AgentLoop
-from utils.config import RAW_DIR, PROCESSED_DIR
 from core.error_handler import ErrorHandler
+from core.formula_engine import FormulaEngine
 from core.prompts import get_quick_definition
-from core.table_extractor import patch_qa_system_with_table_extractor
+from core.qa_engine import QASystem
 from core.table_calculator import TableCalculator
+from core.table_extractor import patch_qa_system_with_table_extractor
+from utils.config import PROCESSED_DIR, RAW_DIR
 
-# Применяем патч для таблиц
+# Применяем патч для улучшенного извлечения таблиц
 try:
     patch_qa_system_with_table_extractor()
     print("✅ TableExtractor применён")
-except Exception as e:
-    print(f"⚠️ Не удалось применить TableExtractor: {e}")
+except Exception as exc:
+    print(f"⚠️ Не удалось применить TableExtractor: {exc}")
 
 st.set_page_config(
     page_title="Инженерный чат-бот",
     page_icon="🏗️",
     layout="wide",
-    initial_sidebar_state="expanded"
+    initial_sidebar_state="expanded",
 )
 
 HISTORY_FILE = PROCESSED_DIR / "chat_history.json"
@@ -37,7 +49,7 @@ HISTORY_FILE = PROCESSED_DIR / "chat_history.json"
 # ========= ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ =========
 
 def run_async_safely(async_func, *args, **kwargs):
-    """Безопасный запуск асинхронной функции в Streamlit"""
+    """Безопасный запуск асинхронной функции в Streamlit."""
     loop = None
     try:
         loop = asyncio.new_event_loop()
@@ -50,7 +62,7 @@ def run_async_safely(async_func, *args, **kwargs):
 
 
 def call_maybe_async(func, *args, **kwargs):
-    """Универсальный вызов sync/async функции"""
+    """Универсальный вызов sync/async функции."""
     result = func(*args, **kwargs)
     if asyncio.iscoroutine(result):
         return run_async_safely(lambda: result)
@@ -58,9 +70,11 @@ def call_maybe_async(func, *args, **kwargs):
 
 
 def get_initial_message():
-    return [{
-        "role": "assistant",
-        "content": """🏗️ **Здравствуйте!** Я инженерный помощник по строительной документации.
+    """Начальное приветственное сообщение."""
+    return [
+        {
+            "role": "assistant",
+            "content": """🏗️ **Здравствуйте!** Я инженерный помощник по строительной документации.
 
 📖 **База знаний:** ГОСТы, СП, технические регламенты и методические документы по строительству
 
@@ -72,13 +86,15 @@ def get_initial_message():
 • 📊 Находить таблицы и формулы в документах
 • 🔍 Искать определения терминов
 
-**Задайте свой вопрос или попросите сделать расчет!**"""
-    }]
+**Задайте свой вопрос или попросите сделать расчет!**""",
+        }
+    ]
 
 
 # ========= ЭКСПОРТ В ИСТОРИЮ =========
 
 def export_history_to_docx():
+    """Экспорт истории чата в DOCX."""
     try:
         from docx import Document
 
@@ -98,68 +114,13 @@ def export_history_to_docx():
         doc.save(str(output_path))
         return output_path
 
-    except Exception as e:
-        st.error(f"❌ Ошибка: {e}")
+    except Exception as exc:
+        st.error(f"❌ Ошибка: {exc}")
         return None
 
 
-# ========= ИНИЦИАЛИЗАЦИЯ =========
-
-def init_session_state():
-    """Инициализация состояния сессии"""
-    if 'qa_system' not in st.session_state:
-        st.session_state.qa_system = QASystem(use_llm=False)
-
-        # ПЫТАЕМСЯ ЗАГРУЗИТЬ ИНДЕКС СРАЗУ
-        idx_path = PROCESSED_DIR / "qa_index"
-        if idx_path.exists():
-            loaded = st.session_state.qa_system.load_index(idx_path)
-            if loaded:
-                print(f"✅ Индекс загружен при старте: {st.session_state.qa_system.index.ntotal} векторов")
-            else:
-                print("⚠️ Не удалось загрузить индекс")
-        else:
-            print("📁 Индекс не найден, будет создан при первой необходимости")
-
-    if "formula_engine" not in st.session_state:
-        st.session_state.formula_engine = FormulaEngine(st.session_state.qa_system)
-
-    if "agent_loop" not in st.session_state:
-        st.session_state.agent_loop = AgentLoop(
-            st.session_state.qa_system,
-            st.session_state.formula_engine
-        )
-
-    if "error_handler" not in st.session_state:
-        st.session_state.error_handler = ErrorHandler(log_level="info")
-
-    if "messages" not in st.session_state:
-        if HISTORY_FILE.exists():
-            try:
-                with open(HISTORY_FILE, "r", encoding="utf-8") as f:
-                    st.session_state.messages = json.load(f)
-            except (json.JSONDecodeError, IOError):
-                st.session_state.messages = get_initial_message()
-        else:
-            st.session_state.messages = get_initial_message()
-
-    if "current_answer" not in st.session_state:
-        st.session_state.current_answer = ""
-    if "current_sources" not in st.session_state:
-        st.session_state.current_sources = []
-    if "current_tables" not in st.session_state:
-        st.session_state.current_tables = []
-    if "current_formulas" not in st.session_state:
-        st.session_state.current_formulas = []
-
-    if "current_response_id" not in st.session_state:
-        st.session_state.current_response_id = 0
-
-
-# ========= ФУНКЦИИ ЭКСПОРТА =========
-
 def export_to_docx(answer: str, sources: list, tables: list = None, formulas: list = None, filename: str = None):
-    """Экспорт в DOCX"""
+    """Экспорт отчёта в DOCX."""
     if filename is None:
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         filename = f"engineering_report_{timestamp}.docx"
@@ -225,7 +186,7 @@ def export_to_docx(answer: str, sources: list, tables: list = None, formulas: li
 
 
 def export_to_pdf(answer: str, sources: list, tables: list = None, formulas: list = None, filename: str = None):
-    """Экспорт в PDF"""
+    """Экспорт отчёта в PDF."""
     if filename is None:
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         filename = f"engineering_report_{timestamp}.pdf"
@@ -303,7 +264,7 @@ def export_to_pdf(answer: str, sources: list, tables: list = None, formulas: lis
 
 def render_export_buttons(answer, sources, tables, formulas, key_suffix="current", response_id=None):
     """
-    Отображение кнопок экспорта с ГАРАНТИРОВАННО уникальными ключами.
+    Отображение кнопок экспорта с уникальными ключами.
     """
     if response_id is None:
         response_id = st.session_state.get("current_response_id", 0)
@@ -374,10 +335,62 @@ def render_export_buttons(answer, sources, tables, formulas, key_suffix="current
             st.success("✅ Текст скопирован в буфер обмена!")
 
 
-# ========= АВТОЗАГРУЗКА ДОКУМЕНТОВ =========
+# ========= ИНИЦИАЛИЗАЦИЯ =========
+
+def init_session_state():
+    """Инициализация состояния сессии."""
+    if "qa_system" not in st.session_state:
+        st.session_state.qa_system = QASystem(use_llm=False)
+
+        idx_path = PROCESSED_DIR / "qa_index"
+        if idx_path.exists():
+            try:
+                loaded = st.session_state.qa_system.load_index(idx_path)
+                if loaded:
+                    print("✅ Индекс загружен при старте")
+                else:
+                    print("⚠️ Не удалось загрузить индекс")
+            except Exception as exc:
+                print(f"⚠️ Ошибка загрузки индекса: {exc}")
+        else:
+            print("📁 Индекс пока не найден")
+
+    if "formula_engine" not in st.session_state:
+        st.session_state.formula_engine = FormulaEngine(st.session_state.qa_system)
+
+    if "agent_loop" not in st.session_state:
+        st.session_state.agent_loop = AgentLoop(
+            st.session_state.qa_system,
+            st.session_state.formula_engine,
+        )
+
+    if "table_calculator" not in st.session_state:
+        st.session_state.table_calculator = TableCalculator(st.session_state.qa_system)
+
+    if "messages" not in st.session_state:
+        st.session_state.messages = get_initial_message()
+
+    if "current_answer" not in st.session_state:
+        st.session_state.current_answer = ""
+
+    if "current_sources" not in st.session_state:
+        st.session_state.current_sources = []
+
+    if "current_tables" not in st.session_state:
+        st.session_state.current_tables = []
+
+    if "current_formulas" not in st.session_state:
+        st.session_state.current_formulas = []
+
+    if "current_response_id" not in st.session_state:
+        st.session_state.current_response_id = 0
+
+    if "error_handler" not in st.session_state:
+        st.session_state.error_handler = ErrorHandler()
+
 
 def auto_load_documents():
-    """Автоматическая загрузка и индексация документов"""
+    """Автоматическая загрузка и индексация документов."""
     qa_system = st.session_state.qa_system
     idx_path = PROCESSED_DIR / "qa_index"
 
@@ -454,6 +467,7 @@ def main():
         auto_load_documents()
         st.divider()
 
+        # Кнопки управления индексом
         col1, col2 = st.columns(2)
         with col1:
             if st.button("🔄 Перезагрузить индекс", use_container_width=True):
