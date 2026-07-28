@@ -1,4 +1,4 @@
-# -*- coding: utf-8 -*-
+# core/qa_engine.py
 """
 QA Engine для работы с документацией.
 Поддерживает:
@@ -8,836 +8,684 @@ QA Engine для работы с документацией.
 - Индексацию документов
 - Кэширование индекса
 - Поиск определений
+- Опциональный LLM (OpenAI) для генерации ответов
 """
 
-import numpy as np
-import faiss
-from typing import List, Dict, Optional, Any
-import pickle
-from pathlib import Path
-import re
 import hashlib
-import json
-from datetime import datetime
+import os
+import pickle
+import re
+from pathlib import Path
+from typing import Any, Dict, List, Optional, cast
 
-# ========== ИМПОРТЫ С ОБРАБОТКОЙ ОШИБОК ==========
+# noinspection PyUnresolvedReferences
+import faiss
 
-# SentenceTransformer
+# noinspection PyUnresolvedReferences
+import numpy as np
+
 try:
     from sentence_transformers import SentenceTransformer
-
-    SENTENCE_TRANSFORMER_AVAILABLE = True
 except ImportError:
-    SENTENCE_TRANSFORMER_AVAILABLE = False
-    SentenceTransformer = None
-    print("⚠️ sentence-transformers не установлен. pip install sentence-transformers")
+    SentenceTransformer = None  # type: ignore
 
-# BM25
 try:
     from rank_bm25 import BM25Okapi
-
-    BM25_AVAILABLE = True
 except ImportError:
-    BM25_AVAILABLE = False
-    BM25Okapi = None
-    print("⚠️ rank-bm25 не установлен. Гибридный поиск недоступен.")
+    BM25Okapi = None  # type: ignore
 
-# HuggingFace Hub
 try:
     from huggingface_hub import snapshot_download
-
-    SNAPSHOT_AVAILABLE = True
 except ImportError:
-    SNAPSHOT_AVAILABLE = False
-    snapshot_download = None
-    print("⚠️ huggingface-hub не установлен. pip install huggingface-hub")
+    snapshot_download = None  # type: ignore
 
+try:
+    from openai import OpenAI
+except ImportError:
+    OpenAI = None  # type: ignore
 
-# ========== ОСНОВНОЙ КЛАСС ==========
 
 class QASystem:
-    """Система вопрос-ответ на основе документов"""
+    """Система вопрос-ответ на основе документов с поддержкой LLM."""
 
-    def __init__(self, use_llm: bool = False):
-        if not SENTENCE_TRANSFORMER_AVAILABLE:
-            raise ImportError("sentence-transformers не установлен")
+    def __init__(self, use_llm: bool = False) -> None:
+        if SentenceTransformer is None:
+            raise ImportError("Не установлен sentence-transformers")
 
         print("🔄 Загрузка модели эмбеддингов...")
-        self.model = SentenceTransformer('intfloat/multilingual-e5-small')
-        self.index: Optional[faiss.Index] = None
-        self.chunks: List[Dict] = []
+        model_cls = cast(Any, SentenceTransformer)
+        # noinspection SpellCheckingInspection
+        self.model = model_cls("intfloat/multilingual-e5-small")
         self.dimension = 384
+
+        # noinspection PyTypeChecker
+        self.index = None
+        self.chunks: List[Dict[str, Any]] = []
+        self.bm25_index = None
         self.is_ready = False
 
-        # LLM отключен
-        self.use_llm = False
+        self.use_llm = use_llm
         self.llm_engine = None
-        self.bm25_index = None
 
-        # Стоп-фразы для фильтрации
+        if self.use_llm:
+            if OpenAI is None:
+                raise ImportError("openai не установлен. Установи: pip install openai")
+
+            api_key = os.getenv("OPENAI_API_KEY", "").strip()
+            if not api_key:
+                raise ValueError("OPENAI_API_KEY не найден в переменных окружения")
+
+            openai_cls = cast(Any, OpenAI)
+            self.llm_engine = openai_cls(api_key=api_key)
+            print("✅ OpenAI клиент инициализирован")
+
         self.stop_phrases = [
-            '(В.', 'δ =', 'q =', 'tпов =', 'R =', 'tв =', 'tн =',
-            'поправочный', 'коэффициент, учитывающий'
+            ".", ",", "q", "t", "r", "tv", "tn", "tot", "zot",
+            "δ", "λ", "Q", "R", "A", "L", "("
         ]
+        self.definitions_cache: Dict[str, Dict[str, Any]] = {}
+        self._chunk_size = 1000
+        self._chunk_overlap = 200
 
-        # Кэш определений для быстрого доступа
-        self.definitions_cache = {}
+    @staticmethod
+    def normalize_text(text: str) -> str:
+        if not text:
+            return ""
+        text = text.replace("\xa0", " ")
+        text = re.sub(r"\s+", " ", text)
+        return text.strip()
 
-    # ========== ВСПОМОГАТЕЛЬНЫЕ МЕТОДЫ ==========
-
-    def _is_bad_chunk(self, text: str) -> bool:
-        """Проверяет, является ли чанк "плохим" (коротким или содержащим стоп-фразы)"""
-        text_stripped = text.strip()
-        for phrase in self.stop_phrases:
-            if text_stripped.startswith(phrase):
-                return True
+    def is_bad_chunk(self, text: str) -> bool:
+        text_stripped = self.normalize_text(text).lower()
         if len(text_stripped) < 50:
+            return True
+        if text_stripped in self.stop_phrases:
+            return True
+        if sum(ch.isalpha() for ch in text_stripped) < 20:
             return True
         return False
 
     @staticmethod
-    def chunk_text(text: str, doc_name: str, chunk_size=1000, overlap=200):
-        """Разбивает текст на чанки с перекрытием"""
-        chunks = []
-        sentences = re.split(r'[.!?]\s+', text)
+    def chunk_text(
+        text: str,
+        doc_name: str,
+        chunk_size: int = 1000,
+        overlap: int = 200,
+    ) -> List[Dict[str, Any]]:
+        text = re.sub(r"\s+", " ", text).strip()
+        if not text:
+            return []
 
-        current_chunk = ""
+        sentences = re.split(r"(?<=[.!?])\s+", text)
+        chunks: List[Dict[str, Any]] = []
+        current = ""
         chunk_id = 0
 
         for sent in sentences:
-            if len(current_chunk) + len(sent) < chunk_size:
-                current_chunk += sent + ". "
+            sent = sent.strip()
+            if not sent:
+                continue
+
+            if len(current) + len(sent) + 1 <= chunk_size:
+                current = f"{current} {sent}".strip()
             else:
-                if current_chunk:
+                if current:
                     chunks.append({
-                        'id': f"{doc_name}_{chunk_id}",
-                        'text': current_chunk.strip(),
-                        'doc_name': doc_name,
-                        'chunk_id': chunk_id
+                        "id": f"{doc_name}_{chunk_id}",
+                        "text": current,
+                        "doc_name": doc_name,
+                        "chunk_id": chunk_id,
                     })
                     chunk_id += 1
-                    if overlap > 0:
-                        words = current_chunk.split()
-                        current_chunk = " ".join(words[-overlap // 10:]) + " "
-                current_chunk += sent + ". "
 
-        if current_chunk:
+                    if overlap > 0:
+                        tail = current[-overlap:]
+                        current = f"{tail} {sent}".strip()
+                    else:
+                        current = sent
+
+        if current:
             chunks.append({
-                'id': f"{doc_name}_{chunk_id}",
-                'text': current_chunk.strip(),
-                'doc_name': doc_name,
-                'chunk_id': chunk_id
+                "id": f"{doc_name}_{chunk_id}",
+                "text": current,
+                "doc_name": doc_name,
+                "chunk_id": chunk_id,
             })
 
         return chunks
 
-    # ========== ЧТЕНИЕ ФАЙЛОВ ==========
-
     @staticmethod
-    def _read_docx(file_path: str) -> str:
-        """Чтение DOCX файла с извлечением таблиц"""
+    def read_docx(file_path: str) -> str:
         try:
+            # noinspection PyUnresolvedReferences
             from docx import Document
-            doc = Document(file_path)
-            text_parts = []
-
-            # Обычный текст
-            for para in doc.paragraphs:
-                text_parts.append(para.text)
-
-            # Таблицы
-            for table_idx, table in enumerate(doc.tables):
-                table_text = []
-                table_text.append(f"\n[ТАБЛИЦА {table_idx + 1}]")
-                for row in table.rows:
-                    row_text = []
-                    for cell in row.cells:
-                        row_text.append(cell.text.strip())
-                    if any(row_text):
-                        table_text.append(" | ".join(row_text))
-                if len(table_text) > 1:
-                    text_parts.append("\n".join(table_text))
-
-            return '\n'.join(text_parts)
         except ImportError:
             return ""
-        except Exception:
+
+        try:
+            doc = Document(file_path)
+            parts = [p.text for p in doc.paragraphs if p.text.strip()]
+
+            for table_idx, table in enumerate(doc.tables):
+                table_lines = [f"Таблица {table_idx + 1}"]
+                for row in table.rows:
+                    cells = [cell.text.strip() for cell in row.cells]
+                    if any(cells):
+                        table_lines.append(" | ".join(cells))
+                if len(table_lines) > 1:
+                    parts.append("\n".join(table_lines))
+
+            return "\n".join(parts)
+        except (OSError, ValueError):
             return ""
 
     @staticmethod
-    def _read_pdf(file_path: str) -> str:
-        """Чтение PDF файла с извлечением таблиц"""
+    def read_pdf(file_path: str) -> str:
+        # noinspection PyUnresolvedReferences
+        import fitz  # type: ignore
+
         try:
-            import fitz
+            parts: List[str] = []
             doc = fitz.open(file_path)
-            text_parts = []
-
-            # Текст из PDF
             for page_num, page in enumerate(doc):
-                text_parts.append(f"\n--- Страница {page_num + 1} ---")
-                text_parts.append(page.get_text())
+                parts.append(f"--- page {page_num + 1} ---")
+                parts.append(page.get_text())
 
-            # Пробуем извлечь таблицы через pdfplumber
             try:
+                # noinspection PyUnresolvedReferences
                 import pdfplumber
-                with pdfplumber.open(file_path) as pdf:
-                    for page_num, page in enumerate(pdf.pages):
-                        tables = page.extract_tables()
-                        for table_idx, table in enumerate(tables):
-                            if table and len(table) > 1:
-                                table_text = [f"\n[ТАБЛИЦА {table_idx + 1} на стр.{page_num + 1}]"]
+            except ImportError:
+                pdfplumber = None  # type: ignore
+
+            if pdfplumber is not None:
+                try:
+                    with pdfplumber.open(file_path) as pdf:
+                        for page_num, page in enumerate(pdf.pages):
+                            tables = page.extract_tables() or []
+                            for table_idx, table in enumerate(tables):
+                                lines = [f"Таблица {table_idx + 1}, страница {page_num + 1}"]
                                 for row in table:
                                     if row:
                                         row_text = [str(cell or "").strip() for cell in row]
                                         if any(row_text):
-                                            table_text.append(" | ".join(row_text))
-                                if len(table_text) > 1:
-                                    text_parts.append("\n".join(table_text))
-            except ImportError:
-                pass
-            except Exception:
-                pass
+                                            lines.append(" | ".join(row_text))
+                                if len(lines) > 1:
+                                    parts.append("\n".join(lines))
+                except (OSError, ValueError):
+                    pass
 
-            return '\n'.join(text_parts)
-        except ImportError:
-            return ""
-        except Exception:
+            return "\n".join(parts)
+        except (OSError, ValueError):
             return ""
 
     @staticmethod
-    def _read_rtf(file_path: str) -> str:
-        """Чтение RTF файла"""
+    def read_rtf(file_path: str) -> str:
         try:
+            # noinspection PyUnresolvedReferences
             from striprtf.striprtf import rtf_to_text
-            with open(file_path, 'r', encoding='utf-8', errors='replace') as f:
-                content = f.read()
-            return rtf_to_text(content).strip()
         except ImportError:
             print("⚠️ striprtf не установлен. pip install striprtf")
             return ""
-        except Exception as e:
-            print(f"⚠️ Ошибка чтения RTF: {e}")
+
+        try:
+            raw_text = Path(file_path).read_text(encoding="utf-8", errors="ignore")
+            return rtf_to_text(raw_text).strip()
+        except (OSError, ValueError):
+            return ""
+
+    def read_file(self, file_path: Path) -> str:
+        ext = file_path.suffix.lower()
+
+        try:
+            if ext in {".docx", ".doc"}:
+                return self.read_docx(str(file_path))
+            if ext == ".pdf":
+                return self.read_pdf(str(file_path))
+            if ext == ".rtf":
+                return self.read_rtf(str(file_path))
+            return file_path.read_text(encoding="utf-8", errors="ignore")
+        except (OSError, ValueError):
             return ""
 
     @staticmethod
-    def _read_rtf_pandoc(file_path: str) -> str:
-        """Чтение RTF через pandoc"""
-        try:
-            import pypandoc
-            try:
-                pypandoc.get_pandoc_version()
-            except Exception:
-                print("⚠️ Pandoc не установлен")
-                return ""
-            output = pypandoc.convert_file(
-                file_path,
-                'plain',
-                format='rtf',
-                extra_args=['--wrap=none']
-            )
-            return output.strip()
-        except ImportError:
-            return ""
-        except Exception as e:
-            print(f"⚠️ Ошибка pandoc: {e}")
-            return ""
-
-    def _read_file(self, file_path: Path) -> str:
-        """
-        Чтение файла с поддержкой различных форматов
-
-        Поддерживаемые форматы:
-        - .docx, .doc - через python-docx
-        - .pdf - через PyMuPDF (fitz)
-        - .rtf, .RTF - через striprtf или pypandoc
-        - .txt, .md, .csv, .json, .xml - как текстовые
-        """
-        path_str = str(file_path)
-        file_ext = Path(file_path).suffix.lower()
-
-        try:
-            if file_ext in ['.docx', '.doc']:
-                return self._read_docx(path_str)
-
-            elif file_ext == '.pdf':
-                return self._read_pdf(path_str)
-
-            elif file_ext in ['.rtf', '.RTF']:
-                text = self._read_rtf(path_str)
-                if not text or len(text.strip()) < 50:
-                    text = self._read_rtf_pandoc(path_str)
-                return text
-
-            elif file_ext in ['.txt', '.md', '.csv', '.json', '.xml']:
-                with open(path_str, 'r', encoding='utf-8', errors='ignore') as f:
-                    return f.read()
-
-            else:
-                print(f"⚠️ Неподдерживаемый формат {file_ext}")
-                try:
-                    with open(path_str, 'r', encoding='utf-8', errors='ignore') as f:
-                        return f.read()
-                except Exception:
-                    return ""
-
-        except Exception as e:
-            print(f"❌ Ошибка чтения файла {file_path.name}: {e}")
-            return ""
-
-    # ========== ИНДЕКСАЦИЯ С КЭШИРОВАНИЕМ ==========
-
-    @staticmethod
-    def _get_documents_hash(documents_dir: Path) -> str:
-        """Вычисляет хеш всех документов в директории"""
-        hash_md5 = hashlib.md5()
+    def get_documents_hash(documents_dir: Path) -> str:
+        md5 = hashlib.md5()
         for file_path in sorted(documents_dir.glob("*")):
-            if file_path.suffix.lower() in ['.docx', '.doc', '.pdf', '.rtf']:
+            if file_path.is_file() and file_path.suffix.lower() in {
+                ".docx", ".doc", ".pdf", ".rtf", ".txt", ".md", ".csv", ".json", ".xml"
+            }:
                 try:
-                    with open(file_path, 'rb') as f:
-                        for chunk in iter(lambda: f.read(4096), b''):
-                            hash_md5.update(chunk)
-                except (IOError, OSError):
+                    with open(file_path, "rb") as f:
+                        for chunk in iter(lambda: f.read(4096), b""):
+                            md5.update(chunk)
+                except OSError:
                     continue
-        return hash_md5.hexdigest()
+        return md5.hexdigest()
 
     @staticmethod
-    def _get_hash_file_path(documents_dir: Path) -> Path:
-        """Путь к файлу с хешем"""
+    def get_hash_file_path(documents_dir: Path) -> Path:
         return documents_dir.parent / "processed" / "docs_hash.txt"
 
-    def _load_saved_hash(self, documents_dir: Path) -> Optional[str]:
-        """Загружает сохранённый хеш документов"""
-        hash_file = self._get_hash_file_path(documents_dir)
-        if hash_file.exists():
-            try:
-                with open(hash_file, 'r') as f:
-                    return f.read().strip()
-            except (IOError, OSError):
-                return None
-        return None
-
-    def _save_hash(self, documents_dir: Path, hash_value: str):
-        """Сохраняет хеш документов"""
-        hash_file = self._get_hash_file_path(documents_dir)
+    def load_saved_hash(self, documents_dir: Path) -> Optional[str]:
+        hash_file = self.get_hash_file_path(documents_dir)
+        if not hash_file.exists():
+            return None
         try:
-            hash_file.parent.mkdir(parents=True, exist_ok=True)
-            with open(hash_file, 'w') as f:
-                f.write(hash_value)
-        except (IOError, OSError) as e:
-            print(f"⚠️ Не удалось сохранить хеш: {e}")
+            return hash_file.read_text(encoding="utf-8").strip()
+        except (OSError, ValueError):
+            return None
 
-    def _build_bm25_index(self):
-        """Создаёт BM25 индекс для гибридного поиска"""
-        if not BM25_AVAILABLE or not self.chunks or BM25Okapi is None:
-            return
-        try:
-            tokenized = [chunk['text'].split() for chunk in self.chunks]
-            self.bm25_index = BM25Okapi(tokenized)
-            print("✅ BM25 индекс создан для гибридного поиска")
-        except Exception as e:
-            print(f"⚠️ Не удалось создать BM25: {e}")
+    def save_hash(self, documents_dir: Path, hash_value: str) -> None:
+        hash_file = self.get_hash_file_path(documents_dir)
+        hash_file.parent.mkdir(parents=True, exist_ok=True)
+        hash_file.write_text(hash_value, encoding="utf-8")
+
+    @staticmethod
+    def tokenize(text: str) -> List[str]:
+        return re.findall(r"[A-Za-zА-Яа-я0-9\-]{2,}", text.lower())
+
+    def build_bm25_index(self) -> None:
+        if not self.chunks or BM25Okapi is None:
             self.bm25_index = None
+            return
 
-    def index_documents(self, documents_dir: Path):
-        """
-        Индексация документов с кэшированием.
-        Если индекс уже существует и документы не изменились - загружает из кэша.
-        """
-        if not documents_dir.exists():
-            print(f"⚠️ Директория {documents_dir} не существует, создаём...")
-            documents_dir.mkdir(parents=True, exist_ok=True)
+        bm25_cls = cast(Any, BM25Okapi)
+        tokenized = [self.tokenize(chunk["text"]) for chunk in self.chunks]
+        self.bm25_index = bm25_cls(tokenized)
 
-        # === ПРОВЕРЯЕМ КЭШ ===
-        index_path = documents_dir.parent / "processed" / "qa_index"
+    def save_index(self, index_dir: Path) -> None:
+        if self.index is None:
+            return
 
-        # Пытаемся загрузить существующий индекс
-        if index_path.exists():
-            if self.load_index(index_path):
-                print(f"✅ Индекс загружен из кэша: {self.index.ntotal} векторов")
-                self.is_ready = True
-                return True
+        try:
+            index_dir.mkdir(parents=True, exist_ok=True)
+            # noinspection PyUnresolvedReferences
+            faiss.write_index(self.index, str(index_dir / "qa_index.faiss"))
+            with open(index_dir / "chunks.pkl", "wb") as f:
+                pickle.dump(self.chunks, f)
+        except (OSError, ValueError):
+            return
 
-        # === ЕСЛИ НЕТ - СОЗДАЁМ ===
-        print("🔄 Создание нового индекса...")
+    def load_index(self, index_dir: Path) -> bool:
+        index_path = index_dir / "qa_index.faiss"
+        chunks_path = index_dir / "chunks.pkl"
 
-        # Скачиваем документы
-        if SNAPSHOT_AVAILABLE and snapshot_download is not None:
+        if not index_path.exists() or not chunks_path.exists():
+            return False
+
+        try:
+            # noinspection PyUnresolvedReferences
+            self.index = faiss.read_index(str(index_path))
+            with open(chunks_path, "rb") as f:
+                self.chunks = pickle.load(f)
+            self.build_bm25_index()
+            self.is_ready = True
+            return True
+        except (OSError, ValueError, pickle.UnpicklingError):
+            return False
+
+    def index_documents(self, documents_dir: Path) -> bool:
+        documents_dir.mkdir(parents=True, exist_ok=True)
+        index_dir = documents_dir.parent / "processed"
+
+        current_hash = self.get_documents_hash(documents_dir)
+        saved_hash = self.load_saved_hash(documents_dir)
+
+        if saved_hash == current_hash and self.load_index(index_dir):
+            return True
+
+        if snapshot_download is not None:
             try:
-                print("📥 Скачивание документов из dataset (snapshot)...")
-                snapshot_download(
+                snapshot_fn = cast(Any, snapshot_download)
+                snapshot_fn(
                     repo_id="Lana49/engineering-docs",
                     repo_type="dataset",
                     local_dir=str(documents_dir),
-                    allow_patterns=["*.docx", "*.doc", "*.pdf", "*.rtf", "*.RTF"],
+                    allow_patterns=["*.docx", "*.doc", "*.pdf", "*.rtf", "*.txt", "*.md", "*.csv", "*.json", "*.xml"],
                     local_dir_use_symlinks=False,
-                    force_download=False
+                    force_download=False,
                 )
-                print(f"✅ Документы скачаны в {documents_dir}")
-            except Exception as e:
-                print(f"⚠️ Ошибка скачивания: {e}")
-                print("📁 Использую локальные файлы")
-        else:
-            print("📁 Использую локальные файлы (huggingface-hub не доступен)")
+            except (OSError, ValueError):
+                pass
 
-        # Собираем чанки
-        all_chunks = []
-        files_found = False
+        all_chunks: List[Dict[str, Any]] = []
+
         for file_path in documents_dir.glob("*"):
-            if file_path.suffix.lower() in ['.docx', '.doc', '.pdf', '.rtf']:
-                files_found = True
-                try:
-                    text = self._read_file(file_path)
-                    if text and len(text.strip()) > 100:
-                        chunks = self.chunk_text(text, file_path.stem)
-                        all_chunks.extend(chunks)
-                        print(f"  ✅ {file_path.name}: {len(chunks)} чанков")
-                except Exception as e:
-                    print(f"  ❌ {file_path.name}: {e}")
+            if not file_path.is_file():
+                continue
+            if file_path.suffix.lower() not in {
+                ".docx", ".doc", ".pdf", ".rtf", ".txt", ".md", ".csv", ".json", ".xml"
+            }:
+                continue
 
-        if not files_found:
-            print(f"⚠️ В директории {documents_dir} нет поддерживаемых файлов")
-            print("Поддерживаемые форматы: .docx, .doc, .pdf, .rtf")
-            self.is_ready = False
-            return False
+            text = self.read_file(file_path)
+            if not text.strip():
+                continue
 
+            chunks = self.chunk_text(text, file_path.stem, self._chunk_size, self._chunk_overlap)
+            all_chunks.extend(chunks)
+
+        all_chunks = [c for c in all_chunks if not self.is_bad_chunk(c["text"])]
         if not all_chunks:
-            print("❌ Нет текста для индексации (файлы пусты или повреждены)")
             self.is_ready = False
             return False
 
-        # Генерация эмбеддингов
-        print(f"📊 Генерация эмбеддингов для {len(all_chunks)} чанков...")
-        texts = [chunk['text'] for chunk in all_chunks]
+        texts = [f"passage: {c['text']}" for c in all_chunks]
         embeddings = self.model.encode(texts, show_progress_bar=True)
+        # noinspection PyUnresolvedReferences,PyTypeChecker
+        embeddings = np.asarray(embeddings, dtype=np.float32)
 
-        # Нормализация
-        embeddings = embeddings / np.linalg.norm(embeddings, axis=1, keepdims=True)
+        # noinspection PyUnresolvedReferences
+        norms = np.linalg.norm(embeddings, axis=1, keepdims=True)
+        norms[norms == 0] = 1.0
+        embeddings = embeddings / norms
 
-        # Создание FAISS индекса
+        # noinspection PyUnresolvedReferences
         self.index = faiss.IndexFlatIP(self.dimension)
-        self.index.add(embeddings.astype(np.float32))
+        self.index.add(embeddings)
+
         self.chunks = all_chunks
+        self.build_bm25_index()
+        self.save_index(index_dir)
+        self.save_hash(documents_dir, current_hash)
 
-        # Создание BM25 индекса
-        self._build_bm25_index()
-
-        # === СОХРАНЯЕМ ===
-        index_path.mkdir(parents=True, exist_ok=True)
-        self.save_index(index_path)
-
-        # Сохраняем хеш
-        current_hash = self._get_documents_hash(documents_dir)
-        self._save_hash(documents_dir, current_hash)
-
-        print(f"✅ Индекс создан и сохранён: {self.index.ntotal} векторов")
         self.is_ready = True
         return True
 
-    # ========== ПОИСК ==========
-
-    def _search_bm25(self, query: str, top_k: int = 10) -> List[Dict]:
-        """Поиск через BM25"""
-        if self.bm25_index is None or not BM25_AVAILABLE:
+    def search_bm25(self, query: str, top_k: int = 10) -> List[Dict[str, Any]]:
+        if self.bm25_index is None:
             return []
+
         try:
-            tokenized_query = query.split()
+            tokenized_query = self.tokenize(query)
             scores = self.bm25_index.get_scores(tokenized_query)
-            top_indices = np.argsort(scores)[-top_k:][::-1]
-            results = []
+            # noinspection PyUnresolvedReferences,PyTypeChecker
+            top_indices = np.argsort(scores)[::-1][:top_k]
+            results: List[Dict[str, Any]] = []
+
             for idx in top_indices:
-                if scores[idx] > 0 and idx < len(self.chunks):
+                idx_int = int(idx)
+                if idx_int < len(self.chunks) and float(scores[idx_int]) > 0:
                     results.append({
-                        'text': self.chunks[idx]['text'],
-                        'doc_name': self.chunks[idx]['doc_name'],
-                        'score': float(scores[idx]),
-                        'idx': idx
+                        "text": self.chunks[idx_int]["text"],
+                        "doc_name": self.chunks[idx_int]["doc_name"],
+                        "score": float(scores[idx_int]),
+                        "idx": idx_int,
+                        "search_type": "bm25",
                     })
             return results
-        except Exception as e:
-            print(f"⚠️ Ошибка BM25: {e}")
+        except ValueError:
             return []
 
-    def search(self, query: str, top_k: int = 8) -> List[Dict]:
-        """Гибридный поиск (FAISS + BM25)"""
+    def search(self, query: str, top_k: int = 8) -> List[Dict[str, Any]]:
         if not self.is_ready or self.index is None:
             return []
 
-        # FAISS поиск
-        query_emb = self.model.encode([query])
-        query_emb = query_emb / np.linalg.norm(query_emb)
+        # noinspection PyTypeChecker
+        query_emb = self.model.encode([f"query: {query}"])
+        # noinspection PyUnresolvedReferences,PyTypeChecker
+        query_emb = np.asarray(query_emb, dtype=np.float32)
 
-        scores, indices = self.index.search(query_emb.astype(np.float32), top_k * 2)
+        # noinspection PyUnresolvedReferences
+        norms = np.linalg.norm(query_emb, axis=1, keepdims=True)
+        norms[norms == 0] = 1.0
+        query_emb = query_emb / norms
 
-        faiss_results = []
+        # noinspection PyUnresolvedReferences
+        scores, indices = self.index.search(query_emb, max(top_k * 2, 10))
+        faiss_results: List[Dict[str, Any]] = []
+
         for score, idx in zip(scores[0], indices[0]):
-            if 0 <= idx < len(self.chunks) and score > 0.3:
+            idx_int = int(idx)
+            if 0 <= idx_int < len(self.chunks) and float(score) > 0.25:
                 faiss_results.append({
-                    'text': self.chunks[idx]['text'],
-                    'doc_name': self.chunks[idx]['doc_name'],
-                    'score': float(score),
-                    'idx': idx
+                    "text": self.chunks[idx_int]["text"],
+                    "doc_name": self.chunks[idx_int]["doc_name"],
+                    "score": float(score),
+                    "idx": idx_int,
+                    "search_type": "faiss",
                 })
 
-        # BM25 поиск
-        bm25_results = self._search_bm25(query, top_k * 2)
+        bm25_results = self.search_bm25(query, top_k=top_k)
 
-        # Объединение результатов
-        combined = {}
-        for r in faiss_results + bm25_results:
-            idx = r['idx']
-            if idx not in combined:
-                combined[idx] = r
+        combined: Dict[str, Dict[str, Any]] = {}
+        for item in faiss_results + bm25_results:
+            key = f"{item['doc_name']}::{item['idx']}"
+            if key not in combined:
+                combined[key] = item
             else:
-                combined[idx]['score'] = (combined[idx]['score'] + r['score']) / 2
+                combined[key]["score"] = max(combined[key]["score"], item["score"])
 
-        sorted_results = sorted(combined.values(), key=lambda x: x['score'], reverse=True)
-        return sorted_results[:top_k]
+        results = sorted(combined.values(), key=lambda x: x["score"], reverse=True)
+        return results[:top_k]
 
-    def search_with_formulas(self, query: str, top_k: int = 8) -> Dict[str, Any]:
-        """Поиск с извлечением таблиц и формул"""
-        results = self.search(query, top_k)
-
-        tables = []
-        formulas = []
-        for chunk in results:
-            tables.extend(self._extract_tables(chunk['text'], chunk['doc_name']))
-            formulas.extend(self._extract_formulas(chunk['text']))
-
-        # Удаляем дубликаты таблиц
-        unique_tables = []
-        seen = set()
-        for t in tables:
-            key = t.get('content', '')[:100]
-            if key not in seen:
-                seen.add(key)
-                unique_tables.append(t)
-
-        # Удаляем дубликаты формул
-        unique_formulas = []
-        seen = set()
-        for f in formulas:
-            key = f.get('raw', '')
-            if key not in seen:
-                seen.add(key)
-                unique_formulas.append(f)
-
-        return {
-            'results': results,
-            'tables': unique_tables[:5],
-            'formulas': unique_formulas[:10]
-        }
-
-    # ========== ИЗВЛЕЧЕНИЕ ТАБЛИЦ И ФОРМУЛ ==========
-
-    def _extract_tables(self, text: str, doc_name: str) -> List[Dict]:
-        """Извлекает таблицы из текста"""
-        tables = []
-        lines = text.split('\n')
-        in_table = False
-        table_lines = []
-        table_title = ""
-
-        for i, line in enumerate(lines):
-            # Ищем начало таблицы
-            if '[ТАБЛИЦА]' in line:
-                in_table = True
-                table_lines = []
-                if i > 0 and len(lines[i - 1].strip()) < 100:
-                    table_title = lines[i - 1].strip()
-                else:
-                    table_title = f"Таблица {len(tables) + 1}"
-                continue
-
-            # Если внутри таблицы
-            if in_table:
-                if line.strip() == '':
-                    if table_lines:
-                        tables.append({
-                            'title': table_title,
-                            'content': '\n'.join(table_lines),
-                            'rows': [l for l in table_lines if l.strip()]
-                        })
-                        table_lines = []
-                        table_title = ""
-                    in_table = False
-                else:
-                    table_lines.append(line.strip())
-
-        if table_lines:
-            tables.append({
-                'title': table_title,
-                'content': '\n'.join(table_lines),
-                'rows': [l for l in table_lines if l.strip()]
-            })
-
+    @staticmethod
+    def extract_tables(text: str) -> List[str]:
+        tables: List[str] = []
+        pattern = r"(Таблица.*?(?:\n.+)+)"
+        matches = re.findall(pattern, text, flags=re.MULTILINE)
+        tables.extend(matches)
         return tables
 
-    def _extract_formulas(self, text: str) -> List[Dict]:
-        """Извлекает формулы из текста"""
-        formulas = []
-        pattern = r'([A-Za-zА-Яа-я][_\w]*\s*[=]\s*[^;.\n]+)'
+    @staticmethod
+    def extract_formulas(text: str) -> List[Dict[str, Any]]:
+        formulas: List[Dict[str, Any]] = []
+        patterns = [
+            r"[A-Za-zА-Яа-я][\w]*\s*=\s*[^.\n]+",
+            r"[^.\n]*=\s*[^.\n]*",
+        ]
 
-        matches = re.findall(pattern, text)
-        for match in matches:
-            if len(match) > 3:
-                variables = re.findall(r'[A-Za-zА-Яа-я][_\w]*', match)
+        for pattern in patterns:
+            matches = re.findall(pattern, text)
+            for match in matches:
+                match = match.strip()
+                if len(match) < 3 or "=" not in match:
+                    continue
+
                 formulas.append({
-                    'raw': match.strip(),
-                    'variables': list(set(variables)),
-                    'has_operator': any(c in match for c in ['+', '-', '*', '/', '^', '='])
+                    "raw": match,
+                    "variables": list(set(re.findall(r"[A-Za-zА-Яа-я][_\w]*", match))),
+                    "has_operator": True,
                 })
 
-        bracket_pattern = r'\(([^)]*[=+\-*/^][^)]*)\)'
-        bracket_matches = re.findall(bracket_pattern, text)
-        for match in bracket_matches:
-            if len(match) > 3 and match not in [f['raw'] for f in formulas]:
-                formulas.append({
-                    'raw': f"({match})",
-                    'variables': list(set(re.findall(r'[A-Za-zА-Яа-я][_\w]*', match))),
-                    'has_operator': True
-                })
-
-        # Удаляем дубликаты
-        unique_formulas = []
+        unique_formulas: List[Dict[str, Any]] = []
         seen = set()
-        for f in formulas:
-            key = f['raw']
-            if key not in seen:
-                seen.add(key)
-                unique_formulas.append(f)
+        for formula in formulas:
+            raw = formula["raw"]
+            if raw not in seen:
+                seen.add(raw)
+                unique_formulas.append(formula)
 
         return unique_formulas
 
-    # ========== ОТВЕТЫ ==========
+    def search_with_formulas(self, query: str, top_k: int = 5) -> Dict[str, Any]:
+        results = self.search(query, top_k=top_k)
+
+        all_tables: List[str] = []
+        all_formulas: List[Dict[str, Any]] = []
+
+        for item in results:
+            text = item.get("text", "")
+            all_tables.extend(self.extract_tables(text))
+            all_formulas.extend(self.extract_formulas(text))
+
+        unique_tables: List[str] = []
+        seen_tables = set()
+        for table in all_tables:
+            if table not in seen_tables:
+                seen_tables.add(table)
+                unique_tables.append(table)
+
+        unique_formulas: List[Dict[str, Any]] = []
+        seen_formulas = set()
+        for formula in all_formulas:
+            raw = formula["raw"]
+            if raw not in seen_formulas:
+                seen_formulas.add(raw)
+                unique_formulas.append(formula)
+
+        return {
+            "results": results,
+            "tables": unique_tables,
+            "formulas": unique_formulas,
+        }
+
+    @staticmethod
+    def _build_llm_prompt(
+        question: str,
+        chunks: List[Dict[str, Any]],
+        tables: List[str],
+        formulas: List[Dict[str, Any]],
+    ) -> str:
+        context_parts: List[str] = []
+
+        for i, chunk in enumerate(chunks[:5], 1):
+            context_parts.append(
+                f"[Фрагмент {i} | Источник: {chunk['doc_name']}]\n{chunk['text']}"
+            )
+
+        if tables:
+            context_parts.append("\n[Таблицы]")
+            for table in tables[:3]:
+                context_parts.append(table)
+
+        if formulas:
+            context_parts.append("\n[Формулы]")
+            for formula in formulas[:5]:
+                context_parts.append(formula["raw"])
+
+        context = "\n\n".join(context_parts)
+
+        return f"""
+Ты отвечаешь только на основе контекста из технической документации ниже.
+Если точного ответа в контексте нет, честно скажи об этом.
+Не выдумывай факты.
+Отвечай кратко, по делу и на русском языке.
+
+Вопрос:
+{question}
+
+Контекст:
+{context}
+""".strip()
 
     def answer(self, question: str, top_k: int = 5) -> Dict[str, Any]:
-        """Ответ на вопрос с выделением таблиц и формул"""
         search_results = self.search_with_formulas(question, top_k)
-        relevant = search_results['results']
+        relevant = search_results["results"]
 
         if not relevant:
             return {
-                'question': question,
-                'answer': "❌ Информация по вашему вопросу не найдена в документации.",
-                'sources': [],
-                'tables': [],
-                'formulas': []
+                "question": question,
+                "answer": "❌ Информация по вашему вопросу не найдена в документации.",
+                "sources": [],
+                "tables": [],
+                "formulas": [],
+                "llm_used": False,
             }
 
-        cleaned_chunks = [c for c in relevant if not self._is_bad_chunk(c['text'])]
+        cleaned_chunks = [c for c in relevant if not self.is_bad_chunk(c["text"])]
         if not cleaned_chunks:
             cleaned_chunks = relevant[:2]
 
-        all_tables = search_results.get('tables', [])
-        all_formulas = search_results.get('formulas', [])
+        all_tables = search_results.get("tables", [])
+        all_formulas = search_results.get("formulas", [])
+        llm_used = False
 
-        # LLM отключен - используем обычный ответ
-        first_sentence = cleaned_chunks[0]['text'].split('.')[0] + "."
-        answer = f"**📌 Краткий ответ:**\n{first_sentence}\n\n"
-        answer += f"**📖 Подробнее из документации:**\n"
+        if self.use_llm and self.llm_engine is not None:
+            try:
+                prompt = self._build_llm_prompt(
+                    question=question,
+                    chunks=cleaned_chunks,
+                    tables=all_tables,
+                    formulas=all_formulas,
+                )
 
-        for i, chunk in enumerate(cleaned_chunks[:2], 1):
-            text = chunk['text'][:400].replace('\n', ' ')
-            answer += f"\n**{i}. {chunk['doc_name']}** (релевантность: {chunk['score']:.2f})\n> {text}...\n"
+                response = self.llm_engine.chat.completions.create(
+                    model="gpt-4o-mini",
+                    messages=[
+                        {"role": "system", "content": "Ты — инженерный помощник по строительной документации."},
+                        {"role": "user", "content": prompt}
+                    ],
+                    temperature=0.2,
+                    max_tokens=1000,
+                )
+                answer_text = response.choices[0].message.content.strip()
+                llm_used = True
+            except (ValueError, RuntimeError):
+                answer_text = cleaned_chunks[0]["text"].split(". ")[0].strip()
+        else:
+            answer_text = cleaned_chunks[0]["text"].split(". ")[0].strip()
 
-        # Добавляем таблицы
+        if not answer_text.endswith("."):
+            answer_text += "."
+
         if all_tables:
-            answer += "\n\n**📊 Найденные таблицы:**\n"
+            answer_text += "\n\n📊 Найденные таблицы:\n"
             for table in all_tables[:2]:
-                answer += f"\n**{table.get('title', 'Таблица')}**\n"
-                content = table.get('content', '')
-                if len(content) > 300:
-                    content = content[:300] + "..."
-                answer += f"```\n{content}\n```\n"
+                answer_text += f"\n{table[:700]}\n"
 
-        # Добавляем формулы
         if all_formulas:
-            answer += "\n\n**📐 Найденные формулы:**\n"
+            answer_text += "\n\n📐 Найденные формулы:\n"
             for formula in all_formulas[:3]:
-                raw = formula.get('raw', '')
-                answer += f"\n`{raw}`\n"
-                if formula.get('variables'):
-                    answer += f"   Переменные: {', '.join(formula['variables'][:5])}\n"
+                raw = formula.get("raw", "")
+                answer_text += f"\n{raw}\n"
+                variables = formula.get("variables", [])
+                if variables:
+                    answer_text += f"Переменные: {', '.join(variables[:5])}\n"
 
         return {
-            'question': question,
-            'answer': answer,
-            'sources': cleaned_chunks,
-            'tables': all_tables[:3],
-            'formulas': all_formulas[:5]
+            "question": question,
+            "answer": answer_text,
+            "sources": cleaned_chunks,
+            "tables": all_tables[:3],
+            "formulas": all_formulas[:5],
+            "llm_used": llm_used,
         }
 
-    # ========== ОПРЕДЕЛЕНИЯ ==========
+    @staticmethod
+    def _init_definitions() -> Dict[str, str]:
+        return {
+            "теплопередача": "Процесс переноса тепла от более нагретого тела к менее нагретому.",
+            "коэффициент теплопередачи": "Величина, характеризующая интенсивность передачи тепла через ограждающую конструкцию.",
+            "сопротивление теплопередаче": "Способность конструкции препятствовать прохождению теплового потока.",
+            "точка росы": "Температура, при которой водяной пар в воздухе начинает конденсироваться.",
+            "влажность": "Содержание водяного пара в воздухе или материале.",
+        }
 
     def find_definition(self, term: str) -> Dict[str, Any]:
-        """Поиск определения термина в словаре или документации"""
         term_lower = term.lower().strip()
 
-        # Проверяем кэш
         if term_lower in self.definitions_cache:
             return self.definitions_cache[term_lower]
 
-        # Базовый словарь определений
         all_definitions = self._init_definitions()
 
-        # Поиск точного совпадения
         if term_lower in all_definitions:
             result = {
-                'definition': all_definitions[term_lower],
-                'source': 'Нормативная база',
-                'found': True
+                "term": term,
+                "definition": all_definitions[term_lower],
+                "source": "built-in",
+                "found": True,
             }
             self.definitions_cache[term_lower] = result
             return result
 
-        # Поиск частичного совпадения
-        for key, value in all_definitions.items():
-            if key in term_lower or term_lower in key:
-                result = {
-                    'definition': value,
-                    'source': 'Нормативная база',
-                    'found': True
-                }
-                self.definitions_cache[term_lower] = result
-                return result
-
-        # Поиск в документах
-        if self.chunks:
-            for chunk in self.chunks:
-                if term_lower in chunk['text'].lower():
-                    text = chunk['text']
-                    sentences = text.split('.')
-                    for sent in sentences:
-                        if term_lower in sent.lower():
-                            result = {
-                                'definition': sent.strip() + '.',
-                                'source': chunk.get('doc_name', 'Документация'),
-                                'found': True
-                            }
-                            self.definitions_cache[term_lower] = result
-                            return result
-
-        # Пробуем через answer
-        result = self.answer(term)
-        if result.get('sources'):
-            response = {
-                'definition': result['answer'],
-                'source': result['sources'][0]['doc_name'],
-                'found': True
+        search_results = self.search(term, top_k=3)
+        if search_results:
+            result = {
+                "term": term,
+                "definition": search_results[0]["text"][:500],
+                "source": search_results[0]["doc_name"],
+                "found": True,
             }
-            self.definitions_cache[term_lower] = response
-            return response
+            self.definitions_cache[term_lower] = result
+            return result
 
-        # Не найдено
-        response = {
-            'definition': f"❌ Определение для термина '{term}' не найдено.",
-            'source': 'Нормативная база',
-            'found': False
+        result = {
+            "term": term,
+            "definition": "Определение не найдено.",
+            "source": None,
+            "found": False,
         }
-        self.definitions_cache[term_lower] = response
-        return response
-
-    def _init_definitions(self) -> Dict[str, str]:
-        """Инициализация базового словаря определений"""
-        return {
-            # Теплотехнические термины
-            "гсоп": "**ГСОП (Градусо-сутки отопительного периода)** = (t_в - t_от) × z_от\n\n**Для Москвы:** ГСОП = (20 - (-3,1)) × 214 = 4943 °C·сут",
-            "градусо-сутки": "**ГСОП (Градусо-сутки отопительного периода)** = (t_в - t_от) × z_от",
-            "dd": "**ГСОП** — Degree Days (Градусо-сутки отопительного периода)",
-
-            "отопление": "**Отопление** — система обогрева помещений. Расчётная температура: 20-22°C.",
-            "heating": "**Отопление** — см. определение выше.",
-
-            "вентиляция": "**Вентиляция** — организованный воздухообмен. Норма: 3 м³/ч на 1 м².",
-            "ventilation": "**Вентиляция** — см. определение выше.",
-
-            "кондиционирование": "**Кондиционирование** — поддержание температуры, влажности и чистоты воздуха в помещении.",
-            "ac": "**Кондиционирование** — Air Conditioning (AC).",
-
-            "овк": "**ОВК** — Отопление, Вентиляция, Кондиционирование (СП 60.13330).",
-            "hvac": "**ОВК** — Heating, Ventilation, Air Conditioning (HVAC).",
-
-            # Тепловая изоляция
-            "изоляция": "**Тепловая изоляция** — уменьшение теплопередачи. δ = λ × ((t_в - t_н)/q - R_н)",
-            "теплоизоляция": "**Тепловая изоляция** — конструкция для уменьшения теплопередачи.",
-            "thermal insulation": "**Теплоизоляция** — см. определение выше.",
-            "утеплитель": "**Утеплитель** — материал с низкой теплопроводностью для теплоизоляции: минеральная вата, пенополистирол, пенополиуретан.",
-
-            "термическое сопротивление": "**Термическое сопротивление** R = δ/λ, где δ — толщина слоя (м), λ — коэффициент теплопроводности (Вт/(м·К)). Нормируемое значение R_0 ≥ R_тр",
-            "сопротивление теплопередаче": "**Сопротивление теплопередаче** R_0 = 1/α_в + R_к + 1/α_н, где α_в и α_н — коэффициенты теплоотдачи внутренней и наружной поверхностей.",
-
-            "теплопроводность": "**Теплопроводность** λ — способность материала проводить тепло. Чем ниже λ, тем лучше теплоизоляция.",
-            "thermal conductivity": "**Теплопроводность** — см. определение выше.",
-            "коэффициент теплопроводности": "**Коэффициент теплопроводности** λ [Вт/(м·К)] — характеристика материала. Для утеплителей: λ = 0,02-0,05 Вт/(м·К), для кирпича: λ = 0,5-1,0 Вт/(м·К).",
-
-            "теплопотери": "**Теплопотери** — количество тепла, теряемое через ограждающие конструкции. Q = (t_в - t_н) / R_0 × S, где S — площадь поверхности.",
-            "тепловой поток": "**Тепловой поток** q [Вт/м²] — плотность теплового потока через единицу площади. q = (t_в - t_н) / R_0",
-            "точка росы": "**Точка росы** — температура, при которой водяной пар в воздухе достигает насыщения и начинает конденсироваться.",
-
-            # Энергоресурсы
-            "вэр": "**ВЭР** — вторичные энергоресурсы: рекуперация, аккумулирование тепла.",
-            "вторичные энергоресурсы": "**ВЭР** — вторичные энергоресурсы: рекуперация, аккумулирование тепла.",
-            "рекуперация": "**Рекуперация** — использование тепла вытяжного воздуха для подогрева приточного воздуха. КПД рекуператора до 85%.",
-            "рекуператор": "**Рекуператор** — устройство для передачи тепла между вытяжным и приточным воздухом.",
-            "теплонасос": "**Тепловой насос** — устройство для передачи тепла от источника низкопотенциального тепла к системе отопления. COP = 3-5.",
-            "тепловой насос": "**Тепловой насос** — устройство для отбора тепла от низкопотенциальных источников для отопления и ГВС.",
-            "аккумулирование тепла": "**Аккумулирование тепла** — накопление тепловой энергии в тепловых аккумуляторах.",
-            "тепловая энергия": "**Тепловая энергия** — энергия теплового движения молекул. Единицы: Дж, кВт·ч, Гкал.",
-            "теплоноситель": "**Теплоноситель** — среда, передающая тепловую энергию: вода, пар, воздух, антифриз.",
-
-            # Энергоэффективность
-            "энергоэффективность": "**Энергоэффективность** — отношение полезного эффекта к затратам энергии. Классы: A, B, C, D, E.",
-            "energy efficiency": "**Энергоэффективность** — см. определение выше.",
-            "энергосбережение": "**Энергосбережение** — комплекс мер по снижению потребления энергии.",
-            "тепловая защита": "**Тепловая защита здания** — комплекс свойств ограждающих конструкций, обеспечивающих нормируемый тепловой режим помещений (СП 50.13330).",
-            "энергопаспорт": "**Энергетический паспорт** — документ с показателями энергоэффективности здания. Классы: A, B, C.",
-            "теплотехнический расчёт": "**Теплотехнический расчёт** — определение теплозащитных свойств ограждающих конструкций: R_0 ≥ R_тр, δ = R_тр × λ.",
-            "влажностный режим": "**Влажностный режим** — режим эксплуатации ограждающих конструкций по влажности (сухой, нормальный, влажный, мокрый).",
-
-            # Ограждающие конструкции
-            "ограждающие конструкции": "**Ограждающие конструкции** — стены, перекрытия, покрытия, окна, двери, разделяющие внутреннюю и наружную среду.",
-            "наружная стена": "**Наружная стена** — вертикальная ограждающая конструкция, отделяющая помещение от наружного воздуха.",
-            "кровля": "**Кровля** — верхняя ограждающая конструкция здания. Утеплённая (чердачная) или бесчердачная (совмещённая).",
-            "перекрытие": "**Перекрытие** — горизонтальная ограждающая конструкция, разделяющая этажи.",
-            "светопрозрачные конструкции": "**Светопрозрачные конструкции** — окна, витражи, стеклянные двери. R_0 ≥ 0,6 м²·°С/Вт",
-            "стеклопакет": "**Стеклопакет** — герметичная конструкция из двух или трёх стёкол с воздушной прослойкой.",
-
-            # Нормы и стандарты
-            "сп 60": "**СП 60.13330** — Свод правил «Отопление, вентиляция и кондиционирование воздуха»",
-            "сп 50": "**СП 50.13330** — Свод правил «Тепловая защита зданий»",
-            "сп 131": "**СП 131.13330** — Строительная климатология",
-            "снип": "**СНиП** — Строительные нормы и правила (заменены на СП).",
-            "гост": "**ГОСТ** — Государственный Стандарт.",
-            "микроклимат": "**Микроклимат** — климатические условия внутри помещения: температура, влажность, скорость воздуха.",
-            "комфортная температура": "**Комфортная температура** — 20-24°C для жилых помещений, 22-24°C для офисов, 18-20°C для спален."
-        }
-
-    # ========== СОХРАНЕНИЕ И ЗАГРУЗКА ИНДЕКСА ==========
-
-    def save_index(self, path: Path):
-        """Сохраняет индекс в файл"""
-        if not self.is_ready or self.index is None:
-            return
-        path.mkdir(parents=True, exist_ok=True)
-        faiss.write_index(self.index, str(path / "index.faiss"))
-        with open(path / "chunks.pkl", 'wb') as f:
-            pickle.dump(self.chunks, f)
-        print(f"✅ Индекс сохранен в {path}")
-
-    def load_index(self, path: Path) -> bool:
-        """Загружает индекс из файла"""
-        index_path = path / "index.faiss"
-        chunks_path = path / "chunks.pkl"
-
-        if not index_path.exists() or not chunks_path.exists():
-            return False
-        try:
-            self.index = faiss.read_index(str(index_path))
-            with open(chunks_path, 'rb') as f:
-                self.chunks = pickle.load(f)
-            self.is_ready = True
-            print(f"✅ Индекс загружен: {self.index.ntotal} векторов")
-            return True
-        except Exception as e:
-            print(f"❌ Ошибка загрузки индекса: {e}")
-            return False
+        self.definitions_cache[term_lower] = result
+        return result

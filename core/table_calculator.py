@@ -67,7 +67,7 @@ class TableCalculator:
         for search_query in search_queries:
             try:
                 chunks = self.qa_system.search(search_query, top_k=5)
-            except Exception:
+            except (AttributeError, TypeError, ValueError):
                 continue
 
             for chunk in chunks:
@@ -79,12 +79,12 @@ class TableCalculator:
                     if self._is_climate_table(table):
                         all_tables.append(table)
 
-        # Удаляем дубликаты
+        # Удаляем дубликаты по комбинации source + title + raw_text
         seen = set()
         unique_tables: List[ExtractedTable] = []
 
         for table in all_tables:
-            key = table.raw_text[:200]
+            key = (table.source, table.title.strip().lower(), table.raw_text[:200])
             if key not in seen:
                 seen.add(key)
                 unique_tables.append(table)
@@ -121,7 +121,7 @@ class TableCalculator:
 
     @staticmethod
     def _is_city_name(text: str) -> bool:
-        """Проверяет, является ли текст названием города."""
+        """Проверяет, является ли текст названием города (строгое совпадение)."""
         if not text or len(text.strip()) < 2:
             return False
 
@@ -141,9 +141,9 @@ class TableCalculator:
         }
 
         normalized = text.lower().strip().replace("ё", "е")
-        cities_norm = {city.replace("ё", "е") for city in cities}
 
-        return normalized in cities_norm or any(city in normalized for city in cities_norm)
+        # Точное совпадение (без частичных вхождений)
+        return normalized in cities
 
     def extract_climate_data(self, table: ExtractedTable, city_name: str) -> Optional[ClimateData]:
         """Извлекает климатические данные для указанного города."""
@@ -172,7 +172,13 @@ class TableCalculator:
         if headers and len(headers) == len(found_row):
             self._extract_by_headers(headers, found_row, data)
 
-        self._extract_by_plain_scan(found_row, data)
+        # Если заголовки не помогли, используем улучшенный парсинг
+        if data.t_ot is None or data.z_ot is None:
+            self._extract_by_markers(found_row, data)
+
+        # Если всё ещё не нашли — пробуем plain scan как fallback
+        if data.t_ot is None or data.z_ot is None:
+            self._extract_by_plain_scan(found_row, data)
 
         confidence = 0.0
         if data.t_ot is not None:
@@ -222,31 +228,69 @@ class TableCalculator:
             if data.t_avg is None and "среднегод" in header_text and -50 <= value <= 30:
                 data.t_avg = float(value)
 
-    def _extract_by_plain_scan(self, row: List[str], data: ClimateData) -> None:
-        """Запасной вариант извлечения без заголовков."""
+    def _extract_by_markers(self, row: List[str], data: ClimateData) -> None:
+        """Извлекает значения по маркерам (t_от, z_от, t_н, сут)."""
         for cell in row:
-            cell_norm = cell.lower().replace("ё", "е").replace(",", ".").strip()
+            cell_lower = cell.lower().replace("ё", "е").strip()
 
-            if data.z_ot is None:
-                days_match = re.search(r"(\d+)\s*сут", cell_norm)
-                if days_match:
-                    data.z_ot = int(days_match.group(1))
+            if data.t_ot is None and re.search(r"t_от|средняя.*?температура", cell_lower):
+                value = self._extract_first_number(cell)
+                if value is not None and -50 <= value <= 30:
+                    data.t_ot = float(value)
                     continue
 
-            value = self._extract_first_number(cell_norm)
-            if value is None:
-                continue
+            if data.z_ot is None and re.search(r"z_от|продолжительность|сут", cell_lower):
+                value = self._extract_first_number(cell)
+                if value is not None and 1 <= value <= 400:
+                    data.z_ot = int(round(value))
+                    continue
 
-            if data.t_ot is None and -30 <= value <= 25:
-                data.t_ot = float(value)
-                continue
+            if data.t_n is None and re.search(r"t_н|холодной.*?пятидневки|наружная", cell_lower):
+                value = self._extract_first_number(cell)
+                if value is not None and -70 <= value <= 20:
+                    data.t_n = float(value)
+                    continue
 
-            if data.z_ot is None and 1 <= value <= 400:
-                data.z_ot = int(round(value))
-                continue
+    def _extract_by_plain_scan(self, row: List[str], data: ClimateData) -> None:
+        """
+        Запасной вариант извлечения без заголовков.
+        Использует позиционное извлечение с привязкой к найденному городу.
+        """
+        # Сначала ищем все числа в строке
+        numbers = []
+        for cell in row:
+            value = self._extract_first_number(cell)
+            if value is not None:
+                numbers.append(float(value))
 
-            if data.t_n is None and -70 <= value <= 15:
-                data.t_n = float(value)
+        if len(numbers) >= 2:
+            # Первое число из диапазона температур — t_ot
+            for num in numbers:
+                if data.t_ot is None and -30 <= num <= 25:
+                    data.t_ot = float(num)
+                    break
+
+            # Второе число из диапазона продолжительности — z_ot
+            for num in numbers:
+                if data.z_ot is None and 1 <= num <= 400:
+                    data.z_ot = int(round(num))
+                    break
+
+            # Третье число из диапазона отрицательных температур — t_n
+            for num in numbers:
+                if data.t_n is None and -70 <= num <= -5:
+                    data.t_n = float(num)
+                    break
+
+        # Если не нашли по диапазонам, пробуем по порядку
+        if len(numbers) >= 3 and (data.t_ot is None or data.z_ot is None):
+            for i, num in enumerate(numbers):
+                if i == 0 and data.t_ot is None and -30 <= num <= 25:
+                    data.t_ot = float(num)
+                elif i == 1 and data.z_ot is None and 1 <= num <= 400:
+                    data.z_ot = int(round(num))
+                elif i == 2 and data.t_n is None and -70 <= num <= 15:
+                    data.t_n = float(num)
 
     @staticmethod
     def _extract_first_number(text: str) -> Optional[float]:
@@ -334,8 +378,8 @@ class TableCalculator:
 
             result["answer"] = "\n".join(answer_lines)
 
-        except Exception as exc:
-            result["answer"] = f"❌ Ошибка при расчёте: {exc}"
+        except (ValueError, TypeError, AttributeError) as e:
+            result["answer"] = f"❌ Ошибка при расчёте: {e}"
 
         return result
 
@@ -474,8 +518,8 @@ class TableCalculator:
 
             result["answer"] = "\n".join(answer_lines)
 
-        except Exception as exc:
-            result["answer"] = f"❌ Ошибка при расчёте: {exc}"
+        except (ValueError, TypeError, AttributeError) as e:
+            result["answer"] = f"❌ Ошибка при расчёте: {e}"
 
         return result
 

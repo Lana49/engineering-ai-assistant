@@ -4,6 +4,8 @@
 Совместим с async FormulaEngine.answer_calculation(...).
 """
 
+from __future__ import annotations
+
 import re
 import asyncio
 from typing import Dict, List, Any, Optional
@@ -11,6 +13,8 @@ from dataclasses import dataclass, field
 from enum import Enum
 
 from core.prompts import get_quick_definition
+from core.retrieval_memory import RetrievalMemory
+from utils.config import PROCESSED_DIR
 
 
 class QueryType(Enum):
@@ -30,7 +34,7 @@ class ReasoningStep:
     description: str
     result: Any = None
     confidence: float = 0.0
-    next_steps: List[str] = field(default_factory=list)
+    next_steps: List[str] = field(default_factory=lambda: [])
 
 
 @dataclass
@@ -58,6 +62,7 @@ class AgentLoop:
         self.context: Optional[ContextInfo] = None
         self.max_steps = 6
         self.last_error: Optional[str] = None
+        self.memory = RetrievalMemory(PROCESSED_DIR / "retrieval_memory.json")
 
     async def run(self, user_content: str) -> Dict[str, Any]:
         """
@@ -71,19 +76,16 @@ class AgentLoop:
             step1 = self._analyze_query(user_content)
             self.reasoning_steps.append(step1)
             if not step1.result:
-                return self._create_error_response("Не удалось проанализировать запрос", 1)
+                return self._create_error_response("Не удалось проанализировать запрос.", 1)
 
             query_type = step1.result.get("type", QueryType.GENERAL)
             keywords = step1.result.get("keywords", [])
             entities = step1.result.get("entities", {})
             parameters = step1.result.get("parameters", {})
 
-            step2 = self._search_chunks(user_content, query_type)
+            step2 = self._search_chunks(user_content, query_type, entities, keywords)
             self.reasoning_steps.append(step2)
-
-            chunks = []
-            if step2.result:
-                chunks = step2.result.get("chunks", [])
+            chunks = step2.result.get("chunks", []) if step2.result else []
 
             step3 = self._analyze_context(
                 user_content,
@@ -94,7 +96,7 @@ class AgentLoop:
             )
             self.reasoning_steps.append(step3)
             if not step3.result:
-                return self._create_error_response("Не удалось проанализировать контекст", 3)
+                return self._create_error_response("Не удалось проанализировать найденный контекст.", 3)
 
             context_info = step3.result
             self.context = context_info
@@ -112,7 +114,7 @@ class AgentLoop:
 
             self.reasoning_steps.append(step4)
             if not step4.result:
-                return self._create_error_response("Не удалось обработать запрос", 4)
+                return self._create_error_response("Не удалось сформировать промежуточный ответ.", 4)
 
             step5 = self._check_completeness(step4.result, context_info)
             self.reasoning_steps.append(step5)
@@ -126,14 +128,34 @@ class AgentLoop:
                 final_response["needs_clarification"] = True
                 final_response["questions"] = step5.result.get("questions", [])
 
-            self.messages.append({"role": "assistant", "content": final_response["answer"]})
+            self.messages.append({"role": "assistant", "content": final_response.get("answer", "")})
             final_response["steps"] = len(self.reasoning_steps)
+
+            # Сохраняем успешный запрос в память (извлекаем имена источников)
+            if final_response.get("answer") and final_response.get("sources"):
+                source_names = []
+                for src in final_response.get("sources", []):
+                    if isinstance(src, dict):
+                        name = src.get("doc_name") or src.get("docname") or src.get("source") or ""
+                        if name:
+                            source_names.append(name)
+                    elif isinstance(src, str):
+                        source_names.append(src)
+
+                if source_names:
+                    self.memory.save_success(
+                        query=user_content,
+                        query_type=query_type.value,
+                        keywords=keywords,
+                        sources=source_names
+                    )
+
             return final_response
 
         except (ValueError, TypeError, KeyError, AttributeError) as e:
             self.last_error = str(e)
             return {
-                "answer": f"❌ Ошибка: {e}",
+                "answer": f"❌ Ошибка при обработке запроса: {e}",
                 "sources": [],
                 "tables": [],
                 "formulas": [],
@@ -148,24 +170,28 @@ class AgentLoop:
         """Анализирует запрос и определяет его тип."""
         step = ReasoningStep(
             step_id=1,
-            description="Анализ запроса и определение типа"
+            description="Анализ типа запроса и сущностей"
         )
 
         try:
             query_lower = query.lower()
 
             calc_triggers = [
-                "рассчитай", "вычисли", "посчитай", "толщин", "температур",
-                "потери", "формул", "вентиляц", "расход", "гсоп", "градусо",
-                "определите", "найдите", "рассчитать", "вычислить"
+                "рассчитай", "расчет", "вычисли", "посчитай", "формула",
+                "теплопотери", "кратность", "расход", "gsop", "гсоп",
+                "r=", "q=", "площадь", "объем", "мощность"
             ]
             def_triggers = [
-                "что такое", "определение", "термин", "понятие", "что значит",
-                "что означает", "расшифруй", "аббревиатура", "расшифровка",
-                "что это", "как понимать", "объясните", "поясните"
+                "что такое", "определи", "определение", "термин",
+                "что значит", "что означает"
             ]
-            comp_triggers = ["сравни", "сравнение", "отличие", "разница", "чем отличается"]
-            reg_triggers = ["норма", "снип", "сп", "гост", "требование", "стандарт", "норматив"]
+            comp_triggers = [
+                "сравни", "разница", "отличие", "лучше", "хуже"
+            ]
+            reg_triggers = [
+                "требования", "норма", "нормы", "сп", "гост", "снип",
+                "пункт", "таблица", "раздел", "допускается", "следует"
+            ]
 
             is_calc = any(w in query_lower for w in calc_triggers)
             is_def = any(w in query_lower for w in def_triggers)
@@ -183,7 +209,7 @@ class AgentLoop:
             else:
                 query_type = QueryType.SEARCH
 
-            keywords = re.findall(r"[а-яА-Яa-zA-Z0-9_]{2,}", query)
+            keywords = re.findall(r"[A-Za-zА-Яа-я0-9./-]{3,}", query)
             keywords = [w.lower() for w in keywords if len(w) > 2]
 
             numbers = re.findall(r"-?\d+[.,]?\d*", query)
@@ -199,21 +225,44 @@ class AgentLoop:
                 parameters["numeric_values"] = parsed_numbers
 
             entities: Dict[str, Any] = {}
-            if "°" in query or "град" in query_lower:
-                entities["unit_type"] = "temperature"
-            if "м²" in query or "кв.м" in query_lower:
-                entities["unit_type"] = "area"
-            if "м³" in query or "куб" in query_lower:
-                entities["unit_type"] = "volume"
 
-            doc_pattern = r"(СП\s?\d+\.?\d*\.?\d*|ГОСТ\s?\d+[-–]\d+|СНиП\s?[0-9.\-]+)"
-            docs = re.findall(doc_pattern, query, flags=re.IGNORECASE)
-            if docs:
-                entities["documents"] = docs
+            document_codes = re.findall(
+                r"\b(?:сп|гост|снип|рд|санпин|мгсн)\s*[\d.\-]+\b",
+                query,
+                flags=re.IGNORECASE
+            )
+            if document_codes:
+                entities["document_codes"] = document_codes
+                entities["documents"] = document_codes
+
+            section_refs = re.findall(
+                r"\b(?:пункт|п\.|раздел|таблица|табл\.|приложение)\s*[\d.\-]+\b",
+                query,
+                flags=re.IGNORECASE
+            )
+            if section_refs:
+                entities["section_refs"] = section_refs
+
+            domain_terms = [
+                w for w in keywords
+                if w not in {"что", "как", "где", "или", "для", "при", "это"}
+            ]
+            if domain_terms:
+                entities["domain_terms"] = domain_terms[:15]
+
+            if document_codes or section_refs:
+                entities["needs_exact_match"] = True
+
+            if "°c" in query_lower or "c" in query_lower:
+                entities["unit_type"] = "temperature"
+            if "м2" in query_lower or "м²" in query_lower:
+                entities["unit_type"] = "area"
+            if "м3" in query_lower or "м³" in query_lower:
+                entities["unit_type"] = "volume"
 
             step.result = {
                 "type": query_type,
-                "keywords": keywords,
+                "keywords": keywords[:20],
                 "entities": entities,
                 "parameters": parameters,
                 "raw_query": query
@@ -227,28 +276,135 @@ class AgentLoop:
 
         return step
 
+    @staticmethod
+    def _unique_keep_order(items: List[str]) -> List[str]:
+        """Сохраняет уникальные элементы в порядке появления."""
+        result = []
+        seen = set()
+        for item in items:
+            if not item:
+                continue
+            key = item.strip().lower()
+            if key not in seen:
+                seen.add(key)
+                result.append(item.strip())
+        return result
+
+    def _expand_query(self, query: str, entities: Dict[str, Any], keywords: List[str]) -> List[str]:
+        """Расширяет запрос вариантами для поиска."""
+        variants = [query]
+
+        doc_codes = entities.get("document_codes", []) or entities.get("documents", [])
+        section_refs = entities.get("section_refs", [])
+        domain_terms = entities.get("domain_terms", keywords[:6])
+
+        if doc_codes:
+            variants.append(" ".join(doc_codes[:2] + domain_terms[:4]).strip())
+
+        if section_refs:
+            variants.append(" ".join(section_refs[:2] + domain_terms[:4]).strip())
+
+        if domain_terms:
+            variants.append(" ".join(domain_terms[:8]).strip())
+
+        boosts = self.memory.get_boosts(query, entities.get("query_type", "search"))
+        if boosts.get("terms"):
+            variants.append(" ".join((domain_terms[:5] + boosts["terms"][:3])).strip())
+
+        return self._unique_keep_order([v for v in variants if v.strip()])
+
+    @staticmethod
+    def _rerank_chunks(
+        chunks: List[Dict[str, Any]],
+        entities: Dict[str, Any],
+        memory_boosts: Dict[str, List[str]],
+    ) -> List[Dict[str, Any]]:
+        """Повторно ранжирует фрагменты с учётом бустингов."""
+        preferred_sources = [s.lower() for s in memory_boosts.get("sources", [])]
+        document_codes = [d.lower() for d in entities.get("document_codes", [])]
+        section_refs = [s.lower() for s in entities.get("section_refs", [])]
+        domain_terms = [t.lower() for t in entities.get("domain_terms", [])[:8]]
+
+        reranked = []
+        for chunk in chunks:
+            score = float(chunk.get("score", 0.0) or 0.0)
+            doc_name = str(chunk.get("doc_name", "")).lower()
+            doc_name = str(chunk.get("docname", doc_name)).lower()
+            text = str(chunk.get("text", "")).lower()
+
+            if any(src in doc_name for src in preferred_sources):
+                score += 0.20
+
+            if any(code in doc_name or code in text for code in document_codes):
+                score += 0.35
+
+            if any(ref in text for ref in section_refs):
+                score += 0.20
+
+            term_hits = sum(1 for term in domain_terms if term in text)
+            score += min(0.25, term_hits * 0.03)
+
+            reranked.append({**chunk, "score": score})
+
+        reranked.sort(key=lambda x: x.get("score", 0.0), reverse=True)
+        return reranked
+
     def _search_chunks(
         self,
         query: str,
         query_type: QueryType,
+        entities: Optional[Dict[str, Any]] = None,
+        keywords: Optional[List[str]] = None,
     ) -> ReasoningStep:
-        """Ищет релевантные фрагменты в базе знаний."""
+        """Расширенный поиск по индексу с памятью и переранжированием."""
         step = ReasoningStep(
             step_id=2,
-            description="Поиск релевантных фрагментов документов"
+            description="Расширенный поиск по индексу с памятью и повторным ранжированием"
         )
 
         try:
+            entities = entities or {}
+            keywords = keywords or []
+            entities["query_type"] = query_type.value
+
             if not self.qa_system or not getattr(self.qa_system, "is_ready", False):
-                step.result = {"chunks": [], "count": 0, "query_type": query_type}
+                step.result = {
+                    "chunks": [],
+                    "count": 0,
+                    "query_type": query_type
+                }
                 step.confidence = 0.2
                 return step
 
-            top_k = 8 if query_type == QueryType.CALCULATION else 5
-            chunks = self.qa_system.search(query, top_k)
+            memory_boosts = self.memory.get_boosts(query, query_type.value)
+            queries = self._expand_query(query, entities, keywords)
+
+            if query_type == QueryType.CALCULATION:
+                top_k = 8
+            elif query_type == QueryType.REGULATORY:
+                top_k = 14
+            else:
+                top_k = 12
+
+            all_chunks: List[Dict[str, Any]] = []
+            seen = set()
+
+            for q in queries[:4]:
+                found = self.qa_system.search(q, top_k)
+                for chunk in found:
+                    doc_name = chunk.get("doc_name", "")
+                    doc_name = chunk.get("docname", doc_name)
+                    text = chunk.get("text", "")
+                    uniq = (doc_name, text[:250])
+                    if uniq not in seen:
+                        seen.add(uniq)
+                        all_chunks.append(chunk)
+
+            reranked = self._rerank_chunks(all_chunks, entities, memory_boosts)
+            reranked = reranked[:top_k]
 
             enriched_chunks = []
-            for chunk in chunks:
+            for chunk in reranked:
                 text = chunk.get("text", "")
                 tables = self._extract_tables(text, chunk.get("doc_name", ""))
                 formulas = self._extract_formulas(text)
@@ -262,9 +418,11 @@ class AgentLoop:
             step.result = {
                 "chunks": enriched_chunks,
                 "count": len(enriched_chunks),
-                "query_type": query_type
+                "query_type": query_type,
+                "expanded_queries": queries,
+                "memory_boosts": memory_boosts,
             }
-            step.confidence = 0.8 if enriched_chunks else 0.3
+            step.confidence = 0.85 if enriched_chunks else 0.3
 
         except (AttributeError, TypeError, ValueError) as e:
             step.result = None
@@ -688,7 +846,6 @@ class AgentLoop:
         )
 
         try:
-            # Используем context.query для получения исходного запроса
             query = context.query.lower()
             parts = re.split(r"\s+и\s+|\s+vs\s+|\s+против\s+", query)
 
@@ -699,6 +856,7 @@ class AgentLoop:
                 for item in items:
                     # Ищем информацию по каждому объекту в чанках
                     info = None
+                    source = "Документ"
                     for chunk in context.chunks:
                         chunk_text = chunk.get("text", "").lower()
                         if item in chunk_text:
@@ -710,7 +868,7 @@ class AgentLoop:
                         comparison_results.append({
                             "item": item,
                             "info": info,
-                            "source": source or "Документ"
+                            "source": source
                         })
 
                 answer_lines = [f"**Сравнение:** {', '.join(items)}", ""]

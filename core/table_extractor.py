@@ -55,6 +55,7 @@ class ExtractedTable:
         if not PANDAS_AVAILABLE or pd is None:
             return None
         if not self.headers:
+            # noinspection PyUnresolvedReferences
             return pd.DataFrame(self.rows)
 
         rows_padded = []
@@ -62,6 +63,7 @@ class ExtractedTable:
             padded = row + [""] * (len(self.headers) - len(row))
             rows_padded.append(padded[:len(self.headers)])
 
+        # noinspection PyUnresolvedReferences
         return pd.DataFrame(rows_padded, columns=self.headers)
 
     def to_dict(self) -> Dict[str, Any]:
@@ -399,8 +401,12 @@ class TableExtractor:
 
         return unique_tables
 
+    def deduplicate_tables(self, tables: List[ExtractedTable]) -> List[ExtractedTable]:
+        """Публичный метод для дедупликации таблиц."""
+        return self._deduplicate_tables(tables)
+
     def extract_from_chunks(self, chunks: List[Dict[str, Any]], source: str = "") -> List[ExtractedTable]:
-        """Извлекает таблицы из списка чанков."""
+        """Извлекает таблицы из списка фрагментов."""
         all_tables: List[ExtractedTable] = []
 
         for chunk in chunks:
@@ -478,7 +484,8 @@ def patch_qa_system_with_table_extractor() -> None:
 
     def enhanced_answer(self, question: str, top_k: int = 5) -> Dict[str, Any]:
         """Улучшенный ответ с распознаванием таблиц."""
-        from core.table_extractor import TableExtractor, ExtractedTable
+        # Используем классы напрямую
+        extractor = TableExtractor()
 
         if hasattr(self, "search_with_formulas"):
             result = self.search_with_formulas(question, top_k)
@@ -497,7 +504,6 @@ def patch_qa_system_with_table_extractor() -> None:
                 "formulas": [],
             }
 
-        extractor = TableExtractor()
         all_tables: List[ExtractedTable] = []
 
         for chunk in relevant:
@@ -506,7 +512,7 @@ def patch_qa_system_with_table_extractor() -> None:
             tables = extractor.extract(chunk_text, chunk_doc)
             all_tables.extend(tables)
 
-        unique_tables = extractor._deduplicate_tables(all_tables)
+        unique_tables = extractor.deduplicate_tables(all_tables)
 
         # Проверяем наличие метода is_bad_chunk
         if hasattr(self, "is_bad_chunk"):
