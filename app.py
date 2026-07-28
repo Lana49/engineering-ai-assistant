@@ -5,19 +5,19 @@
 Интегрирует:
 - QASystem для поиска по документам
 - FormulaEngine для инженерных расчётов
-- AgentLoop для многошаговых рассуждений
+- AgentLoop для пошаговых рассуждений
 - ErrorHandler для обработки ошибок
 - Экспорт в DOCX и PDF
 - Извлечение таблиц и расчёты по таблицам
+- Mixed-режим с автоматическим выбором Ollama/Gemini
 """
 
 from __future__ import annotations
 
 import asyncio
-import html
 import json
+import os
 import random
-import shutil
 import sys
 import time
 from datetime import datetime
@@ -25,6 +25,13 @@ from pathlib import Path
 from typing import Any, Optional
 
 import streamlit as st
+
+# Загрузка .env через python-dotenv (установите: pip install python-dotenv)
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    pass
 
 sys.path.insert(0, str(Path(__file__).parent))
 
@@ -84,11 +91,12 @@ def get_initial_message() -> list[dict[str, str]]:
 
 **Что я умею:**
 • 📖 Отвечать на вопросы по нормативной документации
-• 📐 Рассчитывать толщину изоляции и теплопотери
+• 📐 Рассчитывать толщину изоляции и тепловые потери
 • 🌍 Вычислять ГСОП (градусо-сутки отопительного периода)
 • 💨 Определять расход теплоты на вентиляцию
 • 📊 Находить таблицы и формулы в документах
 • 🔍 Искать определения терминов
+• 🤖 Автоматический выбор между Ollama и Gemini
 
 **Задайте свой вопрос или попросите сделать расчёт!**""",
         }
@@ -350,30 +358,85 @@ def render_export_buttons(
                     st.error("❌ Ошибка создания PDF")
 
     with col3:
-        if st.button("📋 Копировать", key=f"copy_{unique_id}"):
-            escaped_answer = html.escape(answer)
-            st.markdown(
-                f"""
-                <script>
-                (function() {{
-                    const text = `{escaped_answer}`;
-                    navigator.clipboard.writeText(text).then(() => {{
-                        console.log("copied");
-                    }});
-                }})();
-                </script>
-                """,
-                unsafe_allow_html=True,
-            )
-            st.success("✅ Текст скопирован в буфер обмена!")
+        if st.button("📋 Копировать в буфер", key=f"copy_{unique_id}"):
+            st.write("✅ Текст скопирован! (Нажмите Ctrl+C)")
+
+
+def build_qa_system() -> QASystem:
+    """
+    Создаёт QASystem с поддержкой mixed-режима.
+
+    Переменные окружения:
+    - LLM_PROVIDER: "ollama", "gemini", "mixed", "none" (по умолчанию "mixed")
+    - OLLAMA_BASE_URL: URL Ollama (по умолчанию "http://localhost:11434")
+    - OLLAMA_MODEL: модель Ollama (по умолчанию "llama3.1:8b")
+    - GEMINI_API_KEY: ключ для Gemini
+    - GEMINI_MODEL: модель Gemini (по умолчанию "gemini-2.0-flash")
+    - TOP_K: количество результатов (по умолчанию 5)
+    - MIN_SCORE: минимальный score (по умолчанию 0.15)
+    - USE_EMBEDDINGS: использовать эмбеддинги (по умолчанию true)
+    - SEMANTIC_WEIGHT: вес семантики (по умолчанию 0.7)
+    - LEXICAL_WEIGHT: вес лексики (по умолчанию 0.3)
+    """
+    llm_provider = os.getenv("LLM_PROVIDER", "mixed").strip().lower()
+    use_llm = llm_provider not in {"none", ""}
+
+    ollama_base_url = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434").strip()
+    ollama_model = os.getenv("OLLAMA_MODEL", "llama3.1:8b").strip() or "llama3.1:8b"
+
+    gemini_api_key = os.getenv("GEMINI_API_KEY", "").strip()
+    gemini_model = os.getenv("GEMINI_MODEL", "gemini-2.0-flash").strip() or "gemini-2.0-flash"
+
+    top_k = int(os.getenv("TOP_K", "5"))
+    min_score = float(os.getenv("MIN_SCORE", "0.15"))
+    use_embeddings = os.getenv("USE_EMBEDDINGS", "true").strip().lower() in {"1", "true", "yes", "on"}
+
+    semantic_weight = float(os.getenv("SEMANTIC_WEIGHT", "0.7"))
+    lexical_weight = float(os.getenv("LEXICAL_WEIGHT", "0.3"))
+
+    try:
+        qa = QASystem(
+            use_llm=use_llm,
+            llm_provider=llm_provider,
+            top_k=top_k,
+            min_score=min_score,
+            ollama_base_url=ollama_base_url,
+            ollama_model=ollama_model,
+            gemini_api_key=gemini_api_key,
+            gemini_model=gemini_model,
+            use_embeddings=use_embeddings,
+            semantic_weight=semantic_weight,
+            lexical_weight=lexical_weight,
+        )
+
+        if use_llm:
+            if llm_provider == "mixed":
+                print("✅ QASystem инициализирован в mixed-режиме")
+                print(f"   Ollama: {ollama_model} ({ollama_base_url})")
+                print(f"   Gemini: {gemini_model}")
+            else:
+                print(f"✅ QASystem инициализирован с {llm_provider}")
+        else:
+            print("ℹ️ QASystem в режиме без LLM")
+        return qa
+    except Exception as e:
+        print(f"⚠️ Ошибка инициализации: {e}")
+        print("ℹ️ Запуск в режиме без LLM")
+        return QASystem(use_llm=False)
+
+
+@st.cache_resource(show_spinner=False)
+def get_qa_system() -> QASystem:
+    """Кэшированное создание QASystem."""
+    return build_qa_system()
 
 
 def init_session_state() -> None:
     """Инициализация состояния сессии."""
     if "qa_system" not in st.session_state:
-        st.session_state.qa_system = QASystem(use_llm=False)
+        st.session_state.qa_system = get_qa_system()
 
-        idx_path = PROCESSED_DIR / "qa_index"
+        idx_path = PROCESSED_DIR / "qa_index.pkl"
         if idx_path.exists():
             try:
                 loaded = st.session_state.qa_system.load_index(idx_path)
@@ -381,7 +444,7 @@ def init_session_state() -> None:
                     print("✅ Индекс загружен при старте")
                 else:
                     print("⚠️ Не удалось загрузить индекс")
-            except OSError as load_error:
+            except Exception as load_error:
                 print(f"⚠️ Ошибка загрузки индекса: {load_error}")
         else:
             print("📁 Индекс пока не найден")
@@ -413,6 +476,7 @@ def init_session_state() -> None:
     st.session_state.setdefault("current_tables", [])
     st.session_state.setdefault("current_formulas", [])
     st.session_state.setdefault("current_response_id", 0)
+    st.session_state.setdefault("current_provider", "none")
 
     if "error_handler" not in st.session_state:
         st.session_state.error_handler = ErrorHandler()
@@ -421,53 +485,40 @@ def init_session_state() -> None:
 def auto_load_documents() -> bool:
     """Автоматическая загрузка и индексация документов."""
     qa_system = st.session_state.qa_system
-    idx_path = PROCESSED_DIR / "qa_index"
+    idx_path = PROCESSED_DIR / "qa_index.pkl"
 
-    if qa_system.is_ready and qa_system.index is not None:
-        st.sidebar.success(f"✅ База знаний готова\n📄 {qa_system.index.ntotal} фрагментов")
+    if qa_system.is_ready:
+        st.sidebar.success(f"✅ База знаний готова\n📄 {len(qa_system.chunks)} фрагментов")
         return True
 
     if idx_path.exists():
         try:
             if qa_system.load_index(idx_path):
-                st.sidebar.success(f"✅ Индекс загружен\n📄 {qa_system.index.ntotal} фрагментов")
+                st.sidebar.success(f"✅ Индекс загружен\n📄 {len(qa_system.chunks)} фрагментов")
                 return True
-        except OSError as load_error:
+        except Exception as load_error:
             st.sidebar.warning(f"⚠️ Ошибка загрузки индекса: {load_error}")
 
     docs = list(RAW_DIR.glob("*.docx")) + list(RAW_DIR.glob("*.pdf")) + list(RAW_DIR.glob("*.rtf"))
 
     if not docs:
-        st.sidebar.info("📥 Документы будут загружены из Hugging Face...")
-        with st.sidebar:
-            with st.spinner("📥 Загрузка документов из Hugging Face..."):
-                indexed = qa_system.index_documents(RAW_DIR)
-                if indexed and qa_system.is_ready:
-                    idx_path.mkdir(parents=True, exist_ok=True)
-                    qa_system.save_index(idx_path)
-                    st.sidebar.success(f"✅ Загружено {qa_system.index.ntotal} фрагментов")
-                    st.rerun()
-                else:
-                    st.sidebar.warning("📁 Папка data/raw пуста. Добавьте документы вручную.")
+        st.sidebar.info("📁 Папка data/raw пуста. Добавьте документы вручную.")
         return False
 
-    if not qa_system.is_ready:
+    with st.sidebar:
+        st.info(f"📚 Индексация {len(docs)} документов...")
+
+    indexed = qa_system.index_documents(RAW_DIR)
+
+    if indexed:
+        idx_path.parent.mkdir(parents=True, exist_ok=True)
+        qa_system.save_index(idx_path)
         with st.sidebar:
-            st.info(f"📚 Индексация {len(docs)} документов...")
+            st.success(f"✅ Загружено {len(qa_system.chunks)} фрагментов")
+        return True
 
-        indexed = qa_system.index_documents(RAW_DIR)
-
-        if indexed:
-            idx_path.mkdir(parents=True, exist_ok=True)
-            qa_system.save_index(idx_path)
-            with st.sidebar:
-                st.success(f"✅ Загружено {qa_system.index.ntotal} фрагментов")
-            return True
-
-        st.sidebar.error("❌ Ошибка индексации")
-        return False
-
-    return True
+    st.sidebar.error("❌ Ошибка индексации")
+    return False
 
 
 def render_sidebar(
@@ -485,9 +536,35 @@ def render_sidebar(
 - ✅ Извлечение нормативных параметров
 - ✅ Поиск таблиц и формул
 - ✅ Определения терминов
+- 🤖 Mixed-режим (Ollama + Gemini)
 """
         )
         st.divider()
+
+        llm_provider = os.getenv("LLM_PROVIDER", "mixed").strip().lower()
+
+        if llm_provider == "mixed":
+            ollama_available = qa_system.is_ollama_available() if hasattr(qa_system, "is_ollama_available") else False
+            gemini_available = bool(getattr(qa_system, "gemini_api_key", ""))
+
+            ollama_status = "✅" if ollama_available else "❌"
+            gemini_status = "✅" if gemini_available else "❌"
+            st.info(f"🤖 Mixed-режим\nOllama: {ollama_status}\nGemini: {gemini_status}")
+
+        elif llm_provider == "ollama":
+            ollama_available = qa_system.is_ollama_available() if hasattr(qa_system, "is_ollama_available") else False
+            if ollama_available:
+                st.success(f"🤖 Ollama: {qa_system.ollama_model}")
+            else:
+                st.warning("⚠️ Ollama не доступен")
+
+        elif llm_provider == "gemini":
+            if getattr(qa_system, "gemini_api_key", ""):
+                st.success(f"🤖 Gemini: {qa_system.gemini_model}")
+            else:
+                st.warning("⚠️ Не задан GEMINI_API_KEY")
+        else:
+            st.info("🤖 Режим без LLM")
 
         auto_load_documents()
         st.divider()
@@ -496,19 +573,19 @@ def render_sidebar(
 
         with col1:
             if st.button("🔄 Перезагрузить индекс", use_container_width=True):
-                idx_path = PROCESSED_DIR / "qa_index"
+                idx_path = PROCESSED_DIR / "qa_index.pkl"
                 if idx_path.exists():
                     st.session_state.qa_system.load_index(idx_path)
-                    st.success(f"✅ Индекс перезагружен: {qa_system.index.ntotal} векторов")
+                    st.success(f"✅ Индекс перезагружен: {len(qa_system.chunks)} фрагментов")
                     st.rerun()
                 else:
                     st.warning("⚠️ Индекс не найден")
 
         with col2:
             if st.button("🗑️ Очистить индекс", use_container_width=True):
-                idx_path = PROCESSED_DIR / "qa_index"
+                idx_path = PROCESSED_DIR / "qa_index.pkl"
                 if idx_path.exists():
-                    shutil.rmtree(idx_path)
+                    idx_path.unlink(missing_ok=True)
                     st.success("✅ Индекс очищен")
                     st.rerun()
 
@@ -517,10 +594,10 @@ def render_sidebar(
                 with st.spinner("Индексация..."):
                     result = qa_system.index_documents(RAW_DIR)
                     if result:
-                        idx_path = PROCESSED_DIR / "qa_index"
-                        idx_path.mkdir(parents=True, exist_ok=True)
+                        idx_path = PROCESSED_DIR / "qa_index.pkl"
+                        idx_path.parent.mkdir(parents=True, exist_ok=True)
                         qa_system.save_index(idx_path)
-                        st.success(f"✅ Проиндексировано {qa_system.index.ntotal} фрагментов")
+                        st.success(f"✅ Проиндексировано {len(qa_system.chunks)} фрагментов")
                         st.rerun()
                     else:
                         st.error("❌ Не найдено документов для индексации")
@@ -546,7 +623,7 @@ def render_sidebar(
             + len(list(RAW_DIR.glob("*.pdf")))
             + len(list(RAW_DIR.glob("*.rtf")))
         )
-        chunks_count = qa_system.index.ntotal if qa_system.is_ready else 0
+        chunks_count = len(qa_system.chunks) if qa_system.is_ready else 0
 
         stat_col1, stat_col2 = st.columns(2)
         stat_col1.metric("Документов", docs_count)
@@ -628,16 +705,21 @@ def main() -> None:
         current_sources: list[Any] = []
         current_tables: list[Any] = []
         current_formulas: list[Any] = []
+        current_provider = "none"
 
         with st.chat_message("assistant"):
             with st.spinner("🔍 Анализирую запрос..."):
                 try:
                     result = call_maybe_async(agent_loop.run, prompt)
 
-                    response = result.get("answer", response)
-                    current_sources = result.get("sources", [])
-                    current_tables = result.get("tables", [])
-                    current_formulas = result.get("formulas", [])
+                    if isinstance(result, dict):
+                        response = result.get("answer", response)
+                        current_sources = result.get("sources", [])
+                        current_tables = result.get("tables", [])
+                        current_formulas = result.get("formulas", [])
+                        current_provider = result.get("provider", "none")
+                    else:
+                        response = str(result)
 
                     st.session_state.current_response_id += 1
                     current_id = st.session_state.current_response_id
@@ -646,8 +728,12 @@ def main() -> None:
                     st.session_state.current_sources = current_sources
                     st.session_state.current_tables = current_tables
                     st.session_state.current_formulas = current_formulas
+                    st.session_state.current_provider = current_provider
 
                     st.markdown(response)
+
+                    if current_provider and current_provider != "none":
+                        st.caption(f"🤖 Ответ сгенерирован через: **{current_provider.upper()}**")
 
                     if hasattr(agent_loop, "get_reasoning_chain"):
                         try:

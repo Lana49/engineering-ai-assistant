@@ -1,691 +1,636 @@
-# core/qa_engine.py
+# -*- coding: utf-8 -*-
 """
-QA Engine для работы с документацией.
-Поддерживает:
-- Семантический поиск по документам
-- Гибридный поиск (FAISS + BM25)
-- Извлечение таблиц и формул
-- Индексацию документов
-- Кэширование индекса
-- Поиск определений
-- Опциональный LLM (OpenAI) для генерации ответов
+QA Engine для инженерной документации.
+
+Возможности:
+- Гибридный поиск: semantic + lexical
+- SentenceTransformers embeddings
+- TF-IDF fallback
+- LLM-ответы через Ollama / Gemini
+- Mixed-режим: автоматический выбор между Ollama и Gemini
+- Сохранение/загрузка индекса
 """
 
-import hashlib
+from __future__ import annotations
+
 import os
 import pickle
 import re
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, List, Optional, cast
+from typing import Any, Dict, List, Optional, Union
 
-# noinspection PyUnresolvedReferences
-import faiss
-
-# noinspection PyUnresolvedReferences
 import numpy as np
+import requests
 
+# Попытка импорта python-dotenv (опционально)
 try:
-    from sentence_transformers import SentenceTransformer
+    from dotenv import load_dotenv
+    load_dotenv()
 except ImportError:
-    SentenceTransformer = None  # type: ignore
+    # Если python-dotenv не установлен, просто пропускаем
+    load_dotenv = None  # type: ignore
 
-try:
-    from rank_bm25 import BM25Okapi
-except ImportError:
-    BM25Okapi = None  # type: ignore
 
+# Попытка импорта TfidfVectorizer из sklearn
 try:
-    from huggingface_hub import snapshot_download
+    from sklearn.feature_extraction.text import TfidfVectorizer
 except ImportError:
-    snapshot_download = None  # type: ignore
+    # Если scikit-learn не установлен, определяем заглушку
+    TfidfVectorizer = None  # type: ignore
 
-try:
-    from openai import OpenAI
-except ImportError:
-    OpenAI = None  # type: ignore
+
+@dataclass
+class SearchResult:
+    """Результат поиска."""
+    doc_name: str
+    chunk_id: int
+    text: str
+    score: float
+    semantic_score: float = 0.0
+    lexical_score: float = 0.0
+    filepath: str = ""
+    metadata: Dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass
+class QAResponse:
+    """Ответ на вопрос."""
+    question: str
+    answer: str
+    sources: List[SearchResult] = field(default_factory=list)
+    provider: str = "none"
+    used_llm: bool = False
+    context: str = ""
 
 
 class QASystem:
-    """Система вопрос-ответ на основе документов с поддержкой LLM."""
+    """Система вопросов-ответов по документам."""
 
-    def __init__(self, use_llm: bool = False) -> None:
-        if SentenceTransformer is None:
-            raise ImportError("Не установлен sentence-transformers")
-
-        print("🔄 Загрузка модели эмбеддингов...")
-        model_cls = cast(Any, SentenceTransformer)
-        # noinspection SpellCheckingInspection
-        self.model = model_cls("intfloat/multilingual-e5-small")
-        self.dimension = 384
-
-        # noinspection PyTypeChecker
-        self.index = None
-        self.chunks: List[Dict[str, Any]] = []
-        self.bm25_index = None
-        self.is_ready = False
-
+    def __init__(
+        self,
+        use_llm: bool = False,
+        llm_provider: str = "ollama",
+        model_name: Optional[str] = None,
+        top_k: int = 5,
+        min_score: float = 0.15,
+        ollama_base_url: str = "http://localhost:11434",
+        ollama_model: str = "llama3.1:8b",
+        gemini_api_key: Optional[str] = None,
+        gemini_model: str = "gemini-2.0-flash",
+        embedding_model_name: str = "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2",
+        use_embeddings: bool = True,
+        semantic_weight: float = 0.7,
+        lexical_weight: float = 0.3,
+    ):
         self.use_llm = use_llm
-        self.llm_engine = None
+        self.llm_provider = (llm_provider or "ollama").strip().lower()
+        self.top_k = top_k
+        self.min_score = min_score
+
+        self.ollama_base_url = ollama_base_url.rstrip("/")
+        self.ollama_model = ollama_model or "llama3.1:8b"
+
+        self.gemini_api_key = (gemini_api_key or os.getenv("GEMINI_API_KEY", "")).strip()
+        self.gemini_model = gemini_model or "gemini-2.0-flash"
+
+        if model_name:
+            if self.llm_provider in {"ollama", "mixed"}:
+                self.ollama_model = model_name
+            elif self.llm_provider == "gemini":
+                self.gemini_model = model_name
+
+        self.embedding_model_name = embedding_model_name
+        self.use_embeddings = use_embeddings
+        self.semantic_weight = semantic_weight
+        self.lexical_weight = lexical_weight
+
+        self.documents: List[Dict[str, Any]] = []
+        self.chunks: List[Dict[str, Any]] = []
+
+        self.embedding_model: Any = None
+        self.chunk_embeddings: Optional[np.ndarray] = None
+
+        self.vectorizer: Optional[Any] = None
+        self.tfidf_matrix: Any = None
+
+        self.is_ready = False
+        self.llm_available = False
+
+        if TfidfVectorizer is None:
+            print("⚠️ scikit-learn не установлен. Установите: pip install scikit-learn")
+
+        if self.use_embeddings:
+            self._try_load_embedding_model()
 
         if self.use_llm:
-            if OpenAI is None:
-                raise ImportError("openai не установлен. Установи: pip install openai")
+            self._validate_llm_config()
 
-            api_key = os.getenv("OPENAI_API_KEY", "").strip()
-            if not api_key:
-                raise ValueError("OPENAI_API_KEY не найден в переменных окружения")
-
-            openai_cls = cast(Any, OpenAI)
-            self.llm_engine = openai_cls(api_key=api_key)
-            print("✅ OpenAI клиент инициализирован")
-
-        self.stop_phrases = [
-            ".", ",", "q", "t", "r", "tv", "tn", "tot", "zot",
-            "δ", "λ", "Q", "R", "A", "L", "("
-        ]
-        self.definitions_cache: Dict[str, Dict[str, Any]] = {}
-        self._chunk_size = 1000
-        self._chunk_overlap = 200
-
-    @staticmethod
-    def normalize_text(text: str) -> str:
-        if not text:
-            return ""
-        text = text.replace("\xa0", " ")
-        text = re.sub(r"\s+", " ", text)
-        return text.strip()
-
-    def is_bad_chunk(self, text: str) -> bool:
-        text_stripped = self.normalize_text(text).lower()
-        if len(text_stripped) < 50:
-            return True
-        if text_stripped in self.stop_phrases:
-            return True
-        if sum(ch.isalpha() for ch in text_stripped) < 20:
-            return True
-        return False
-
-    @staticmethod
-    def chunk_text(
-        text: str,
-        doc_name: str,
-        chunk_size: int = 1000,
-        overlap: int = 200,
-    ) -> List[Dict[str, Any]]:
-        text = re.sub(r"\s+", " ", text).strip()
-        if not text:
-            return []
-
-        sentences = re.split(r"(?<=[.!?])\s+", text)
-        chunks: List[Dict[str, Any]] = []
-        current = ""
-        chunk_id = 0
-
-        for sent in sentences:
-            sent = sent.strip()
-            if not sent:
-                continue
-
-            if len(current) + len(sent) + 1 <= chunk_size:
-                current = f"{current} {sent}".strip()
-            else:
-                if current:
-                    chunks.append({
-                        "id": f"{doc_name}_{chunk_id}",
-                        "text": current,
-                        "doc_name": doc_name,
-                        "chunk_id": chunk_id,
-                    })
-                    chunk_id += 1
-
-                    if overlap > 0:
-                        tail = current[-overlap:]
-                        current = f"{tail} {sent}".strip()
-                    else:
-                        current = sent
-
-        if current:
-            chunks.append({
-                "id": f"{doc_name}_{chunk_id}",
-                "text": current,
-                "doc_name": doc_name,
-                "chunk_id": chunk_id,
-            })
-
-        return chunks
-
-    @staticmethod
-    def read_docx(file_path: str) -> str:
+    def is_ollama_available(self) -> bool:
+        """Проверка доступности Ollama."""
         try:
-            # noinspection PyUnresolvedReferences
-            from docx import Document
-        except ImportError:
-            return ""
+            response = requests.get(f"{self.ollama_base_url}/api/tags", timeout=3)
+            return response.status_code == 200
+        except requests.RequestException:
+            return False
 
-        try:
-            doc = Document(file_path)
-            parts = [p.text for p in doc.paragraphs if p.text.strip()]
+    def build_index(self, parsed_docs: List[Dict[str, Any]]) -> bool:
+        """Строит индекс по уже обработанным документам."""
+        self.documents = parsed_docs or []
+        self.chunks = []
 
-            for table_idx, table in enumerate(doc.tables):
-                table_lines = [f"Таблица {table_idx + 1}"]
-                for row in table.rows:
-                    cells = [cell.text.strip() for cell in row.cells]
-                    if any(cells):
-                        table_lines.append(" | ".join(cells))
-                if len(table_lines) > 1:
-                    parts.append("\n".join(table_lines))
+        for doc in self.documents:
+            doc_name = doc.get("doc_name", "")
+            filepath = doc.get("filepath", "")
+            filetype = doc.get("filetype", "")
+            doc_metadata = doc.get("metadata", {}) or {}
 
-            return "\n".join(parts)
-        except (OSError, ValueError):
-            return ""
-
-    @staticmethod
-    def read_pdf(file_path: str) -> str:
-        # noinspection PyUnresolvedReferences
-        import fitz  # type: ignore
-
-        try:
-            parts: List[str] = []
-            doc = fitz.open(file_path)
-            for page_num, page in enumerate(doc):
-                parts.append(f"--- page {page_num + 1} ---")
-                parts.append(page.get_text())
-
-            try:
-                # noinspection PyUnresolvedReferences
-                import pdfplumber
-            except ImportError:
-                pdfplumber = None  # type: ignore
-
-            if pdfplumber is not None:
-                try:
-                    with pdfplumber.open(file_path) as pdf:
-                        for page_num, page in enumerate(pdf.pages):
-                            tables = page.extract_tables() or []
-                            for table_idx, table in enumerate(tables):
-                                lines = [f"Таблица {table_idx + 1}, страница {page_num + 1}"]
-                                for row in table:
-                                    if row:
-                                        row_text = [str(cell or "").strip() for cell in row]
-                                        if any(row_text):
-                                            lines.append(" | ".join(row_text))
-                                if len(lines) > 1:
-                                    parts.append("\n".join(lines))
-                except (OSError, ValueError):
-                    pass
-
-            return "\n".join(parts)
-        except (OSError, ValueError):
-            return ""
-
-    @staticmethod
-    def read_rtf(file_path: str) -> str:
-        try:
-            # noinspection PyUnresolvedReferences
-            from striprtf.striprtf import rtf_to_text
-        except ImportError:
-            print("⚠️ striprtf не установлен. pip install striprtf")
-            return ""
-
-        try:
-            raw_text = Path(file_path).read_text(encoding="utf-8", errors="ignore")
-            return rtf_to_text(raw_text).strip()
-        except (OSError, ValueError):
-            return ""
-
-    def read_file(self, file_path: Path) -> str:
-        ext = file_path.suffix.lower()
-
-        try:
-            if ext in {".docx", ".doc"}:
-                return self.read_docx(str(file_path))
-            if ext == ".pdf":
-                return self.read_pdf(str(file_path))
-            if ext == ".rtf":
-                return self.read_rtf(str(file_path))
-            return file_path.read_text(encoding="utf-8", errors="ignore")
-        except (OSError, ValueError):
-            return ""
-
-    @staticmethod
-    def get_documents_hash(documents_dir: Path) -> str:
-        md5 = hashlib.md5()
-        for file_path in sorted(documents_dir.glob("*")):
-            if file_path.is_file() and file_path.suffix.lower() in {
-                ".docx", ".doc", ".pdf", ".rtf", ".txt", ".md", ".csv", ".json", ".xml"
-            }:
-                try:
-                    with open(file_path, "rb") as f:
-                        for chunk in iter(lambda: f.read(4096), b""):
-                            md5.update(chunk)
-                except OSError:
+            for chunk in doc.get("chunks", []) or []:
+                text = (chunk.get("text") or "").strip()
+                if not text:
                     continue
-        return md5.hexdigest()
 
-    @staticmethod
-    def get_hash_file_path(documents_dir: Path) -> Path:
-        return documents_dir.parent / "processed" / "docs_hash.txt"
-
-    def load_saved_hash(self, documents_dir: Path) -> Optional[str]:
-        hash_file = self.get_hash_file_path(documents_dir)
-        if not hash_file.exists():
-            return None
-        try:
-            return hash_file.read_text(encoding="utf-8").strip()
-        except (OSError, ValueError):
-            return None
-
-    def save_hash(self, documents_dir: Path, hash_value: str) -> None:
-        hash_file = self.get_hash_file_path(documents_dir)
-        hash_file.parent.mkdir(parents=True, exist_ok=True)
-        hash_file.write_text(hash_value, encoding="utf-8")
-
-    @staticmethod
-    def tokenize(text: str) -> List[str]:
-        return re.findall(r"[A-Za-zА-Яа-я0-9\-]{2,}", text.lower())
-
-    def build_bm25_index(self) -> None:
-        if not self.chunks or BM25Okapi is None:
-            self.bm25_index = None
-            return
-
-        bm25_cls = cast(Any, BM25Okapi)
-        tokenized = [self.tokenize(chunk["text"]) for chunk in self.chunks]
-        self.bm25_index = bm25_cls(tokenized)
-
-    def save_index(self, index_dir: Path) -> None:
-        if self.index is None:
-            return
-
-        try:
-            index_dir.mkdir(parents=True, exist_ok=True)
-            # noinspection PyUnresolvedReferences
-            faiss.write_index(self.index, str(index_dir / "qa_index.faiss"))
-            with open(index_dir / "chunks.pkl", "wb") as f:
-                pickle.dump(self.chunks, f)
-        except (OSError, ValueError):
-            return
-
-    def load_index(self, index_dir: Path) -> bool:
-        index_path = index_dir / "qa_index.faiss"
-        chunks_path = index_dir / "chunks.pkl"
-
-        if not index_path.exists() or not chunks_path.exists():
-            return False
-
-        try:
-            # noinspection PyUnresolvedReferences
-            self.index = faiss.read_index(str(index_path))
-            with open(chunks_path, "rb") as f:
-                self.chunks = pickle.load(f)
-            self.build_bm25_index()
-            self.is_ready = True
-            return True
-        except (OSError, ValueError, pickle.UnpicklingError):
-            return False
-
-    def index_documents(self, documents_dir: Path) -> bool:
-        documents_dir.mkdir(parents=True, exist_ok=True)
-        index_dir = documents_dir.parent / "processed"
-
-        current_hash = self.get_documents_hash(documents_dir)
-        saved_hash = self.load_saved_hash(documents_dir)
-
-        if saved_hash == current_hash and self.load_index(index_dir):
-            return True
-
-        if snapshot_download is not None:
-            try:
-                snapshot_fn = cast(Any, snapshot_download)
-                snapshot_fn(
-                    repo_id="Lana49/engineering-docs",
-                    repo_type="dataset",
-                    local_dir=str(documents_dir),
-                    allow_patterns=["*.docx", "*.doc", "*.pdf", "*.rtf", "*.txt", "*.md", "*.csv", "*.json", "*.xml"],
-                    local_dir_use_symlinks=False,
-                    force_download=False,
+                self.chunks.append(
+                    {
+                        "doc_name": chunk.get("doc_name", doc_name),
+                        "chunk_id": chunk.get("chunk_id", 0),
+                        "text": text,
+                        "filepath": filepath,
+                        "filetype": filetype,
+                        "metadata": {**doc_metadata, **chunk.get("metadata", {})},
+                    }
                 )
-            except (OSError, ValueError):
-                pass
 
-        all_chunks: List[Dict[str, Any]] = []
-
-        for file_path in documents_dir.glob("*"):
-            if not file_path.is_file():
-                continue
-            if file_path.suffix.lower() not in {
-                ".docx", ".doc", ".pdf", ".rtf", ".txt", ".md", ".csv", ".json", ".xml"
-            }:
-                continue
-
-            text = self.read_file(file_path)
-            if not text.strip():
-                continue
-
-            chunks = self.chunk_text(text, file_path.stem, self._chunk_size, self._chunk_overlap)
-            all_chunks.extend(chunks)
-
-        all_chunks = [c for c in all_chunks if not self.is_bad_chunk(c["text"])]
-        if not all_chunks:
+        if not self.chunks:
+            print("⚠️ Нет фрагментов для индексации")
             self.is_ready = False
             return False
 
-        texts = [f"passage: {c['text']}" for c in all_chunks]
-        embeddings = self.model.encode(texts, show_progress_bar=True)
-        # noinspection PyUnresolvedReferences,PyTypeChecker
-        embeddings = np.asarray(embeddings, dtype=np.float32)
+        texts = [c["text"] for c in self.chunks]
 
-        # noinspection PyUnresolvedReferences
-        norms = np.linalg.norm(embeddings, axis=1, keepdims=True)
-        norms[norms == 0] = 1.0
-        embeddings = embeddings / norms
+        # Создание TF-IDF векторизатора
+        if TfidfVectorizer is not None:
+            self.vectorizer = TfidfVectorizer(
+                lowercase=True,
+                ngram_range=(1, 2),
+                max_features=50000,
+                token_pattern=r"(?u)\b[\w\-/\.]+\b",
+            )
+            self.tfidf_matrix = self.vectorizer.fit_transform(texts) if texts else None
+        else:
+            self.vectorizer = None
+            self.tfidf_matrix = None
+            print("⚠️ TF-IDF недоступен: scikit-learn не установлен")
 
-        # noinspection PyUnresolvedReferences
-        self.index = faiss.IndexFlatIP(self.dimension)
-        self.index.add(embeddings)
-
-        self.chunks = all_chunks
-        self.build_bm25_index()
-        self.save_index(index_dir)
-        self.save_hash(documents_dir, current_hash)
+        # Создание эмбеддингов
+        if self.embedding_model is not None and texts:
+            try:
+                embeddings = self.embedding_model.encode(
+                    texts,
+                    normalize_embeddings=True,
+                    show_progress_bar=False,
+                )
+                self.chunk_embeddings = np.asarray(embeddings, dtype=np.float32)
+            except Exception as e:
+                print(f"⚠️ Ошибка построения эмбеддингов: {e}")
+                self.chunk_embeddings = None
+        else:
+            self.chunk_embeddings = None
 
         self.is_ready = True
+        print(f"✅ Индекс построен: {len(self.chunks)} фрагментов")
         return True
 
-    def search_bm25(self, query: str, top_k: int = 10) -> List[Dict[str, Any]]:
-        if self.bm25_index is None:
+    def index_documents(self, directory: Union[str, Path]) -> bool:
+        """Индексирует документы из директории."""
+        try:
+            from core.parser import DocumentParser
+
+            parser = DocumentParser(chunk_size=1200, chunk_overlap=200)
+            docs = parser.parse_directory(directory, recursive=True)
+            return self.build_index(docs)
+        except ImportError as e:
+            print(f"❌ Не удалось импортировать parser: {e}")
+            return False
+        except Exception as e:
+            print(f"❌ Ошибка индексации: {e}")
+            return False
+
+    def save_index(self, index_path: Union[str, Path]) -> bool:
+        """Сохраняет индекс на диск."""
+        try:
+            data = {
+                "documents": self.documents,
+                "chunks": self.chunks,
+                "top_k": self.top_k,
+                "min_score": self.min_score,
+                "embedding_model_name": self.embedding_model_name,
+                "use_embeddings": self.use_embeddings,
+                "semantic_weight": self.semantic_weight,
+                "lexical_weight": self.lexical_weight,
+                "chunk_embeddings": self.chunk_embeddings,
+                "vectorizer": self.vectorizer,
+                "tfidf_matrix": self.tfidf_matrix,
+                "ollama_model": self.ollama_model,
+                "gemini_model": self.gemini_model,
+                "llm_provider": self.llm_provider,
+            }
+
+            index_path = Path(index_path)
+            index_path.parent.mkdir(parents=True, exist_ok=True)
+
+            with open(index_path, "wb") as f:
+                pickle.dump(data, f)
+
+            print(f"✅ Индекс сохранён: {index_path}")
+            return True
+        except (OSError, pickle.PickleError) as e:
+            print(f"❌ Ошибка сохранения индекса: {e}")
+            return False
+
+    def load_index(self, index_path: Union[str, Path]) -> bool:
+        """Загружает индекс с диска."""
+        try:
+            index_path = Path(index_path)
+            if not index_path.exists():
+                print(f"⚠️ Индекс не найден: {index_path}")
+                return False
+
+            with open(index_path, "rb") as f:
+                data = pickle.load(f)
+
+            self.documents = data.get("documents", [])
+            self.chunks = data.get("chunks", [])
+            self.top_k = data.get("top_k", self.top_k)
+            self.min_score = data.get("min_score", self.min_score)
+            self.embedding_model_name = data.get("embedding_model_name", self.embedding_model_name)
+            self.use_embeddings = data.get("use_embeddings", self.use_embeddings)
+            self.semantic_weight = data.get("semantic_weight", self.semantic_weight)
+            self.lexical_weight = data.get("lexical_weight", self.lexical_weight)
+            self.chunk_embeddings = data.get("chunk_embeddings", None)
+            self.vectorizer = data.get("vectorizer", None)
+            self.tfidf_matrix = data.get("tfidf_matrix", None)
+            self.ollama_model = data.get("ollama_model", self.ollama_model)
+            self.gemini_model = data.get("gemini_model", self.gemini_model)
+            self.llm_provider = data.get("llm_provider", self.llm_provider)
+
+            if self.use_embeddings and self.embedding_model is None:
+                self._try_load_embedding_model()
+
+            if self.use_llm:
+                self._validate_llm_config()
+
+            self.is_ready = bool(self.chunks)
+            print(f"✅ Индекс загружен: {len(self.chunks)} фрагментов")
+            return True
+        except (OSError, pickle.PickleError, EOFError) as e:
+            print(f"❌ Ошибка загрузки индекса: {e}")
+            self.is_ready = False
+            return False
+
+    def search(
+        self,
+        query: str,
+        top_k: Optional[int] = None,
+        search_type: str = "hybrid",
+    ) -> List[SearchResult]:
+        """Поиск по индексу."""
+        if not self.is_ready or not self.chunks:
+            return []
+
+        top_k = top_k or self.top_k
+
+        if search_type == "semantic":
+            return self.search_semantic(query, top_k)
+        if search_type == "lexical":
+            return self.search_lexical(query, top_k)
+
+        return self.search_hybrid(query, top_k)
+
+    def answer(
+        self,
+        question: str,
+        top_k: Optional[int] = None,
+        search_type: str = "hybrid",
+    ) -> QAResponse:
+        """Отвечает на вопрос по документам."""
+        results = self.search(question, top_k=top_k, search_type=search_type)
+        context = self._build_context(results)
+
+        if not results:
+            return QAResponse(
+                question=question,
+                answer="Не удалось найти релевантную информацию в документах.",
+                sources=[],
+                provider="none",
+                used_llm=False,
+                context="",
+            )
+
+        if self.use_llm and self.llm_available:
+            llm_answer, provider = self._generate_llm_answer(question, context)
+            if llm_answer:
+                return QAResponse(
+                    question=question,
+                    answer=llm_answer,
+                    sources=results,
+                    provider=provider,
+                    used_llm=True,
+                    context=context,
+                )
+
+        fallback_answer = self._generate_extract_answer(results)
+        return QAResponse(
+            question=question,
+            answer=fallback_answer,
+            sources=results,
+            provider="none",
+            used_llm=False,
+            context=context,
+        )
+
+    def search_semantic(self, query: str, top_k: int = 5) -> List[SearchResult]:
+        """Семантический поиск по эмбеддингам."""
+        if self.chunk_embeddings is None or self.embedding_model is None or not self.chunks:
             return []
 
         try:
-            tokenized_query = self.tokenize(query)
-            scores = self.bm25_index.get_scores(tokenized_query)
-            # noinspection PyUnresolvedReferences,PyTypeChecker
-            top_indices = np.argsort(scores)[::-1][:top_k]
-            results: List[Dict[str, Any]] = []
+            query_emb = self.embedding_model.encode(
+                [query],
+                normalize_embeddings=True,
+                show_progress_bar=False,
+            )
+            query_emb = np.asarray(query_emb, dtype=np.float32)[0]
+            scores = np.dot(self.chunk_embeddings, query_emb)
 
-            for idx in top_indices:
-                idx_int = int(idx)
-                if idx_int < len(self.chunks) and float(scores[idx_int]) > 0:
-                    results.append({
-                        "text": self.chunks[idx_int]["text"],
-                        "doc_name": self.chunks[idx_int]["doc_name"],
-                        "score": float(scores[idx_int]),
-                        "idx": idx_int,
-                        "search_type": "bm25",
-                    })
-            return results
-        except ValueError:
-            return []
+            # Получаем индексы отсортированные по убыванию
+            sorted_indices = np.argsort(scores)[::-1][:top_k]
+            results: List[SearchResult] = []
 
-    def search(self, query: str, top_k: int = 8) -> List[Dict[str, Any]]:
-        if not self.is_ready or self.index is None:
-            return []
-
-        # noinspection PyTypeChecker
-        query_emb = self.model.encode([f"query: {query}"])
-        # noinspection PyUnresolvedReferences,PyTypeChecker
-        query_emb = np.asarray(query_emb, dtype=np.float32)
-
-        # noinspection PyUnresolvedReferences
-        norms = np.linalg.norm(query_emb, axis=1, keepdims=True)
-        norms[norms == 0] = 1.0
-        query_emb = query_emb / norms
-
-        # noinspection PyUnresolvedReferences
-        scores, indices = self.index.search(query_emb, max(top_k * 2, 10))
-        faiss_results: List[Dict[str, Any]] = []
-
-        for score, idx in zip(scores[0], indices[0]):
-            idx_int = int(idx)
-            if 0 <= idx_int < len(self.chunks) and float(score) > 0.25:
-                faiss_results.append({
-                    "text": self.chunks[idx_int]["text"],
-                    "doc_name": self.chunks[idx_int]["doc_name"],
-                    "score": float(score),
-                    "idx": idx_int,
-                    "search_type": "faiss",
-                })
-
-        bm25_results = self.search_bm25(query, top_k=top_k)
-
-        combined: Dict[str, Dict[str, Any]] = {}
-        for item in faiss_results + bm25_results:
-            key = f"{item['doc_name']}::{item['idx']}"
-            if key not in combined:
-                combined[key] = item
-            else:
-                combined[key]["score"] = max(combined[key]["score"], item["score"])
-
-        results = sorted(combined.values(), key=lambda x: x["score"], reverse=True)
-        return results[:top_k]
-
-    @staticmethod
-    def extract_tables(text: str) -> List[str]:
-        tables: List[str] = []
-        pattern = r"(Таблица.*?(?:\n.+)+)"
-        matches = re.findall(pattern, text, flags=re.MULTILINE)
-        tables.extend(matches)
-        return tables
-
-    @staticmethod
-    def extract_formulas(text: str) -> List[Dict[str, Any]]:
-        formulas: List[Dict[str, Any]] = []
-        patterns = [
-            r"[A-Za-zА-Яа-я][\w]*\s*=\s*[^.\n]+",
-            r"[^.\n]*=\s*[^.\n]*",
-        ]
-
-        for pattern in patterns:
-            matches = re.findall(pattern, text)
-            for match in matches:
-                match = match.strip()
-                if len(match) < 3 or "=" not in match:
+            for idx in sorted_indices:
+                score = float(scores[idx])
+                if score < self.min_score:
                     continue
+                chunk = self.chunks[idx]
+                results.append(
+                    SearchResult(
+                        doc_name=chunk["doc_name"],
+                        chunk_id=chunk["chunk_id"],
+                        text=chunk["text"],
+                        score=score,
+                        semantic_score=score,
+                        lexical_score=0.0,
+                        filepath=chunk.get("filepath", ""),
+                        metadata=chunk.get("metadata", {}),
+                    )
+                )
+            return results
+        except Exception as e:
+            print(f"⚠️ Ошибка semantic search: {e}")
+            return []
 
-                formulas.append({
-                    "raw": match,
-                    "variables": list(set(re.findall(r"[A-Za-zА-Яа-я][_\w]*", match))),
-                    "has_operator": True,
-                })
+    def search_lexical(self, query: str, top_k: int = 5) -> List[SearchResult]:
+        """Лексический поиск по TF-IDF."""
+        if self.vectorizer is None or self.tfidf_matrix is None or not self.chunks:
+            return []
 
-        unique_formulas: List[Dict[str, Any]] = []
+        try:
+            query_vec = self.vectorizer.transform([query])
+            scores = (self.tfidf_matrix @ query_vec.T).toarray().ravel()
+
+            sorted_indices = np.argsort(scores)[::-1][:top_k]
+            results: List[SearchResult] = []
+
+            for idx in sorted_indices:
+                score = float(scores[idx])
+                if score < max(self.min_score * 0.5, 0.01):
+                    continue
+                chunk = self.chunks[idx]
+                results.append(
+                    SearchResult(
+                        doc_name=chunk["doc_name"],
+                        chunk_id=chunk["chunk_id"],
+                        text=chunk["text"],
+                        score=score,
+                        semantic_score=0.0,
+                        lexical_score=score,
+                        filepath=chunk.get("filepath", ""),
+                        metadata=chunk.get("metadata", {}),
+                    )
+                )
+            return results
+        except Exception as e:
+            print(f"⚠️ Ошибка lexical search: {e}")
+            return []
+
+    def search_hybrid(self, query: str, top_k: int = 5) -> List[SearchResult]:
+        """Гибридный поиск semantic + lexical."""
+        semantic_scores = np.zeros(len(self.chunks), dtype=np.float32)
+        lexical_scores = np.zeros(len(self.chunks), dtype=np.float32)
+
+        if self.chunk_embeddings is not None and self.embedding_model is not None:
+            try:
+                query_emb = self.embedding_model.encode(
+                    [query],
+                    normalize_embeddings=True,
+                    show_progress_bar=False,
+                )
+                query_emb = np.asarray(query_emb, dtype=np.float32)[0]
+                semantic_scores = np.dot(self.chunk_embeddings, query_emb)
+            except Exception as e:
+                print(f"⚠️ Ошибка semantic части hybrid search: {e}")
+
+        if self.vectorizer is not None and self.tfidf_matrix is not None:
+            try:
+                query_vec = self.vectorizer.transform([query])
+                lexical_scores = (self.tfidf_matrix @ query_vec.T).toarray().ravel()
+            except Exception as e:
+                print(f"⚠️ Ошибка lexical части hybrid search: {e}")
+
+        combined = self.semantic_weight * semantic_scores + self.lexical_weight * lexical_scores
+        sorted_indices = np.argsort(combined)[::-1][: max(top_k * 2, top_k)]
+
+        results: List[SearchResult] = []
         seen = set()
-        for formula in formulas:
-            raw = formula["raw"]
-            if raw not in seen:
-                seen.add(raw)
-                unique_formulas.append(formula)
 
-        return unique_formulas
+        for idx in sorted_indices:
+            score = float(combined[idx])
+            if score < max(self.min_score * 0.5, 0.01):
+                continue
 
-    def search_with_formulas(self, query: str, top_k: int = 5) -> Dict[str, Any]:
-        results = self.search(query, top_k=top_k)
+            chunk = self.chunks[idx]
+            key = (chunk["doc_name"], chunk["chunk_id"])
+            if key in seen:
+                continue
+            seen.add(key)
 
-        all_tables: List[str] = []
-        all_formulas: List[Dict[str, Any]] = []
-
-        for item in results:
-            text = item.get("text", "")
-            all_tables.extend(self.extract_tables(text))
-            all_formulas.extend(self.extract_formulas(text))
-
-        unique_tables: List[str] = []
-        seen_tables = set()
-        for table in all_tables:
-            if table not in seen_tables:
-                seen_tables.add(table)
-                unique_tables.append(table)
-
-        unique_formulas: List[Dict[str, Any]] = []
-        seen_formulas = set()
-        for formula in all_formulas:
-            raw = formula["raw"]
-            if raw not in seen_formulas:
-                seen_formulas.add(raw)
-                unique_formulas.append(formula)
-
-        return {
-            "results": results,
-            "tables": unique_tables,
-            "formulas": unique_formulas,
-        }
-
-    @staticmethod
-    def _build_llm_prompt(
-        question: str,
-        chunks: List[Dict[str, Any]],
-        tables: List[str],
-        formulas: List[Dict[str, Any]],
-    ) -> str:
-        context_parts: List[str] = []
-
-        for i, chunk in enumerate(chunks[:5], 1):
-            context_parts.append(
-                f"[Фрагмент {i} | Источник: {chunk['doc_name']}]\n{chunk['text']}"
+            results.append(
+                SearchResult(
+                    doc_name=chunk["doc_name"],
+                    chunk_id=chunk["chunk_id"],
+                    text=chunk["text"],
+                    score=score,
+                    semantic_score=float(semantic_scores[idx]),
+                    lexical_score=float(lexical_scores[idx]),
+                    filepath=chunk.get("filepath", ""),
+                    metadata=chunk.get("metadata", {}),
+                )
             )
 
-        if tables:
-            context_parts.append("\n[Таблицы]")
-            for table in tables[:3]:
-                context_parts.append(table)
+            if len(results) >= top_k:
+                break
 
-        if formulas:
-            context_parts.append("\n[Формулы]")
-            for formula in formulas[:5]:
-                context_parts.append(formula["raw"])
+        return results
 
-        context = "\n\n".join(context_parts)
+    def _try_load_embedding_model(self) -> None:
+        """Пытается загрузить embedding model."""
+        try:
+            from sentence_transformers import SentenceTransformer
 
+            self.embedding_model = SentenceTransformer(self.embedding_model_name)
+            print(f"✅ Эмбеддинг модель загружена: {self.embedding_model_name}")
+        except ImportError:
+            self.embedding_model = None
+            print("⚠️ sentence-transformers не установлен. Установите: pip install sentence-transformers")
+        except Exception as e:
+            self.embedding_model = None
+            print(f"⚠️ Не удалось загрузить эмбеддинг модель: {e}")
+
+    def _validate_llm_config(self) -> None:
+        """Проверяет доступность LLM-провайдеров."""
+        self.llm_available = False
+
+        if self.llm_provider == "ollama":
+            self.llm_available = self.is_ollama_available()
+
+        elif self.llm_provider == "gemini":
+            self.llm_available = bool(self.gemini_api_key)
+
+        elif self.llm_provider == "mixed":
+            self.llm_available = self.is_ollama_available() or bool(self.gemini_api_key)
+
+        elif self.llm_provider == "none":
+            self.llm_available = False
+
+        print(f"ℹ️ LLM provider={self.llm_provider}, available={self.llm_available}")
+
+    @staticmethod
+    def _build_context(results: List[SearchResult]) -> str:
+        """Собирает контекст из найденных фрагментов."""
+        parts = []
+        for i, result in enumerate(results, start=1):
+            parts.append(
+                f"[Источник {i}] {result.doc_name}\n"
+                f"Фрагмент #{result.chunk_id}\n"
+                f"{result.text}"
+            )
+        return "\n\n".join(parts)
+
+    def _generate_llm_answer(self, question: str, context: str) -> tuple[Optional[str], str]:
+        """Генерация ответа через выбранный провайдер."""
+        prompt = self._build_prompt(question, context)
+
+        if self.llm_provider == "ollama":
+            answer = self._ask_ollama(prompt)
+            return answer, "ollama" if answer else "none"
+
+        if self.llm_provider == "gemini":
+            answer = self._ask_gemini(prompt)
+            return answer, "gemini" if answer else "none"
+
+        if self.llm_provider == "mixed":
+            if self.is_ollama_available():
+                answer = self._ask_ollama(prompt)
+                if answer:
+                    return answer, "ollama"
+
+            if self.gemini_api_key:
+                answer = self._ask_gemini(prompt)
+                if answer:
+                    return answer, "gemini"
+
+        return None, "none"
+
+    def _ask_ollama(self, prompt: str) -> Optional[str]:
+        """Запрос к Ollama."""
+        try:
+            response = requests.post(
+                f"{self.ollama_base_url}/api/generate",
+                json={
+                    "model": self.ollama_model,
+                    "prompt": prompt,
+                    "stream": False,
+                    "options": {
+                        "temperature": 0.2,
+                    },
+                },
+                timeout=120,
+            )
+            response.raise_for_status()
+            data = response.json()
+            text = (data.get("response") or "").strip()
+            return text or None
+        except Exception as e:
+            print(f"⚠️ Ошибка Ollama: {e}")
+            return None
+
+    def _ask_gemini(self, prompt: str) -> Optional[str]:
+        """Запрос к Gemini."""
+        if not self.gemini_api_key:
+            return None
+
+        try:
+            # Импортируем google.generativeai только при использовании
+            import google.generativeai as genai
+
+            genai.configure(api_key=self.gemini_api_key)
+            model = genai.GenerativeModel(self.gemini_model)
+            response = model.generate_content(prompt)
+            text = getattr(response, "text", None)
+            if text:
+                text = text.strip()
+            return text or None
+        except ImportError:
+            print("⚠️ google-generativeai не установлен. Установите: pip install google-generativeai")
+            return None
+        except Exception as e:
+            print(f"⚠️ Ошибка Gemini: {e}")
+            return None
+
+    @staticmethod
+    def _build_prompt(question: str, context: str) -> str:
+        """Формирует промпт для LLM."""
         return f"""
-Ты отвечаешь только на основе контекста из технической документации ниже.
-Если точного ответа в контексте нет, честно скажи об этом.
-Не выдумывай факты.
-Отвечай кратко, по делу и на русском языке.
+Ты инженерный помощник по строительной документации.
 
-Вопрос:
-{question}
+Используй только информацию из контекста ниже.
+Если данных недостаточно, прямо так и скажи.
+Если в тексте есть нормы, значения, таблицы, пункты документов — ссылайся на них в ответе.
+Отвечай на русском языке, кратко и по делу.
 
 Контекст:
 {context}
+
+Вопрос:
+{question}
 """.strip()
 
-    def answer(self, question: str, top_k: int = 5) -> Dict[str, Any]:
-        search_results = self.search_with_formulas(question, top_k)
-        relevant = search_results["results"]
-
-        if not relevant:
-            return {
-                "question": question,
-                "answer": "❌ Информация по вашему вопросу не найдена в документации.",
-                "sources": [],
-                "tables": [],
-                "formulas": [],
-                "llm_used": False,
-            }
-
-        cleaned_chunks = [c for c in relevant if not self.is_bad_chunk(c["text"])]
-        if not cleaned_chunks:
-            cleaned_chunks = relevant[:2]
-
-        all_tables = search_results.get("tables", [])
-        all_formulas = search_results.get("formulas", [])
-        llm_used = False
-
-        if self.use_llm and self.llm_engine is not None:
-            try:
-                prompt = self._build_llm_prompt(
-                    question=question,
-                    chunks=cleaned_chunks,
-                    tables=all_tables,
-                    formulas=all_formulas,
-                )
-
-                response = self.llm_engine.chat.completions.create(
-                    model="gpt-4o-mini",
-                    messages=[
-                        {"role": "system", "content": "Ты — инженерный помощник по строительной документации."},
-                        {"role": "user", "content": prompt}
-                    ],
-                    temperature=0.2,
-                    max_tokens=1000,
-                )
-                answer_text = response.choices[0].message.content.strip()
-                llm_used = True
-            except (ValueError, RuntimeError):
-                answer_text = cleaned_chunks[0]["text"].split(". ")[0].strip()
-        else:
-            answer_text = cleaned_chunks[0]["text"].split(". ")[0].strip()
-
-        if not answer_text.endswith("."):
-            answer_text += "."
-
-        if all_tables:
-            answer_text += "\n\n📊 Найденные таблицы:\n"
-            for table in all_tables[:2]:
-                answer_text += f"\n{table[:700]}\n"
-
-        if all_formulas:
-            answer_text += "\n\n📐 Найденные формулы:\n"
-            for formula in all_formulas[:3]:
-                raw = formula.get("raw", "")
-                answer_text += f"\n{raw}\n"
-                variables = formula.get("variables", [])
-                if variables:
-                    answer_text += f"Переменные: {', '.join(variables[:5])}\n"
-
-        return {
-            "question": question,
-            "answer": answer_text,
-            "sources": cleaned_chunks,
-            "tables": all_tables[:3],
-            "formulas": all_formulas[:5],
-            "llm_used": llm_used,
-        }
-
     @staticmethod
-    def _init_definitions() -> Dict[str, str]:
-        return {
-            "теплопередача": "Процесс переноса тепла от более нагретого тела к менее нагретому.",
-            "коэффициент теплопередачи": "Величина, характеризующая интенсивность передачи тепла через ограждающую конструкцию.",
-            "сопротивление теплопередаче": "Способность конструкции препятствовать прохождению теплового потока.",
-            "точка росы": "Температура, при которой водяной пар в воздухе начинает конденсироваться.",
-            "влажность": "Содержание водяного пара в воздухе или материале.",
-        }
+    def _generate_extract_answer(results: List[SearchResult]) -> str:
+        """Fallback-ответ без LLM."""
+        if not results:
+            return "Не удалось найти информацию в документах."
 
-    def find_definition(self, term: str) -> Dict[str, Any]:
-        term_lower = term.lower().strip()
+        top = results[0]
+        fragments = [r.text.strip() for r in results[:3] if r.text.strip()]
+        merged = "\n\n".join(fragments)
 
-        if term_lower in self.definitions_cache:
-            return self.definitions_cache[term_lower]
+        merged = re.sub(r"\n{3,}", "\n\n", merged).strip()
 
-        all_definitions = self._init_definitions()
+        if len(merged) > 1800:
+            merged = merged[:1800].rsplit(" ", 1)[0] + "..."
 
-        if term_lower in all_definitions:
-            result = {
-                "term": term,
-                "definition": all_definitions[term_lower],
-                "source": "built-in",
-                "found": True,
-            }
-            self.definitions_cache[term_lower] = result
-            return result
-
-        search_results = self.search(term, top_k=3)
-        if search_results:
-            result = {
-                "term": term,
-                "definition": search_results[0]["text"][:500],
-                "source": search_results[0]["doc_name"],
-                "found": True,
-            }
-            self.definitions_cache[term_lower] = result
-            return result
-
-        result = {
-            "term": term,
-            "definition": "Определение не найдено.",
-            "source": None,
-            "found": False,
-        }
-        self.definitions_cache[term_lower] = result
-        return result
+        return (
+            f"Найдена релевантная информация в документе «{top.doc_name}».\n\n"
+            f"{merged}"
+        )
