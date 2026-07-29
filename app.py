@@ -10,6 +10,7 @@
 - Экспорт в DOCX и PDF
 - Извлечение таблиц и расчёты по таблицам
 - Mixed-режим с автоматическим выбором Ollama/Gemini
+- Автосинхронизацию документов из Hugging Face Dataset
 """
 
 from __future__ import annotations
@@ -25,6 +26,7 @@ from pathlib import Path
 from typing import Any, Optional
 
 import streamlit as st
+from huggingface_hub import snapshot_download
 
 # Загрузка .env через python-dotenv (установите: pip install python-dotenv)
 try:
@@ -38,10 +40,11 @@ sys.path.insert(0, str(Path(__file__).parent))
 from core.agent_loop import AgentLoop
 from core.error_handler import ErrorHandler
 from core.formula_engine import FormulaEngine
+from core.prompts import get_quick_definition
 from core.qa_engine import QASystem
 from core.table_calculator import TableCalculator
 from core.table_extractor import patch_qa_system_with_table_extractor
-from utils.config import PROCESSED_DIR, RAW_DIR
+from utils.config import HF_DATASET_REPO_ID, PROCESSED_DIR, RAW_DIR
 
 try:
     patch_qa_system_with_table_extractor()
@@ -108,6 +111,59 @@ def save_history() -> None:
     HISTORY_FILE.parent.mkdir(parents=True, exist_ok=True)
     with open(HISTORY_FILE, "w", encoding="utf-8") as file_obj:
         json.dump(st.session_state.messages, file_obj, ensure_ascii=False, indent=2)
+
+
+def sync_hf_dataset_to_raw(force: bool = False) -> bool:
+    """
+    Скачивает документы из Hugging Face Dataset repo в RAW_DIR.
+
+    Переменные окружения:
+    - HF_DATASET_REPO_ID: например "Lana49/engineering-docs"
+    - HF_TOKEN: токен Hugging Face (необязательно для публичного датасета)
+    """
+    dataset_repo_id = (HF_DATASET_REPO_ID or "").strip()
+    if not dataset_repo_id:
+        print("ℹ️ HF_DATASET_REPO_ID не задан, синхронизация dataset пропущена")
+        return False
+
+    RAW_DIR.mkdir(parents=True, exist_ok=True)
+
+    existing_docs = (
+        list(RAW_DIR.glob("*.docx"))
+        + list(RAW_DIR.glob("*.pdf"))
+        + list(RAW_DIR.glob("*.rtf"))
+        + list(RAW_DIR.glob("*.doc"))
+    )
+
+    if existing_docs and not force:
+        print(f"✅ Документы уже есть в {RAW_DIR}: {len(existing_docs)} шт.")
+        return True
+
+    hf_token = os.getenv("HF_TOKEN", "").strip() or None
+
+    try:
+        print(f"📥 Скачиваю dataset {dataset_repo_id} в {RAW_DIR} ...")
+        snapshot_download(
+            repo_id=dataset_repo_id,
+            repo_type="dataset",
+            local_dir=str(RAW_DIR),
+            token=hf_token,
+            resume_download=True,
+        )
+
+        downloaded_docs = (
+            list(RAW_DIR.glob("*.docx"))
+            + list(RAW_DIR.glob("*.pdf"))
+            + list(RAW_DIR.glob("*.rtf"))
+            + list(RAW_DIR.glob("*.doc"))
+        )
+
+        print(f"✅ Dataset синхронизирован. Найдено документов: {len(downloaded_docs)}")
+        return bool(downloaded_docs)
+
+    except Exception as dataset_error:
+        print(f"⚠️ Ошибка загрузки dataset из Hugging Face: {dataset_error}")
+        return False
 
 
 def export_history_to_docx() -> Optional[Path]:
@@ -359,7 +415,22 @@ def render_export_buttons(
 
     with col3:
         if st.button("📋 Копировать в буфер", key=f"copy_{unique_id}"):
-            st.write("✅ Текст скопирован! (Нажмите Ctrl+C)")
+            import html
+            escaped_answer = html.escape(answer)
+            st.markdown(
+                f"""
+                <script>
+                (function() {{
+                    const text = `{escaped_answer}`;
+                    navigator.clipboard.writeText(text).then(() => {{
+                        console.log("copied");
+                    }});
+                }})();
+                </script>
+                """,
+                unsafe_allow_html=True,
+            )
+            st.success("✅ Текст скопирован в буфер обмена!")
 
 
 def build_qa_system() -> QASystem:
@@ -499,10 +570,15 @@ def auto_load_documents() -> bool:
         except Exception as load_error:
             st.sidebar.warning(f"⚠️ Ошибка загрузки индекса: {load_error}")
 
-    docs = list(RAW_DIR.glob("*.docx")) + list(RAW_DIR.glob("*.pdf")) + list(RAW_DIR.glob("*.rtf"))
+    docs = (
+        list(RAW_DIR.glob("*.docx"))
+        + list(RAW_DIR.glob("*.pdf"))
+        + list(RAW_DIR.glob("*.rtf"))
+        + list(RAW_DIR.glob("*.doc"))
+    )
 
     if not docs:
-        st.sidebar.info("📁 Папка data/raw пуста. Добавьте документы вручную.")
+        st.sidebar.info("📁 Папка документов пуста. Проверьте загрузку dataset или добавьте документы.")
         return False
 
     with st.sidebar:
@@ -566,6 +642,9 @@ def render_sidebar(
         else:
             st.info("🤖 Режим без LLM")
 
+        st.caption(f"📂 RAW_DIR: {RAW_DIR}")
+        st.caption(f"📦 Dataset: {HF_DATASET_REPO_ID or 'не задан'}")
+
         auto_load_documents()
         st.divider()
 
@@ -588,6 +667,15 @@ def render_sidebar(
                     idx_path.unlink(missing_ok=True)
                     st.success("✅ Индекс очищен")
                     st.rerun()
+
+        if st.button("📥 Синхронизировать dataset", use_container_width=True):
+            with st.spinner("Скачивание документов из Hugging Face..."):
+                ok = sync_hf_dataset_to_raw(force=True)
+                if ok:
+                    st.success("✅ Dataset синхронизирован")
+                else:
+                    st.error("❌ Не удалось синхронизировать dataset")
+                st.rerun()
 
         if not qa_system.is_ready:
             if st.button("📚 Индексировать документы", key="index_btn", use_container_width=True):
@@ -622,6 +710,7 @@ def render_sidebar(
             len(list(RAW_DIR.glob("*.docx")))
             + len(list(RAW_DIR.glob("*.pdf")))
             + len(list(RAW_DIR.glob("*.rtf")))
+            + len(list(RAW_DIR.glob("*.doc")))
         )
         chunks_count = len(qa_system.chunks) if qa_system.is_ready else 0
 
@@ -672,6 +761,9 @@ def main() -> None:
     agent_loop = st.session_state.agent_loop
     error_handler = st.session_state.error_handler
 
+    # Синхронизация документов с Hugging Face при старте
+    sync_hf_dataset_to_raw()
+
     st.title("🏗️ Инженерный помощник проектировщика")
     st.caption(
         "📄 База знаний: ГОСТы, СП, технические регламенты и методические документы по строительству"
@@ -710,24 +802,199 @@ def main() -> None:
         with st.chat_message("assistant"):
             with st.spinner("🔍 Анализирую запрос..."):
                 try:
-                    result = call_maybe_async(agent_loop.run, prompt)
+                    prompt_lower = prompt.lower()
 
-                    if isinstance(result, dict):
-                        response = result.get("answer", response)
-                        current_sources = result.get("sources", [])
-                        current_tables = result.get("tables", [])
-                        current_formulas = result.get("formulas", [])
-                        current_provider = result.get("provider", "none")
+                    calc_triggers = [
+                        "рассчитай", "вычисли", "посчитай", "толщин", "температур",
+                        "потери", "формул", "вентиляц", "расход", "гсоп", "градусо"
+                    ]
+                    def_triggers = [
+                        "что такое", "определение", "термин", "понятие", "что значит",
+                        "что означает", "расшифруй", "аббревиатура", "расшифровка",
+                        "что это", "как понимать", "объясните", "поясните"
+                    ]
+                    table_triggers = ["таблиц", "табл", "покажи таблиц", "выведи таблиц"]
+                    calc_from_table_triggers = [
+                        "по таблице", "из таблицы", "на основе таблицы",
+                        "используя таблицу", "с помощью таблицы"
+                    ]
+
+                    is_calc = any(w in prompt_lower for w in calc_triggers)
+                    is_def = any(w in prompt_lower for w in def_triggers)
+                    is_table = any(w in prompt_lower for w in table_triggers)
+                    is_calc_from_table = any(w in prompt_lower for w in calc_from_table_triggers)
+
+                    if is_calc_from_table:
+                        # === РАСЧЁТ НА ОСНОВЕ ТАБЛИЦЫ ===
+                        calc = TableCalculator(qa_system)
+
+                        cities = [
+                            'москва', 'санкт-петербург', 'новосибирск', 'екатеринбург',
+                            'казань', 'нижний новгород', 'челябинск', 'омск', 'самара',
+                            'ростов-на-дону', 'уфа', 'красноярск', 'пермь', 'воронеж',
+                            'волгоград', 'краснодар', 'сочи', 'владивосток', 'иркутск'
+                        ]
+
+                        found_city = None
+                        for city in cities:
+                            if city in prompt_lower:
+                                found_city = city
+                                break
+
+                        if not found_city:
+                            response = (
+                                "⚠️ Не удалось определить город в запросе.\n\n"
+                                "Поддерживаемые города: Москва, Санкт-Петербург, Новосибирск, "
+                                "Екатеринбург, Казань, Нижний Новгород, Челябинск, Омск, Самара, "
+                                "Уфа, Красноярск, Пермь, Воронеж, Волгоград, Краснодар, Сочи\n\n"
+                                "Примеры:\n"
+                                "- «Рассчитай ГСОП для Москвы по таблице»\n"
+                                "- «Найди в таблице климат для Новосибирска и посчитай ГСОП»"
+                            )
+                        else:
+                            if "вентиляц" in prompt_lower or "расход теплоты" in prompt_lower:
+                                import re
+                                flow_match = re.search(r'(\d+[.,]?\d*)\s*м³/ч', prompt_lower)
+                                if not flow_match:
+                                    flow_match = re.search(r'расход\s*(\d+[.,]?\d*)', prompt_lower)
+                                if flow_match:
+                                    air_flow = float(flow_match.group(1).replace(',', '.'))
+                                    result = calc.calculate_ventilation_from_table(found_city, air_flow)
+                                    response = result['answer']
+                                    sources = [{'doc_name': result.get('source', 'Таблица')}]
+                                else:
+                                    response = (
+                                        f"⚠️ Для расчёта вентиляции укажите расход воздуха (м³/ч)\n\n"
+                                        f"Пример: «Рассчитай вентиляцию для {found_city.title()} с расходом 1000 м³/ч по таблице»"
+                                    )
+                            elif "теплопотер" in prompt_lower:
+                                import re
+                                area_match = re.search(r'площадь\s*(\d+[.,]?\d*)', prompt_lower)
+                                res_match = re.search(r'сопротивление\s*(\d+[.,]?\d*)', prompt_lower)
+                                if not area_match:
+                                    area_match = re.search(r'A\s*=\s*(\d+[.,]?\d*)', prompt_lower)
+                                if not res_match:
+                                    res_match = re.search(r'R\s*=\s*(\d+[.,]?\d*)', prompt_lower)
+                                if area_match and res_match:
+                                    area = float(area_match.group(1).replace(',', '.'))
+                                    resistance = float(res_match.group(1).replace(',', '.'))
+                                    result = calc.calculate_heat_loss_from_table(found_city, area, resistance)
+                                    response = result['answer']
+                                    sources = [{'doc_name': result.get('source', 'Таблица')}]
+                                else:
+                                    response = (
+                                        f"⚠️ Для расчёта теплопотерь укажите:\n"
+                                        f"- площадь (м²)\n"
+                                        f"- сопротивление теплопередаче (м²·°C/Вт)\n\n"
+                                        f"Пример: «Рассчитай теплопотери для {found_city.title()} с площадью 100 м² и сопротивлением 2.5 по таблице»"
+                                    )
+                            else:
+                                result = calc.calculate_gsop_from_table(found_city)
+                                response = result['answer']
+                                sources = [{'doc_name': result.get('source', 'Таблица')}]
+                                if result.get('table'):
+                                    tables = [result['table'].to_dict()]
+
+                    elif is_calc:
+                        # === РАСЧЁТНЫЙ ЗАПРОС ===
+                        result = call_maybe_async(formula_engine.answer_calculation, prompt)
+                        response = result.get("answer", "Не удалось выполнить расчёт")
+                        sources = result.get("sources", [])
+                        tables = result.get("tables", [])
+                        formulas = result.get("formulas", [])
+
+                        if not formulas and result.get("formula"):
+                            formulas = [result["formula"]]
+
+                    elif is_def:
+                        # === ОПРЕДЕЛЕНИЕ ТЕРМИНА ===
+                        clean_term = prompt_lower
+                        for trigger in def_triggers:
+                            clean_term = clean_term.replace(trigger, "").strip(" ?!.,:")
+
+                        quick_def = get_quick_definition(clean_term)
+                        if quick_def:
+                            response = (
+                                f"📖 **Определение термина «{clean_term}»:**\n\n"
+                                f"{quick_def['definition']}\n\n"
+                                f"📚 **Источник:** {quick_def['source']}"
+                            )
+                            if quick_def.get("example"):
+                                response += f"\n\n**Пример:** {quick_def['example']}"
+                        else:
+                            if hasattr(qa_system, "find_definition"):
+                                definition_result = qa_system.find_definition(clean_term)
+                                if definition_result.get("found"):
+                                    response = (
+                                        f"📖 **Определение термина «{clean_term}»:**\n\n"
+                                        f"{definition_result.get('definition', '')}\n\n"
+                                        f"📚 **Источник:** {definition_result.get('source', 'Нормативная база')}"
+                                    )
+                                else:
+                                    response = f"⚠️ В загруженных документах не найдено определение для термина «{clean_term}»."
+                            else:
+                                response = f"⚠️ В загруженных документах не найдено определение для термина «{clean_term}»."
+
+                    elif is_table:
+                        # === ПОИСК ТАБЛИЦЫ ===
+                        result = qa_system.answer(prompt)
+                        response = result.get("answer", "Таблица не найдена")
+                        tables = result.get("tables", [])
+                        sources = result.get("sources", [])
+                        formulas = result.get("formulas", [])
+
+                        if tables:
+                            response += "\n\n📊 **Найденные таблицы:**\n"
+                            for table in tables[:2]:
+                                if isinstance(table, dict):
+                                    title = table.get("title", "Таблица")
+                                    headers = table.get("headers", [])
+                                    rows = table.get("rows", [])
+                                    response += f"\n**{title}**\n"
+                                    if headers:
+                                        response += "| " + " | ".join(headers[:6]) + " |\n"
+                                        response += "| " + " | ".join(["---"] * len(headers[:6])) + " |\n"
+                                        for row in rows[:5]:
+                                            padded = row + [""] * (len(headers[:6]) - len(row))
+                                            response += "| " + " | ".join(
+                                                str(cell).strip()[:30] for cell in padded[:6]) + " |\n"
+                                    else:
+                                        for row in rows[:5]:
+                                            response += f"- " + " | ".join(row) + "\n"
+                                    if len(rows) > 5:
+                                        response += f"*... и ещё {len(rows) - 5} строк*\n"
+
                     else:
-                        response = str(result)
+                        # === АГЕНТСКИЙ ЦИКЛ ДЛЯ СЛОЖНЫХ ЗАПРОСОВ ===
+                        result = call_maybe_async(agent_loop.run, prompt)
+                        response = result.get("answer", "Не удалось получить ответ")
+                        sources = result.get("sources", [])
+                        tables = result.get("tables", [])
+                        formulas = result.get("formulas", [])
+                        current_provider = result.get("provider", "none")
 
+                        if result.get("needs_clarification"):
+                            questions = result.get("questions", [])
+                            if questions:
+                                response += "\n\n❓ **Уточните:**\n" + "\n".join([f"• {q}" for q in questions])
+
+                    # Показываем цепочку рассуждений
+                    with st.sidebar:
+                        with st.expander("🔍 Показать цепочку рассуждений"):
+                            if is_calc or is_calc_from_table:
+                                st.markdown("✅ Расчёт выполнен на основе данных из таблицы")
+                            else:
+                                st.markdown(agent_loop.get_reasoning_chain())
+
+                    # Новый уникальный id ответа
                     st.session_state.current_response_id += 1
                     current_id = st.session_state.current_response_id
 
+                    # Сохраняем для экспорта
                     st.session_state.current_answer = response
-                    st.session_state.current_sources = current_sources
-                    st.session_state.current_tables = current_tables
-                    st.session_state.current_formulas = current_formulas
+                    st.session_state.current_sources = sources
+                    st.session_state.current_tables = tables
+                    st.session_state.current_formulas = formulas
                     st.session_state.current_provider = current_provider
 
                     st.markdown(response)
@@ -735,22 +1002,13 @@ def main() -> None:
                     if current_provider and current_provider != "none":
                         st.caption(f"🤖 Ответ сгенерирован через: **{current_provider.upper()}**")
 
-                    if hasattr(agent_loop, "get_reasoning_chain"):
-                        try:
-                            reasoning_chain = agent_loop.get_reasoning_chain()
-                            if reasoning_chain:
-                                with st.expander("🔍 Показать цепочку рассуждений"):
-                                    st.markdown(reasoning_chain)
-                        except AttributeError:
-                            pass
-
                     render_export_buttons(
                         response,
-                        current_sources,
-                        current_tables,
-                        current_formulas,
+                        sources,
+                        tables,
+                        formulas,
                         key_suffix="current",
-                        response_id=current_id,
+                        response_id=current_id
                     )
 
                 except (RuntimeError, ValueError, OSError) as run_error:
