@@ -9,8 +9,9 @@ from __future__ import annotations
 import asyncio
 
 import streamlit as st
+from huggingface_hub import snapshot_download
 
-from utils.config import PROCESSED_DIR, RAW_DIR
+from core.config import PROCESSED_DIR, RAW_DIR, HF_DATASET_REPO_ID
 from core.parser import parse_directory
 from core.qa_engine import QASystem
 from core.formula_engine import FormulaEngine
@@ -27,6 +28,52 @@ st.set_page_config(
 
 st.title("🏗️ Инженерная база знаний")
 st.caption("Поиск по строительным нормам, ГОСТам и технической документации")
+
+
+def sync_hf_dataset_to_raw(force: bool = False) -> bool:
+    """
+    Скачивает документы из Hugging Face Dataset repo в RAW_DIR.
+    """
+    dataset_repo_id = (HF_DATASET_REPO_ID or "").strip()
+    if not dataset_repo_id:
+        print("ℹ️ HF_DATASET_REPO_ID не задан, синхронизация dataset пропущена")
+        return False
+
+    RAW_DIR.mkdir(parents=True, exist_ok=True)
+
+    existing_docs = (
+            list(RAW_DIR.glob("*.docx"))
+            + list(RAW_DIR.glob("*.pdf"))
+            + list(RAW_DIR.glob("*.rtf"))
+            + list(RAW_DIR.glob("*.doc"))
+    )
+
+    if existing_docs and not force:
+        print(f"✅ Документы уже есть в {RAW_DIR}: {len(existing_docs)} шт.")
+        return True
+
+    try:
+        print(f"📥 Скачиваю dataset {dataset_repo_id} в {RAW_DIR} ...")
+        snapshot_download(
+            repo_id=dataset_repo_id,
+            repo_type="dataset",
+            local_dir=str(RAW_DIR),
+            # token не нужен для публичного датасета
+        )
+
+        downloaded_docs = (
+                list(RAW_DIR.glob("*.docx"))
+                + list(RAW_DIR.glob("*.pdf"))
+                + list(RAW_DIR.glob("*.rtf"))
+                + list(RAW_DIR.glob("*.doc"))
+        )
+
+        print(f"✅ Dataset синхронизирован. Найдено документов: {len(downloaded_docs)}")
+        return bool(downloaded_docs)
+
+    except Exception as dataset_error:
+        print(f"⚠️ Ошибка загрузки dataset из Hugging Face: {dataset_error}")
+        return False
 
 
 def run_async(coro):
@@ -58,10 +105,18 @@ def init_qa_system() -> QASystem:
             print(f"📂 Индекс загружен: {index_path}")
         else:
             print("📥 Индекс не найден. Парсим документы...")
+
+            # АВТОМАТИЧЕСКАЯ ЗАГРУЗКА ДАТАСЕТА
+            print("🔄 Проверяю наличие документов...")
+            sync_hf_dataset_to_raw()
+
             _build_index(qa, index_path)
     except Exception as exc:
         print(f"⚠️ Ошибка загрузки индекса: {exc}")
         st.warning("⚠️ Индекс повреждён или несовместим. Выполняется пересборка...")
+
+        # АВТОМАТИЧЕСКАЯ ЗАГРУЗКА ДАТАСЕТА
+        sync_hf_dataset_to_raw()
         _build_index(qa, index_path)
 
     return qa
@@ -86,6 +141,12 @@ def init_session_state() -> None:
     """Инициализирует состояние сессии."""
     if "qa_system" not in st.session_state:
         with st.spinner("Загрузка системы..."):
+            # Сначала синхронизируем датасет
+            with st.status("📥 Загрузка документов...", expanded=True) as status:
+                status.write("Скачивание датасета с Hugging Face...")
+                sync_hf_dataset_to_raw()
+                status.write("✅ Документы загружены")
+
             st.session_state.qa_system = init_qa_system()
             st.session_state.formula_engine = FormulaEngine(st.session_state.qa_system)
             st.session_state.agent_loop = AgentLoop(
@@ -150,6 +211,12 @@ def main() -> None:
 
     if not getattr(qa, "is_ready", False):
         st.warning("⚠️ Система не готова. Проверьте наличие документов в data/raw/")
+
+        # Кнопка для ручной загрузки
+        if st.button("📥 Загрузить документы сейчас"):
+            with st.spinner("Загрузка..."):
+                sync_hf_dataset_to_raw(force=True)
+                st.rerun()
         st.stop()
 
     col1, col2 = st.columns([3, 1])
