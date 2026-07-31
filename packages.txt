@@ -3,3 +3,6 @@ gcc
 pandoc
 ghostscript
 default-jre
+antiword
+catdoc
+poppler-utils

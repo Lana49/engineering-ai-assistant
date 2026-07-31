@@ -5,18 +5,141 @@
 Поддерживает:
 - .pdf   -> PyMuPDF + pdfplumber (fallback)
 - .docx  -> python-docx
-- .doc   -> textract (ТОЛЬКО textract)
+- .doc   -> textutil (macOS) / textract (Linux/Windows)
 - .rtf   -> striprtf
 """
 
 from __future__ import annotations
 
 import re
+import shutil
+import subprocess
+import sys
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
 SUPPORTED_EXTENSIONS = {".pdf", ".docx", ".doc", ".rtf"}
+
+# Определяем платформу
+IS_MACOS = sys.platform == "darwin"
+
+
+def command_exists(name: str) -> bool:
+    """Проверяет, установлена ли команда в системе."""
+    return shutil.which(name) is not None
+
+
+def read_doc_textutil(file_path: str | Path) -> str:
+    """
+    Чтение .doc через встроенную утилиту macOS textutil.
+    Работает только на macOS.
+    """
+    if not IS_MACOS:
+        return ""
+
+    path = Path(file_path)
+    if not path.exists() or path.stat().st_size == 0:
+        return ""
+
+    try:
+        result = subprocess.run(
+            ["textutil", "-stdout", "-convert", "txt", str(path)],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=60,
+        )
+        if result.returncode == 0 and result.stdout.strip():
+            return result.stdout.strip()
+        return ""
+    except (subprocess.TimeoutExpired, subprocess.SubprocessError, FileNotFoundError):
+        return ""
+
+
+def read_doc_textract(file_path: str | Path) -> str:
+    """
+    Чтение .doc через textract (Linux/Windows).
+    Проверяет наличие antiword перед вызовом.
+    """
+    # Проверяем, установлен ли textract
+    try:
+        import textract
+    except ImportError:
+        return ""
+
+    path = Path(file_path)
+    if not path.exists() or path.stat().st_size == 0:
+        return ""
+
+    # Проверяем наличие antiword (textract требует его для .doc)
+    if not command_exists("antiword"):
+        return ""
+
+    try:
+        data = textract.process(str(path))
+        return data.decode("utf-8", errors="ignore").strip()
+    except Exception:
+        return ""
+
+
+def read_doc_catdoc(file_path: str | Path) -> str:
+    """
+    Чтение .doc через catdoc (альтернатива для Linux/macOS).
+    """
+    path = Path(file_path)
+    if not path.exists() or path.stat().st_size == 0:
+        return ""
+
+    if not command_exists("catdoc"):
+        return ""
+
+    try:
+        result = subprocess.run(
+            ["catdoc", str(path)],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=60,
+        )
+        if result.returncode == 0 and result.stdout.strip():
+            return result.stdout.strip()
+        return ""
+    except (subprocess.TimeoutExpired, subprocess.SubprocessError):
+        return ""
+
+
+def read_doc(file_path: str | Path) -> str:
+    """
+    Чтение .doc с каскадным fallback:
+    1. textutil (macOS)
+    2. catdoc (Linux/macOS)
+    3. textract (Linux/Windows)
+    """
+    path = Path(file_path)
+    if not path.exists() or not path.is_file() or path.stat().st_size == 0:
+        return ""
+
+    # 1. Пробуем textutil на macOS
+    if IS_MACOS:
+        text = read_doc_textutil(path)
+        if text:
+            return text
+
+    # 2. Пробуем catdoc
+    text = read_doc_catdoc(path)
+    if text:
+        return text
+
+    # 3. Пробуем textract
+    text = read_doc_textract(path)
+    if text:
+        return text
+
+    print(f"⚠️ Не удалось извлечь текст из DOC {path.name}")
+    return ""
 
 
 def read_docx(file_path: str | Path) -> str:
@@ -47,7 +170,7 @@ def read_docx(file_path: str | Path) -> str:
                     parts.append(" | ".join(cells))
 
         return "\n".join(parts).strip()
-    except (OSError, ValueError, AttributeError) as exc:
+    except Exception as exc:
         print(f"⚠️ Ошибка DOCX {path.name}: {exc}")
         return ""
 
@@ -60,21 +183,19 @@ def read_pdf_pymupdf(file_path: str | Path) -> str:
         try:
             import fitz as pymupdf
         except ImportError:
-            print("⚠️ PyMuPDF (fitz) не установлен. Установите: pip install PyMuPDF")
+            print("⚠️ PyMuPDF не установлен. Установите: pip install PyMuPDF")
             return ""
 
     path = Path(file_path)
     try:
-        # Используем pymupdf.open() вместо pymupdf.open() - IDE может не видеть, но это работает
-        doc = pymupdf.open(str(path))
-        parts: list[str] = []
-        for page in doc:
-            page_text = page.get_text() or ""
-            if page_text.strip():
-                parts.append(page_text.strip())
-        doc.close()
+        with pymupdf.open(str(path)) as doc:
+            parts: list[str] = []
+            for page in doc:
+                page_text = page.get_text() or ""
+                if page_text.strip():
+                    parts.append(page_text.strip())
         return "\n".join(parts).strip()
-    except (OSError, ValueError, AttributeError, RuntimeError) as exc:
+    except Exception as exc:
         print(f"⚠️ PyMuPDF ошибка {path.name}: {exc}")
         return ""
 
@@ -95,7 +216,7 @@ def read_pdf_pdfplumber(file_path: str | Path) -> str:
                 if text.strip():
                     parts.append(text.strip())
         return "\n".join(parts).strip()
-    except (OSError, ValueError, AttributeError) as exc:
+    except Exception as exc:
         print(f"⚠️ pdfplumber ошибка {path.name}: {exc}")
         return ""
 
@@ -118,40 +239,6 @@ def read_pdf(file_path: str | Path) -> str:
     return ""
 
 
-def read_doc_textract(file_path: str | Path) -> str:
-    """Чтение .doc через textract (ТОЛЬКО ОН)."""
-    try:
-        import textract
-    except ImportError:
-        print("⚠️ textract не установлен. Установите: pip install textract")
-        return ""
-
-    path = Path(file_path)
-    try:
-        if not path.exists() or path.stat().st_size == 0:
-            return ""
-
-        data = textract.process(str(path))
-        return data.decode("utf-8", errors="ignore").strip()
-    except (OSError, ValueError, AttributeError, RuntimeError) as exc:
-        print(f"⚠️ textract ошибка {path.name}: {exc}")
-        return ""
-
-
-def read_doc(file_path: str | Path) -> str:
-    """Чтение .doc через textract."""
-    path = Path(file_path)
-    if not path.exists() or not path.is_file() or path.stat().st_size == 0:
-        return ""
-
-    text = read_doc_textract(path)
-    if text:
-        return text
-
-    print(f"⚠️ Не удалось извлечь текст из DOC {path.name}")
-    return ""
-
-
 def read_rtf(file_path: str | Path) -> str:
     """Чтение RTF файла через striprtf с поддержкой кодировок."""
     try:
@@ -170,11 +257,11 @@ def read_rtf(file_path: str | Path) -> str:
                 content = path.read_text(encoding=encoding, errors="replace")
                 if content.strip():
                     return rtf_to_text(content).strip()
-            except (UnicodeDecodeError, OSError):
+            except Exception:
                 continue
 
         return ""
-    except (OSError, ValueError, AttributeError) as exc:
+    except Exception as exc:
         print(f"⚠️ Ошибка RTF {path.name}: {exc}")
         return ""
 
@@ -383,7 +470,24 @@ class DocumentParser:
     def parse_file(self, file_path: str | Path) -> dict[str, Any]:
         """Парсит один файл."""
         path = Path(file_path)
-        text = self.normalize_text(read_file(path))
+
+        try:
+            text = self.normalize_text(read_file(path))
+        except Exception as exc:
+            print(f"⚠️ Ошибка парсинга {path.name}: {exc}")
+            return {
+                "doc_name": path.name,
+                "filepath": str(path),
+                "filetype": path.suffix.lower(),
+                "text": "",
+                "chunks": [],
+                "metadata": {
+                    "parsed": False,
+                    "filename": path.name,
+                    "suffix": path.suffix.lower(),
+                    "error": str(exc),
+                },
+            }
 
         if not text:
             return {
@@ -438,10 +542,21 @@ class DocumentParser:
         ]
 
         parsed: list[dict[str, Any]] = []
+        skipped: list[str] = []
+
         for path in sorted(files):
-            item = self.parse_file(path)
-            if item.get("text"):
-                parsed.append(item)
+            try:
+                item = self.parse_file(path)
+                if item.get("text"):
+                    parsed.append(item)
+                else:
+                    skipped.append(path.name)
+            except Exception as exc:
+                print(f"⚠️ Критическая ошибка на файле {path.name}: {exc}")
+                skipped.append(path.name)
+
+        if skipped:
+            print(f"ℹ️ Пропущено файлов: {len(skipped)}")
 
         return parsed
 
