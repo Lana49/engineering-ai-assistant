@@ -26,6 +26,7 @@ striprtf>=0.0.26
 openpyxl>=3.1.0
 docx2txt>=0.8
 pypandoc>=1.11
+textract
 
 # Export
 reportlab>=4.0.0

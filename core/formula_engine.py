@@ -17,20 +17,20 @@ import json
 import re
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any
 
 
-@dataclass
+@dataclass(slots=True)
 class Material:
     """Материал с теплофизическими свойствами."""
     name: str
     lambda_value: float
     density: float = 0.0
-    specific_heat: Optional[float] = None
-    source: Optional[str] = None
+    specific_heat: float | None = None
+    source: str | None = None
 
 
-@dataclass
+@dataclass(slots=True)
 class CityClimate:
     """Климатические данные города."""
     name: str
@@ -47,11 +47,11 @@ class FormulaEngine:
 
     def __init__(self, qa_system=None):
         self.qa_system = qa_system
-        self.reasoning_steps: List[str] = []
-        self.materials: Dict[str, Material] = {}
-        self.cities: Dict[str, CityClimate] = {}
-        self._material_cache: Dict[str, Material] = {}
-        self._city_cache: Dict[str, CityClimate] = {}
+        self.reasoning_steps: list[str] = []
+        self.materials: dict[str, Material] = {}
+        self.cities: dict[str, CityClimate] = {}
+        self._material_cache: dict[str, Material] = {}
+        self._city_cache: dict[str, CityClimate] = {}
         self._table_calculator = None
         self._on_city_not_found = None
         self._on_material_not_found = None
@@ -65,9 +65,7 @@ class FormulaEngine:
             "волгоград", "краснодар", "тюмень"
         ], key=len, reverse=True)
 
-    # ========== ИНИЦИАЛИЗАЦИЯ ФОРМУЛ ==========
-
-    def _init_formulas(self) -> Dict[str, Dict[str, Any]]:
+    def _init_formulas(self) -> dict[str, dict[str, Any]]:
         """База формул с безопасными хендлерами."""
         return {
             "gsop": {
@@ -165,8 +163,6 @@ class FormulaEngine:
             }
         }
 
-    # ========== КЭШИРОВАНИЕ ==========
-
     @staticmethod
     def _get_cache_path() -> Path:
         cache_dir = Path("cache")
@@ -240,10 +236,8 @@ class FormulaEngine:
         except OSError:
             pass
 
-    # ========== ИЗВЛЕЧЕНИЕ ДАННЫХ ==========
-
     @staticmethod
-    def _extract_number(text: str, patterns: List[str]) -> Optional[float]:
+    def _extract_number(text: str, patterns: list[str]) -> float | None:
         for pattern in patterns:
             match = re.search(pattern, text, re.IGNORECASE)
             if match:
@@ -253,16 +247,16 @@ class FormulaEngine:
                     continue
         return None
 
-    def _extract_city_from_text(self, text: str) -> Optional[str]:
+    def _extract_city_from_text(self, text: str) -> str | None:
         text_lower = text.lower()
         for city in self.city_list:
             if city in text_lower:
                 return city
         return None
 
-    def _extract_parameters_from_text(self, text: str) -> Dict[str, float]:
+    def _extract_parameters_from_text(self, text: str) -> dict[str, float]:
         t = text.lower().replace(",", ".")
-        params: Dict[str, float] = {}
+        params: dict[str, float] = {}
 
         patterns = {
             "A": [r"(?:a|площадь)\s*[:=]?\s*(-?\d+(?:\.\d+)?)"],
@@ -286,7 +280,7 @@ class FormulaEngine:
 
         return params
 
-    def _detect_formula_key(self, query: str) -> Optional[str]:
+    def _detect_formula_key(self, query: str) -> str | None:
         query_lower = query.lower()
 
         for formula_key, meta in self.formulas.items():
@@ -307,13 +301,11 @@ class FormulaEngine:
 
         return None
 
-    # ========== ОСНОВНОЙ МЕТОД ==========
-
     async def answer_calculation(
         self,
         query: str,
-        parameters: Optional[Dict[str, float]] = None,
-    ) -> Dict[str, Any]:
+        parameters: dict[str, float] | None = None,
+    ) -> dict[str, Any]:
         """
         Главный async-метод для выполнения расчёта.
         """
@@ -375,7 +367,7 @@ class FormulaEngine:
                 "questions": []
             }
 
-    async def _try_table_calculation(self, query: str) -> Optional[Dict[str, Any]]:
+    async def _try_table_calculation(self, query: str) -> dict[str, Any] | None:
         city = self._extract_city_from_text(query)
         if not city:
             return None
@@ -400,9 +392,7 @@ class FormulaEngine:
             return "🔍 Цепочка расчёта пуста."
         return "\n".join([f"{i + 1}. {step}" for i, step in enumerate(self.reasoning_steps)])
 
-    # ========== ХЕНДЛЕРЫ РАСЧЁТОВ ==========
-
-    def _calc_gsop(self, params: Dict[str, float], formula_meta: Dict[str, Any]) -> Dict[str, Any]:
+    def _calc_gsop(self, params: dict[str, float], formula_meta: dict[str, Any]) -> dict[str, Any]:
         t_v = float(params["t_v"])
         t_ot = float(params["t_ot"])
         z_ot = float(params["z_ot"])
@@ -428,7 +418,7 @@ class FormulaEngine:
             "source": formula_meta["source"]
         }
 
-    def _calc_ventilation_heat(self, params: Dict[str, float], formula_meta: Dict[str, Any]) -> Dict[str, Any]:
+    def _calc_ventilation_heat(self, params: dict[str, float], formula_meta: dict[str, Any]) -> dict[str, Any]:
         air_flow = float(params["L"])
         t_v = float(params["t_v"])
         t_n = float(params["t_n"])
@@ -454,7 +444,7 @@ class FormulaEngine:
             "source": formula_meta["source"]
         }
 
-    def _calc_heat_loss(self, params: Dict[str, float], formula_meta: Dict[str, Any]) -> Dict[str, Any]:
+    def _calc_heat_loss(self, params: dict[str, float], formula_meta: dict[str, Any]) -> dict[str, Any]:
         area = float(params["A"])
         delta_t = float(params["delta_t"])
         resistance = float(params["R"])
@@ -483,7 +473,7 @@ class FormulaEngine:
             "source": formula_meta["source"]
         }
 
-    def _calc_thermal_resistance_layer(self, params: Dict[str, float], formula_meta: Dict[str, Any]) -> Dict[str, Any]:
+    def _calc_thermal_resistance_layer(self, params: dict[str, float], formula_meta: dict[str, Any]) -> dict[str, Any]:
         delta = float(params["delta"])
         lambda_value = float(params["lambda_value"])
 
@@ -510,7 +500,7 @@ class FormulaEngine:
             "source": formula_meta["source"]
         }
 
-    def _calc_required_insulation_thickness(self, params: Dict[str, float], formula_meta: Dict[str, Any]) -> Dict[str, Any]:
+    def _calc_required_insulation_thickness(self, params: dict[str, float], formula_meta: dict[str, Any]) -> dict[str, Any]:
         r_required = float(params["R_tr"])
         lambda_value = float(params["lambda_value"])
 
@@ -535,7 +525,7 @@ class FormulaEngine:
             "source": formula_meta["source"]
         }
 
-    def _calc_pipe_surface_heat_flux(self, params: Dict[str, float], formula_meta: Dict[str, Any]) -> Dict[str, Any]:
+    def _calc_pipe_surface_heat_flux(self, params: dict[str, float], formula_meta: dict[str, Any]) -> dict[str, Any]:
         heat_flow = float(params["Q"])
         length = float(params["L"])
 
@@ -562,10 +552,8 @@ class FormulaEngine:
             "source": formula_meta["source"]
         }
 
-    # ========== ВСПОМОГАТЕЛЬНЫЕ МЕТОДЫ ДЛЯ ОТВЕТОВ ==========
-
     @staticmethod
-    def _build_error_response(message: str) -> Dict[str, Any]:
+    def _build_error_response(message: str) -> dict[str, Any]:
         return {
             "answer": message,
             "sources": [],
@@ -579,9 +567,9 @@ class FormulaEngine:
 
     @staticmethod
     def _build_missing_params_response(
-        formula_meta: Dict[str, Any],
-        missing: List[str]
-    ) -> Dict[str, Any]:
+        formula_meta: dict[str, Any],
+        missing: list[str]
+    ) -> dict[str, Any]:
         required = ", ".join(formula_meta.get("required_params", []))
 
         answer = (
@@ -607,7 +595,7 @@ class FormulaEngine:
         }
 
     @staticmethod
-    def _format_result(result: Dict[str, Any], formula_meta: Dict[str, Any]) -> Dict[str, Any]:
+    def _format_result(result: dict[str, Any], formula_meta: dict[str, Any]) -> dict[str, Any]:
         if "sources" not in result:
             source = result.get("source", formula_meta.get("source", ""))
             result["sources"] = [{"doc_name": source}] if source else []
@@ -629,9 +617,7 @@ class FormulaEngine:
 
         return result
 
-    # ========== ПУБЛИЧНЫЕ МЕТОДЫ ==========
-
-    def get_available_formulas(self) -> List[Dict[str, Any]]:
+    def get_available_formulas(self) -> list[dict[str, Any]]:
         """Возвращает список формул для отображения в sidebar."""
         return [
             {

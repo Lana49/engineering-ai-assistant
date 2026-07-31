@@ -7,9 +7,11 @@
 from __future__ import annotations
 
 import json
+import re
 import traceback
 from datetime import datetime
-from typing import Any, Dict, List, Optional
+from pathlib import Path
+from typing import Any, Callable, Awaitable
 
 
 class ErrorHandler:
@@ -18,7 +20,9 @@ class ErrorHandler:
     Адаптировано для Streamlit-приложений.
     """
 
-    def __init__(self, log_level: str = "info", log_file: Optional[str] = None):
+    _VALID_LOG_LEVELS = {"debug", "info", "error"}
+
+    def __init__(self, log_level: str = "info", log_file: str | None = None):
         """
         Инициализация обработчика ошибок.
 
@@ -26,15 +30,16 @@ class ErrorHandler:
             log_level: Уровень логирования ("info", "debug", "error")
             log_file: Путь к файлу для записи логов (опционально)
         """
-        self.log_level = log_level
+        normalized_level = (log_level or "info").strip().lower()
+        self.log_level = normalized_level if normalized_level in self._VALID_LOG_LEVELS else "info"
         self.log_file = log_file
-        self.errors: List[Dict[str, Any]] = []
+        self.errors: list[dict[str, Any]] = []
 
-    def handle(self, error: Exception, context: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    def handle(self, error: Exception, context: dict[str, Any] | None = None) -> dict[str, Any]:
         """
         Обрабатывает ошибку и возвращает понятный ответ для пользователя.
         """
-        error_info = {
+        error_info: dict[str, Any] = {
             "timestamp": datetime.now().isoformat(),
             "type": type(error).__name__,
             "message": str(error),
@@ -46,35 +51,43 @@ class ErrorHandler:
         self._log_error(error_info)
         return self._format_error(error_info)
 
-    def _log_error(self, error_info: Dict[str, Any]) -> None:
+    def _log_error(self, error_info: dict[str, Any]) -> None:
         """
         Логирует ошибку в консоль и/или файл.
         """
         message = (
-            f"[ERROR] {error_info['timestamp']} "
-            f"{error_info['type']}: {error_info['message']}"
+            f"[ERROR] {error_info.get('timestamp', '')} "
+            f"{error_info.get('type', 'Unknown')}: {error_info.get('message', '')}"
         )
 
         print(message)
+
         if self.log_level == "debug":
-            print(error_info["traceback"])
+            trace = str(error_info.get("traceback", "") or "")
+            if trace.strip():
+                print(trace)
 
         if self.log_file:
             try:
-                with open(self.log_file, "a", encoding="utf-8") as f:
-                    f.write(message + "\n")
+                log_path = Path(self.log_file)
+                log_path.parent.mkdir(parents=True, exist_ok=True)
+
+                with log_path.open("a", encoding="utf-8") as file:
+                    file.write(message + "\n")
                     if self.log_level == "debug":
-                        f.write(error_info["traceback"] + "\n")
-                        f.write("-" * 80 + "\n")
+                        trace = str(error_info.get("traceback", "") or "")
+                        if trace.strip():
+                            file.write(trace + "\n")
+                    file.write("-" * 80 + "\n")
             except OSError:
                 pass
 
-    def _format_error(self, error_info: Dict[str, Any]) -> Dict[str, Any]:
+    def _format_error(self, error_info: dict[str, Any]) -> dict[str, Any]:
         """
         Форматирует ошибку для пользователя.
         """
-        error_type = error_info["type"]
-        message = error_info["message"]
+        error_type = str(error_info.get("type", "Exception"))
+        message = str(error_info.get("message", ""))
 
         error_messages = {
             "ModuleNotFoundError": (
@@ -106,14 +119,16 @@ class ErrorHandler:
             "UnicodeEncodeError": "⚠️ Ошибка кодирования. Проверьте текстовые данные.",
         }
 
-        if "FormulaEngine" in error_type or "calculation" in message.lower():
+        message_lower = message.lower()
+
+        if "FormulaEngine" in error_type or "calculation" in message_lower:
             user_message = f"📐 Ошибка расчёта: {message}"
-        elif "QASystem" in error_type or "search" in message.lower():
+        elif "QASystem" in error_type or "search" in message_lower:
             user_message = f"🔍 Ошибка поиска: {message}"
         elif "AgentLoop" in error_type:
             user_message = f"🤖 Ошибка агента: {message}"
         else:
-            user_message = error_messages.get(error_type, f"❌ Ошибка: {message}")
+            user_message = error_messages.get(error_type, f"❌ Ошибка: {message or 'Неизвестная ошибка'}")
 
         return {
             "user_message": user_message,
@@ -121,69 +136,73 @@ class ErrorHandler:
             "is_error": True,
             "type": error_type,
             "message": message,
-            "timestamp": error_info.get("timestamp", ""),
+            "timestamp": str(error_info.get("timestamp", "") or ""),
         }
 
     @staticmethod
     def _extract_module_name(message: str) -> str:
         """Извлекает имя модуля из сообщения об ошибке."""
-        import re
         match = re.search(r"'([^']+)'", message)
         return match.group(1) if match else "название-библиотеки"
 
-    def get_last_error(self) -> Optional[Dict[str, Any]]:
+    def get_last_error(self) -> dict[str, Any] | None:
         """Возвращает последнюю ошибку."""
         return self.errors[-1] if self.errors else None
 
-    def get_all_errors(self) -> List[Dict[str, Any]]:
+    def get_all_errors(self) -> list[dict[str, Any]]:
         """Возвращает все ошибки."""
-        return self.errors
+        return list(self.errors)
 
     def clear_errors(self) -> None:
         """Очищает список ошибок."""
         self.errors.clear()
 
     @staticmethod
-    def format_for_ui(error_info: Dict[str, Any]) -> str:
+    def format_for_ui(error_info: dict[str, Any]) -> str:
         """Форматирует ошибку для отображения в UI."""
         if error_info.get("is_error"):
-            return error_info.get("user_message", "❌ Неизвестная ошибка")
+            return str(error_info.get("user_message", "❌ Неизвестная ошибка"))
         return f"ℹ️ {error_info.get('message', 'Неизвестная ошибка')}"
 
-    def get_error_summary(self) -> Dict[str, Any]:
+    def get_error_summary(self) -> dict[str, Any]:
         """Возвращает сводку по ошибкам."""
         if not self.errors:
             return {"total": 0, "types": {}}
 
-        types: Dict[str, int] = {}
+        types: dict[str, int] = {}
         for error in self.errors:
-            error_type = error.get("type", "Unknown")
+            error_type = str(error.get("type", "Unknown"))
             types[error_type] = types.get(error_type, 0) + 1
+
+        last_error = self.errors[-1] if self.errors else None
 
         return {
             "total": len(self.errors),
             "types": types,
-            "last_error": self.errors[-1] if self.errors else None,
-            "last_timestamp": self.errors[-1].get("timestamp") if self.errors else None,
+            "last_error": last_error,
+            "last_timestamp": last_error.get("timestamp") if last_error else None,
         }
 
     @staticmethod
-    def log_to_file(error_info: Dict[str, Any], file_path: str) -> None:
+    def log_to_file(error_info: dict[str, Any], file_path: str) -> None:
         """Записывает ошибку в отдельный файл лога в формате JSON."""
         try:
-            with open(file_path, "a", encoding="utf-8") as f:
-                json.dump(error_info, f, ensure_ascii=False, indent=2)
-                f.write("\n" + "-" * 80 + "\n")
-        except OSError as e:
-            print(f"⚠️ Не удалось записать лог: {e}")
+            path = Path(file_path)
+            path.parent.mkdir(parents=True, exist_ok=True)
+
+            with path.open("a", encoding="utf-8") as file:
+                json.dump(error_info, file, ensure_ascii=False)
+                file.write("\n" + "-" * 80 + "\n")
+        except OSError as exc:
+            print(f"⚠️ Не удалось записать лог: {exc}")
 
     def get_user_friendly_message(self, error: Exception) -> str:
         """Быстрый метод для получения понятного сообщения об ошибке."""
         result = self.handle(error)
-        return result["user_message"]
+        return str(result["user_message"])
 
     @staticmethod
-    def is_critical(error_info: Dict[str, Any]) -> bool:
+    def is_critical(error_info: dict[str, Any]) -> bool:
         """Определяет, является ли ошибка критической."""
         critical_types = {
             "MemoryError",
@@ -191,24 +210,30 @@ class ErrorHandler:
             "KeyboardInterrupt",
             "SystemError",
         }
-        return error_info.get("type") in critical_types
+        return str(error_info.get("type")) in critical_types
 
 
-# ========== УТИЛИТНЫЕ ФУНКЦИИ ==========
-
-def safe_execute(func, *args, **kwargs):
+def safe_execute(
+    func: Callable[..., Any],
+    *args: Any,
+    **kwargs: Any,
+) -> tuple[Any | None, Exception | None]:
     """Безопасное выполнение функции с обработкой ошибок."""
     try:
         result = func(*args, **kwargs)
         return result, None
-    except Exception as e:
-        return None, e
+    except Exception as exc:
+        return None, exc
 
 
-async def safe_execute_async(async_func, *args, **kwargs):
+async def safe_execute_async(
+    async_func: Callable[..., Awaitable[Any]],
+    *args: Any,
+    **kwargs: Any,
+) -> tuple[Any | None, Exception | None]:
     """Безопасное выполнение асинхронной функции с обработкой ошибок."""
     try:
         result = await async_func(*args, **kwargs)
         return result, None
-    except Exception as e:
-        return None, e
+    except Exception as exc:
+        return None, exc

@@ -1,20 +1,26 @@
 # core/agent_loop.py
 """
 Многошаговый агент для инженерных запросов.
-Совместим с async FormulaEngine.answer_calculation(...).
 """
 
 from __future__ import annotations
 
-import re
 import asyncio
-from typing import Dict, List, Any, Optional
+import re
 from dataclasses import dataclass, field
 from enum import Enum
+from typing import Any
 
 from core.prompts import get_quick_definition
 from core.retrieval_memory import RetrievalMemory
-from utils.config import PROCESSED_DIR
+
+# Правильный импорт конфига
+try:
+    from core.config import PROCESSED_DIR
+except ImportError:
+    # Fallback для случаев, когда config ещё не создан
+    from pathlib import Path
+    PROCESSED_DIR = Path("data/processed")
 
 
 class QueryType(Enum):
@@ -27,25 +33,25 @@ class QueryType(Enum):
     GENERAL = "general"
 
 
-@dataclass
+@dataclass(slots=True)
 class ReasoningStep:
     """Шаг цепочки рассуждений."""
     step_id: int
     description: str
     result: Any = None
     confidence: float = 0.0
-    next_steps: List[str] = field(default_factory=lambda: [])
+    next_steps: list[str] = field(default_factory=list)
 
 
-@dataclass
+@dataclass(slots=True)
 class ContextInfo:
     """Контекстная информация по запросу."""
     query: str
     query_type: QueryType
-    keywords: List[str]
-    entities: Dict[str, Any]
-    parameters: Dict[str, float]
-    chunks: List[Dict[str, Any]]
+    keywords: list[str]
+    entities: dict[str, Any]
+    parameters: dict[str, Any]
+    chunks: list[dict[str, Any]]
     confidence: float = 0.0
 
 
@@ -57,17 +63,15 @@ class AgentLoop:
     def __init__(self, qa_system, formula_engine):
         self.qa_system = qa_system
         self.formula_engine = formula_engine
-        self.messages: List[Dict[str, Any]] = []
-        self.reasoning_steps: List[ReasoningStep] = []
-        self.context: Optional[ContextInfo] = None
+        self.messages: list[dict[str, Any]] = []
+        self.reasoning_steps: list[ReasoningStep] = []
+        self.context: ContextInfo | None = None
         self.max_steps = 6
-        self.last_error: Optional[str] = None
+        self.last_error: str | None = None
         self.memory = RetrievalMemory(PROCESSED_DIR / "retrieval_memory.json")
 
-    async def run(self, user_content: str) -> Dict[str, Any]:
-        """
-        Запускает обработку запроса.
-        """
+    async def run(self, user_content: str) -> dict[str, Any]:
+        """Запускает обработку запроса."""
         self.messages.append({"role": "user", "content": user_content})
         self.reasoning_steps = []
         self.context = None
@@ -87,13 +91,7 @@ class AgentLoop:
             self.reasoning_steps.append(step2)
             chunks = step2.result.get("chunks", []) if step2.result else []
 
-            step3 = self._analyze_context(
-                user_content,
-                chunks,
-                query_type,
-                entities,
-                parameters
-            )
+            step3 = self._analyze_context(user_content, chunks, query_type, entities, parameters)
             self.reasoning_steps.append(step3)
             if not step3.result:
                 return self._create_error_response("Не удалось проанализировать найденный контекст.", 3)
@@ -131,12 +129,11 @@ class AgentLoop:
             self.messages.append({"role": "assistant", "content": final_response.get("answer", "")})
             final_response["steps"] = len(self.reasoning_steps)
 
-            # Сохраняем успешный запрос в память (извлекаем имена источников)
             if final_response.get("answer") and final_response.get("sources"):
                 source_names = []
                 for src in final_response.get("sources", []):
                     if isinstance(src, dict):
-                        name = src.get("doc_name") or src.get("docname") or src.get("source") or ""
+                        name = src.get("doc_name") or src.get("source") or ""
                         if name:
                             source_names.append(name)
                     elif isinstance(src, str):
@@ -155,7 +152,7 @@ class AgentLoop:
         except (ValueError, TypeError, KeyError, AttributeError) as e:
             self.last_error = str(e)
             return {
-                "answer": f"❌ Ошибка при обработке запроса: {e}",
+                "answer": f"Ошибка при обработке запроса: {e}",
                 "sources": [],
                 "tables": [],
                 "formulas": [],
@@ -178,7 +175,7 @@ class AgentLoop:
 
             calc_triggers = [
                 "рассчитай", "расчет", "вычисли", "посчитай", "формула",
-                "теплопотери", "кратность", "расход", "gsop", "гсоп",
+                "теплопотери", "кратность", "расход", "гсоп",
                 "r=", "q=", "площадь", "объем", "мощность"
             ]
             def_triggers = [
@@ -220,11 +217,11 @@ class AgentLoop:
                 except ValueError:
                     continue
 
-            parameters: Dict[str, Any] = {}
+            parameters: dict[str, Any] = {}
             if parsed_numbers:
                 parameters["numeric_values"] = parsed_numbers
 
-            entities: Dict[str, Any] = {}
+            entities: dict[str, Any] = {}
 
             document_codes = re.findall(
                 r"\b(?:сп|гост|снип|рд|санпин|мгсн)\s*[\d.\-]+\b",
@@ -277,7 +274,7 @@ class AgentLoop:
         return step
 
     @staticmethod
-    def _unique_keep_order(items: List[str]) -> List[str]:
+    def _unique_keep_order(items: list[str]) -> list[str]:
         """Сохраняет уникальные элементы в порядке появления."""
         result = []
         seen = set()
@@ -290,7 +287,7 @@ class AgentLoop:
                 result.append(item.strip())
         return result
 
-    def _expand_query(self, query: str, entities: Dict[str, Any], keywords: List[str]) -> List[str]:
+    def _expand_query(self, query: str, entities: dict[str, Any], keywords: list[str]) -> list[str]:
         """Расширяет запрос вариантами для поиска."""
         variants = [query]
 
@@ -315,10 +312,10 @@ class AgentLoop:
 
     @staticmethod
     def _rerank_chunks(
-        chunks: List[Dict[str, Any]],
-        entities: Dict[str, Any],
-        memory_boosts: Dict[str, List[str]],
-    ) -> List[Dict[str, Any]]:
+        chunks: list[dict[str, Any]],
+        entities: dict[str, Any],
+        memory_boosts: dict[str, list[str]],
+    ) -> list[dict[str, Any]]:
         """Повторно ранжирует фрагменты с учётом бустингов."""
         preferred_sources = [s.lower() for s in memory_boosts.get("sources", [])]
         document_codes = [d.lower() for d in entities.get("document_codes", [])]
@@ -329,7 +326,6 @@ class AgentLoop:
         for chunk in chunks:
             score = float(chunk.get("score", 0.0) or 0.0)
             doc_name = str(chunk.get("doc_name", "")).lower()
-            doc_name = str(chunk.get("docname", doc_name)).lower()
             text = str(chunk.get("text", "")).lower()
 
             if any(src in doc_name for src in preferred_sources):
@@ -353,10 +349,10 @@ class AgentLoop:
         self,
         query: str,
         query_type: QueryType,
-        entities: Optional[Dict[str, Any]] = None,
-        keywords: Optional[List[str]] = None,
+        entities: dict[str, Any] | None = None,
+        keywords: list[str] | None = None,
     ) -> ReasoningStep:
-        """Расширенный поиск по индексу с памятью и переранжированием."""
+        """Расширенный поиск по индексу с памятью и повторным ранжированием."""
         step = ReasoningStep(
             step_id=2,
             description="Расширенный поиск по индексу с памятью и повторным ранжированием"
@@ -386,14 +382,13 @@ class AgentLoop:
             else:
                 top_k = 12
 
-            all_chunks: List[Dict[str, Any]] = []
+            all_chunks: list[dict[str, Any]] = []
             seen = set()
 
             for q in queries[:4]:
                 found = self.qa_system.search(q, top_k)
                 for chunk in found:
                     doc_name = chunk.get("doc_name", "")
-                    doc_name = chunk.get("docname", doc_name)
                     text = chunk.get("text", "")
                     uniq = (doc_name, text[:250])
                     if uniq not in seen:
@@ -432,7 +427,7 @@ class AgentLoop:
         return step
 
     @staticmethod
-    def _extract_tables(text: str, doc_name: str) -> List[Dict[str, Any]]:
+    def _extract_tables(text: str, doc_name: str) -> list[dict[str, Any]]:
         """Извлекает таблицы из текста."""
         tables = []
         lines = text.split("\n")
@@ -476,7 +471,7 @@ class AgentLoop:
         return tables
 
     @staticmethod
-    def _extract_formulas(text: str) -> List[Dict[str, Any]]:
+    def _extract_formulas(text: str) -> list[dict[str, Any]]:
         """Извлекает формулы из текста."""
         formulas = []
         pattern = r"([A-Za-zА-Яа-я][_\w]*\s*[=]\s*[^;.\n]+)"
@@ -515,10 +510,10 @@ class AgentLoop:
     @staticmethod
     def _analyze_context(
         query: str,
-        chunks: List[Dict[str, Any]],
+        chunks: list[dict[str, Any]],
         query_type: QueryType,
-        entities: Dict[str, Any],
-        parameters: Dict[str, Any]
+        entities: dict[str, Any],
+        parameters: dict[str, Any]
     ) -> ReasoningStep:
         """Анализирует контекст и извлекает ключевую информацию."""
         step = ReasoningStep(
@@ -529,7 +524,7 @@ class AgentLoop:
         try:
             combined_text = "\n".join([c.get("text", "") for c in chunks[:3]])
 
-            extracted_params: Dict[str, float] = {}
+            extracted_params: dict[str, float] = {}
             param_patterns = {
                 "temperature": r"(-?\d+[.,]?\d*)\s*°[СC]",
                 "thickness": r"(\d+[.,]?\d*)\s*мм",
@@ -547,7 +542,6 @@ class AgentLoop:
                     except ValueError:
                         pass
 
-            # Обновляем параметры из запроса
             numeric_params = parameters.get("numeric_values", [])
             if numeric_params and isinstance(numeric_params, list):
                 for i, val in enumerate(numeric_params[:3]):
@@ -592,7 +586,6 @@ class AgentLoop:
             query = context.query
             params = context.parameters or {}
 
-            # Формируем запрос с параметрами
             if params:
                 param_str = ", ".join([f"{k}={v}" for k, v in params.items()])
                 calc_query = f"{query}. Данные: {param_str}"
@@ -606,7 +599,6 @@ class AgentLoop:
             else:
                 result = raw_result
 
-            # Fallback: если расчёт не дал ответа, ищем формулу в чанках
             if context.chunks and not result.get("answer"):
                 for chunk in context.chunks:
                     if chunk.get("formulas"):
@@ -644,7 +636,7 @@ class AgentLoop:
         except (ValueError, TypeError, ZeroDivisionError) as e:
             step.result = {
                 "type": "calculation",
-                "answer": f"❌ Ошибка расчета: {e}",
+                "answer": f"Ошибка расчета: {e}",
                 "formula": None,
                 "parameters": {},
                 "result": None,
@@ -671,7 +663,6 @@ class AgentLoop:
             query = context.query.strip()
             query_lower = query.lower()
 
-            # Извлекаем термин
             term = query_lower
             for prefix in [
                 "что такое", "определение", "термин", "понятие",
@@ -681,7 +672,6 @@ class AgentLoop:
             ]:
                 term = term.replace(prefix, "").strip()
 
-            # Сначала ищем в быстром словаре
             quick = get_quick_definition(term)
             if quick:
                 definition = quick.get("definition", "")
@@ -705,7 +695,6 @@ class AgentLoop:
                 step.confidence = 0.95
                 return step
 
-            # Ищем в QA системе
             definition = self.qa_system.find_definition(term)
 
             if not definition.get("found") and context.chunks:
@@ -745,7 +734,7 @@ class AgentLoop:
             else:
                 step.result = {
                     "type": "definition",
-                    "answer": f"❌ Определение для термина «{term}» не найдено.",
+                    "answer": f"Определение для термина «{term}» не найдено.",
                     "sources": [],
                     "tables": [],
                     "formulas": [],
@@ -772,7 +761,7 @@ class AgentLoop:
             if not context.chunks:
                 step.result = {
                     "type": "search",
-                    "answer": "❌ Информация не найдена в базе документов.",
+                    "answer": "Информация не найдена в базе документов.",
                     "sources": [],
                     "tables": [],
                     "formulas": [],
@@ -854,7 +843,6 @@ class AgentLoop:
                 comparison_results = []
 
                 for item in items:
-                    # Ищем информацию по каждому объекту в чанках
                     info = None
                     source = "Документ"
                     for chunk in context.chunks:
@@ -956,7 +944,7 @@ class AgentLoop:
                     answer_lines.append(f"- {req['text']}")
                     answer_lines.append(f"  Источник: {req['source']}")
             else:
-                answer_lines.append("❌ Требования не найдены")
+                answer_lines.append("Требования не найдены")
 
             step.result = {
                 "type": "regulatory",
@@ -977,7 +965,7 @@ class AgentLoop:
         return step
 
     @staticmethod
-    def _check_completeness(result: Dict[str, Any], context: ContextInfo) -> ReasoningStep:
+    def _check_completeness(result: dict[str, Any], context: ContextInfo) -> ReasoningStep:
         """Проверяет полноту ответа."""
         step = ReasoningStep(
             step_id=5,
@@ -987,7 +975,7 @@ class AgentLoop:
         try:
             answer = result.get("answer", "") or ""
             needs_clarification = False
-            questions: List[str] = []
+            questions: list[str] = []
 
             if context.query_type == QueryType.CALCULATION:
                 if not result.get("formula") and not result.get("formulas"):
@@ -1023,8 +1011,8 @@ class AgentLoop:
 
     @staticmethod
     def _generate_final_response(
-        result: Dict[str, Any],
-        completeness: Dict[str, Any],
+        result: dict[str, Any],
+        completeness: dict[str, Any],
         context: ContextInfo
     ) -> ReasoningStep:
         """Формирует финальный ответ."""
@@ -1041,7 +1029,7 @@ class AgentLoop:
             confidence = result.get("confidence", context.confidence)
 
             if not answer:
-                answer = "❌ Не удалось сформировать ответ."
+                answer = "Не удалось сформировать ответ."
 
             step.result = {
                 "answer": answer,
@@ -1056,7 +1044,7 @@ class AgentLoop:
 
         except (ValueError, TypeError, AttributeError) as e:
             step.result = {
-                "answer": f"❌ Ошибка финализации ответа: {e}",
+                "answer": f"Ошибка финализации ответа: {e}",
                 "sources": [],
                 "tables": [],
                 "formulas": [],
@@ -1071,10 +1059,10 @@ class AgentLoop:
 
     def _format_response(
         self,
-        result: Dict[str, Any],
+        result: dict[str, Any],
         context: ContextInfo,
         query_type: QueryType
-    ) -> Dict[str, Any]:
+    ) -> dict[str, Any]:
         """Форматирует ответ."""
         response = {
             "answer": result.get("answer", ""),
@@ -1099,10 +1087,10 @@ class AgentLoop:
 
         return response
 
-    def _create_error_response(self, message: str, steps: int = 1) -> Dict[str, Any]:
+    def _create_error_response(self, message: str, steps: int = 1) -> dict[str, Any]:
         """Создаёт ответ с ошибкой."""
         return {
-            "answer": f"❌ {message}",
+            "answer": f"Ошибка: {message}",
             "sources": [],
             "tables": [],
             "formulas": [],
@@ -1128,7 +1116,7 @@ class AgentLoop:
             chain += f"   Уверенность: {step.confidence:.0%} {confidence_stars}\n\n"
         return chain
 
-    def get_reasoning_json(self) -> Dict[str, Any]:
+    def get_reasoning_json(self) -> dict[str, Any]:
         """Возвращает цепочку рассуждений в JSON."""
         return {
             "steps": [

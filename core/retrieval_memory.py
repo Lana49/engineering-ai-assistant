@@ -1,27 +1,24 @@
-# -*- coding: utf-8 -*-
+# core/retrieval_memory.py
 """
 Retrieval Memory — память успешных поисковых запросов для бустинга релевантности.
-Сохраняет паттерны запросов, которые привели к хорошим результатам,
-и использует их для улучшения будущих поисков.
 """
 
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass, asdict, field
+from dataclasses import asdict, dataclass, field
 from datetime import datetime
 from pathlib import Path
-from typing import List, Dict
 
 
-@dataclass
+@dataclass(slots=True)
 class RetrievalRecord:
     """Запись об успешном поисковом запросе."""
     pattern: str
     query_type: str
-    keywords: List[str] = field(default_factory=list)
-    preferred_sources: List[str] = field(default_factory=list)
-    boost_terms: List[str] = field(default_factory=list)
+    keywords: list[str] = field(default_factory=list)
+    preferred_sources: list[str] = field(default_factory=list)
+    boost_terms: list[str] = field(default_factory=list)
     success_count: int = 1
     last_used: str = field(default_factory=lambda: datetime.now().isoformat())
 
@@ -29,22 +26,11 @@ class RetrievalRecord:
 class RetrievalMemory:
     """
     Память успешных поисковых запросов для бустинга релевантности.
-
-    Функциональность:
-    - запоминание источников, которые оказались полезными
-    - запоминание терминов, которые помогли найти релевантные документы
-    - применение бустов к будущим похожим запросам
     """
 
-    def __init__(self, memory_path: Path):
-        """
-        Инициализация памяти.
-
-        Args:
-            memory_path: Путь к файлу для хранения данных
-        """
+    def __init__(self, memory_path: Path | str):
         self.memory_path = Path(memory_path)
-        self.records: List[RetrievalRecord] = []
+        self.records: list[RetrievalRecord] = []
         self.load()
 
     def load(self) -> None:
@@ -56,7 +42,7 @@ class RetrievalMemory:
         try:
             data = json.loads(self.memory_path.read_text(encoding="utf-8"))
             self.records = [RetrievalRecord(**item) for item in data if isinstance(item, dict)]
-        except (json.JSONDecodeError, KeyError, TypeError):
+        except (json.JSONDecodeError, KeyError, TypeError, OSError):
             self.records = []
 
     def save(self) -> None:
@@ -70,35 +56,19 @@ class RetrievalMemory:
 
     @staticmethod
     def normalize_query(query: str) -> str:
-        """
-        Нормализует запрос для использования в качестве ключа.
-
-        Args:
-            query: Исходный запрос
-
-        Returns:
-            Нормализованный шаблон запроса
-        """
+        """Нормализует запрос для использования как ключа."""
         cleaned = "".join(ch.lower() if ch.isalnum() or ch.isspace() else " " for ch in query)
-        tokens = [t for t in cleaned.split() if len(t) > 2]
+        tokens = [token for token in cleaned.split() if len(token) > 2]
         return " ".join(tokens[:8])
 
     def save_success(
         self,
         query: str,
         query_type: str,
-        keywords: List[str],
-        sources: List[str],
+        keywords: list[str],
+        sources: list[str],
     ) -> None:
-        """
-        Сохраняет успешный запрос с источниками и ключевыми словами.
-
-        Args:
-            query: Исходный запрос пользователя
-            query_type: Тип запроса (semantic, lexical, hybrid)
-            keywords: Список ключевых слов из запроса
-            sources: Список источников, которые оказались релевантными
-        """
+        """Сохраняет успешный запрос с источниками и ключевыми словами."""
         if not query or not sources:
             return
 
@@ -106,24 +76,29 @@ class RetrievalMemory:
         if not pattern:
             return
 
-        boost_terms = keywords[:6]
-        preferred_sources = [s for s in sources if s][:8]
+        boost_terms = [term for term in keywords if term][:6]
+        preferred_sources = [src for src in sources if src][:8]
 
-        for record in self.records:
-            if record.pattern == pattern and record.query_type == query_type:
-                record.success_count += 1
-                record.last_used = datetime.now().isoformat()
+        for existing_record in self.records:
+            if existing_record.pattern == pattern and existing_record.query_type == query_type:
+                existing_record.success_count += 1
+                existing_record.last_used = datetime.now().isoformat()
 
                 for src in preferred_sources:
-                    if src not in record.preferred_sources:
-                        record.preferred_sources.append(src)
+                    if src not in existing_record.preferred_sources:
+                        existing_record.preferred_sources.append(src)
 
                 for term in boost_terms:
-                    if term not in record.boost_terms:
-                        record.boost_terms.append(term)
+                    if term not in existing_record.boost_terms:
+                        existing_record.boost_terms.append(term)
 
-                record.preferred_sources = record.preferred_sources[:10]
-                record.boost_terms = record.boost_terms[:10]
+                for term in keywords:
+                    if term and term not in existing_record.keywords:
+                        existing_record.keywords.append(term)
+
+                existing_record.preferred_sources = existing_record.preferred_sources[:10]
+                existing_record.boost_terms = existing_record.boost_terms[:10]
+                existing_record.keywords = existing_record.keywords[:15]
                 self.save()
                 return
 
@@ -137,30 +112,20 @@ class RetrievalMemory:
             )
         )
 
-        # Ограничиваем размер памяти последними 300 записями
         if len(self.records) > 300:
             self.records = self.records[-300:]
 
         self.save()
 
-    def get_boosts(self, query: str, query_type: str) -> Dict[str, List[str]]:
-        """
-        Возвращает бустинги для запроса.
-
-        Args:
-            query: Исходный запрос пользователя
-            query_type: Тип запроса
-
-        Returns:
-            Словарь с ключами 'sources' и 'terms'
-        """
+    def get_boosts(self, query: str, query_type: str) -> dict[str, list[str]]:
+        """Возвращает бустинги для похожего запроса."""
         pattern = self.normalize_query(query)
         if not pattern:
             return {"sources": [], "terms": []}
 
         query_tokens = set(pattern.split())
+        matched_records: list[RetrievalRecord] = []
 
-        matched_records: List[RetrievalRecord] = []
         for record in self.records:
             if record.query_type != query_type:
                 continue
@@ -171,14 +136,13 @@ class RetrievalMemory:
             if overlap >= 2 or pattern == record.pattern:
                 matched_records.append(record)
 
-        # Сортируем по успешности и свежести
         matched_records.sort(
             key=lambda r: (r.success_count, r.last_used),
             reverse=True,
         )
 
-        matched_sources: List[str] = []
-        matched_terms: List[str] = []
+        matched_sources: list[str] = []
+        matched_terms: list[str] = []
 
         for record in matched_records:
             for src in record.preferred_sources:
@@ -198,39 +162,26 @@ class RetrievalMemory:
         self.records = []
         self.save()
 
-    def get_stats(self) -> Dict[str, int]:
-        """
-        Возвращает статистику по памяти.
+    def get_stats(self) -> dict[str, int | float]:
+        """Возвращает статистику по памяти."""
+        total = len(self.records)
+        if total == 0:
+            return {
+                "total_records": 0,
+                "unique_patterns": 0,
+                "avg_success_count": 0.0,
+            }
 
-        Returns:
-            Словарь со статистикой
-        """
         return {
-            "total_records": len(self.records),
+            "total_records": total,
             "unique_patterns": len({r.pattern for r in self.records}),
-            "avg_success_count": sum(r.success_count for r in self.records) // max(1, len(self.records)),
+            "avg_success_count": sum(r.success_count for r in self.records) / total,
         }
 
-    def get_records_by_type(self, query_type: str) -> List[RetrievalRecord]:
-        """
-        Возвращает записи по типу запроса.
-
-        Args:
-            query_type: Тип запроса
-
-        Returns:
-            Список записей
-        """
+    def get_records_by_type(self, query_type: str) -> list[RetrievalRecord]:
+        """Возвращает записи по типу запроса."""
         return [r for r in self.records if r.query_type == query_type]
 
-    def get_most_successful(self, limit: int = 10) -> List[RetrievalRecord]:
-        """
-        Возвращает наиболее успешные записи.
-
-        Args:
-            limit: Максимальное количество записей
-
-        Returns:
-            Список записей
-        """
+    def get_most_successful(self, limit: int = 10) -> list[RetrievalRecord]:
+        """Возвращает наиболее успешные записи."""
         return sorted(self.records, key=lambda r: r.success_count, reverse=True)[:limit]

@@ -7,19 +7,19 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional
+from typing import Any
 
-from core.table_extractor import TableExtractor, ExtractedTable
+from core.table_extractor import ExtractedTable, TableExtractor
 
 
-@dataclass
+@dataclass(slots=True)
 class ClimateData:
     """Климатические данные для города."""
     city: str
-    t_ot: Optional[float] = None
-    z_ot: Optional[int] = None
-    t_n: Optional[float] = None
-    t_avg: Optional[float] = None
+    t_ot: float | None = None
+    z_ot: int | None = None
+    t_n: float | None = None
+    t_avg: float | None = None
     source: str = ""
     confidence: float = 0.0
 
@@ -27,26 +27,48 @@ class ClimateData:
 class TableCalculator:
     """Поиск таблиц и выполнение расчётов на основе данных из таблиц."""
 
-    def __init__(self, qa_system=None):
+    _KNOWN_CITIES = {
+        "москва", "санкт-петербург", "новосибирск", "екатеринбург",
+        "нижний новгород", "казань", "челябинск", "омск", "самара",
+        "ростов-на-дону", "уфа", "красноярск", "пермь", "воронеж",
+        "волгоград", "краснодар", "сочи", "владивосток", "иркутск",
+        "тюмень", "барнаул", "хабаровск", "новокузнецк", "магнитогорск",
+        "томск", "кемерово", "астрахань", "архангельск", "мурманск",
+        "якутск", "чита", "брянск", "курск", "тверь", "рязань",
+        "ярославль", "иваново", "смоленск", "липецк", "орел", "орёл",
+        "белгород", "ставрополь", "грозный", "махачкала", "нальчик",
+        "владикавказ", "киров", "сургут", "нижневартовск", "тобольск",
+        "минск", "алматы", "ташкент", "баку", "ереван", "тбилиси",
+        "бишкек", "душанбе",
+    }
+
+    def __init__(self, qa_system: Any = None) -> None:
         self.qa_system = qa_system
         self.extractor = TableExtractor()
-        self._climate_cache: Dict[str, ClimateData] = {}
+        self._climate_cache: dict[str, ClimateData] = {}
 
     @staticmethod
-    def _chunk_doc_name(chunk: Dict[str, Any], default: str = "") -> str:
+    def _normalize_city_name(text: str) -> str:
+        """Нормализует название города."""
+        return re.sub(r"\s+", " ", text.lower().strip().replace("ё", "е"))
+
+    @staticmethod
+    def _chunk_doc_name(chunk: dict[str, Any], default: str = "") -> str:
         """Извлекает имя документа из чанка."""
-        return chunk.get("doc_name") or chunk.get("docname", default)
+        value = chunk.get("doc_name") or chunk.get("docname") or default
+        return str(value) if value is not None else default
 
     def _qa_ready(self) -> bool:
         """Проверяет готовность QA-системы."""
         if not self.qa_system:
             return False
+
         return bool(
             getattr(self.qa_system, "is_ready", False)
             or getattr(self.qa_system, "isready", False)
         )
 
-    def find_climate_table(self, query: str, city_name: Optional[str] = None) -> Optional[ExtractedTable]:
+    def find_climate_table(self, query: str, city_name: str | None = None) -> ExtractedTable | None:
         """Находит климатическую таблицу по запросу."""
         if not self._qa_ready():
             return None
@@ -62,7 +84,7 @@ class TableCalculator:
         if city_name:
             search_queries.insert(0, f"{city_name} климат СП 131.13330")
 
-        all_tables: List[ExtractedTable] = []
+        all_tables: list[ExtractedTable] = []
 
         for search_query in search_queries:
             try:
@@ -70,8 +92,17 @@ class TableCalculator:
             except (AttributeError, TypeError, ValueError):
                 continue
 
+            if not chunks:
+                continue
+
             for chunk in chunks:
-                text = chunk.get("text", "")
+                if not isinstance(chunk, dict):
+                    continue
+
+                text = str(chunk.get("text", "") or "")
+                if not text.strip():
+                    continue
+
                 doc_name = self._chunk_doc_name(chunk)
                 tables = self.extractor.extract(text, doc_name)
 
@@ -79,17 +110,20 @@ class TableCalculator:
                     if self._is_climate_table(table):
                         all_tables.append(table)
 
-        # Удаляем дубликаты по комбинации source + title + raw_text
-        seen = set()
-        unique_tables: List[ExtractedTable] = []
+        seen: set[tuple[str, str, str]] = set()
+        unique_tables: list[ExtractedTable] = []
 
         for table in all_tables:
-            key = (table.source, table.title.strip().lower(), table.raw_text[:200])
+            key = (
+                str(table.source).strip().lower(),
+                str(table.title).strip().lower(),
+                str(table.raw_text[:200]).strip(),
+            )
             if key not in seen:
                 seen.add(key)
                 unique_tables.append(table)
 
-        unique_tables.sort(key=lambda t: t.confidence, reverse=True)
+        unique_tables.sort(key=lambda item: item.confidence, reverse=True)
         return unique_tables[0] if unique_tables else None
 
     def _is_climate_table(self, table: ExtractedTable) -> bool:
@@ -119,64 +153,55 @@ class TableCalculator:
 
         return has_city and has_numbers
 
-    @staticmethod
-    def _is_city_name(text: str) -> bool:
-        """Проверяет, является ли текст названием города (строгое совпадение)."""
-        if not text or len(text.strip()) < 2:
+    @classmethod
+    def _is_city_name(cls, text: str) -> bool:
+        """Проверяет, является ли текст названием города."""
+        normalized = cls._normalize_city_name(text)
+        if len(normalized) < 2:
             return False
+        return normalized in {city.replace("ё", "е") for city in cls._KNOWN_CITIES}
 
-        cities = {
-            "москва", "санкт-петербург", "новосибирск", "екатеринбург",
-            "нижний новгород", "казань", "челябинск", "омск", "самара",
-            "ростов-на-дону", "уфа", "красноярск", "пермь", "воронеж",
-            "волгоград", "краснодар", "сочи", "владивосток", "иркутск",
-            "тюмень", "барнаул", "хабаровск", "новокузнецк", "магнитогорск",
-            "томск", "кемерово", "астрахань", "архангельск", "мурманск",
-            "якутск", "чита", "брянск", "курск", "тверь", "рязань",
-            "ярославль", "иваново", "смоленск", "липецк", "орел", "орёл",
-            "белгород", "ставрополь", "грозный", "махачкала", "нальчик",
-            "владикавказ", "киров", "сургут", "нижневартовск", "тобольск",
-            "минск", "алматы", "ташкент", "баку", "ереван", "тбилиси",
-            "бишкек", "душанбе",
-        }
+    @classmethod
+    def _row_contains_city(cls, row: list[str], city_name: str) -> bool:
+        """Проверяет, содержит ли строка нужный город."""
+        target = cls._normalize_city_name(city_name)
 
-        normalized = text.lower().strip().replace("ё", "е")
+        for cell in row:
+            cell_normalized = cls._normalize_city_name(cell)
+            if cell_normalized == target:
+                return True
 
-        # Точное совпадение (без частичных вхождений)
-        return normalized in cities
+        row_joined = " | ".join(cls._normalize_city_name(cell) for cell in row)
+        return bool(re.search(rf"(^|\W){re.escape(target)}($|\W)", row_joined))
 
-    def extract_climate_data(self, table: ExtractedTable, city_name: str) -> Optional[ClimateData]:
+    def extract_climate_data(self, table: ExtractedTable, city_name: str) -> ClimateData | None:
         """Извлекает климатические данные для указанного города."""
         if not table or not city_name:
             return None
 
-        cache_key = f"{city_name.lower().strip()}::{hash(table.raw_text[:300])}"
+        cache_key = f"{self._normalize_city_name(city_name)}::{hash(table.raw_text[:300])}"
         if cache_key in self._climate_cache:
             return self._climate_cache[cache_key]
 
-        city_lower = city_name.lower().strip().replace("ё", "е")
         data = ClimateData(city=city_name, source=table.source)
 
-        found_row = None
+        found_row: list[str] | None = None
         for row in table.rows:
-            row_text = " ".join(row).lower().replace("ё", "е")
-            if city_lower in row_text:
+            if self._row_contains_city(row, city_name):
                 found_row = row
                 break
 
         if not found_row:
             return None
 
-        headers = [h.lower().strip().replace("ё", "е") for h in table.headers] if table.headers else []
+        headers = [self._normalize_city_name(h) for h in table.headers] if table.headers else []
 
         if headers and len(headers) == len(found_row):
             self._extract_by_headers(headers, found_row, data)
 
-        # Если заголовки не помогли, используем улучшенный парсинг
         if data.t_ot is None or data.z_ot is None:
             self._extract_by_markers(found_row, data)
 
-        # Если всё ещё не нашли — пробуем plain scan как fallback
         if data.t_ot is None or data.z_ot is None:
             self._extract_by_plain_scan(found_row, data)
 
@@ -192,18 +217,16 @@ class TableCalculator:
         self._climate_cache[cache_key] = data
         return data
 
-    def _extract_by_headers(self, headers: List[str], row: List[str], data: ClimateData) -> None:
+    def _extract_by_headers(self, headers: list[str], row: list[str], data: ClimateData) -> None:
         """Извлекает значения по заголовкам таблицы."""
         for header, cell in zip(headers, row):
             value = self._extract_first_number(cell)
             if value is None:
                 continue
 
-            header_text = header.lower()
-
             if (
                 data.t_ot is None
-                and ("t_от" in header_text or "отоп" in header_text or "средн" in header_text)
+                and ("t_от" in header or "отоп" in header or "средн" in header)
                 and -50 <= value <= 30
             ):
                 data.t_ot = float(value)
@@ -211,7 +234,7 @@ class TableCalculator:
 
             if (
                 data.z_ot is None
-                and ("z_от" in header_text or "продолж" in header_text or "сут" in header_text or "дней" in header_text)
+                and ("z_от" in header or "продолж" in header or "сут" in header or "дней" in header)
                 and 1 <= value <= 400
             ):
                 data.z_ot = int(round(value))
@@ -219,70 +242,63 @@ class TableCalculator:
 
             if (
                 data.t_n is None
-                and ("t_н" in header_text or "пятиднев" in header_text or "холодн" in header_text or "наруж" in header_text)
+                and ("t_н" in header or "пятиднев" in header or "холодн" in header or "наруж" in header)
                 and -70 <= value <= 20
             ):
                 data.t_n = float(value)
                 continue
 
-            if data.t_avg is None and "среднегод" in header_text and -50 <= value <= 30:
+            if data.t_avg is None and "среднегод" in header and -50 <= value <= 30:
                 data.t_avg = float(value)
 
-    def _extract_by_markers(self, row: List[str], data: ClimateData) -> None:
-        """Извлекает значения по маркерам (t_от, z_от, t_н, сут)."""
+    def _extract_by_markers(self, row: list[str], data: ClimateData) -> None:
+        """Извлекает значения по маркерам."""
         for cell in row:
-            cell_lower = cell.lower().replace("ё", "е").strip()
+            cell_lower = self._normalize_city_name(cell)
 
-            if data.t_ot is None and re.search(r"t_от|средняя.*?температура", cell_lower):
+            if data.t_ot is None and re.search(r"t_от|средняя.*температура|отопительный период", cell_lower):
                 value = self._extract_first_number(cell)
                 if value is not None and -50 <= value <= 30:
                     data.t_ot = float(value)
                     continue
 
-            if data.z_ot is None and re.search(r"z_от|продолжительность|сут", cell_lower):
+            if data.z_ot is None and re.search(r"z_от|продолжительность|сут|дней", cell_lower):
                 value = self._extract_first_number(cell)
                 if value is not None and 1 <= value <= 400:
                     data.z_ot = int(round(value))
                     continue
 
-            if data.t_n is None and re.search(r"t_н|холодной.*?пятидневки|наружная", cell_lower):
+            if data.t_n is None and re.search(r"t_н|холодн.*пятидневк|наружн", cell_lower):
                 value = self._extract_first_number(cell)
                 if value is not None and -70 <= value <= 20:
                     data.t_n = float(value)
                     continue
 
-    def _extract_by_plain_scan(self, row: List[str], data: ClimateData) -> None:
-        """
-        Запасной вариант извлечения без заголовков.
-        Использует позиционное извлечение с привязкой к найденному городу.
-        """
-        # Сначала ищем все числа в строке
-        numbers = []
+    def _extract_by_plain_scan(self, row: list[str], data: ClimateData) -> None:
+        """Запасное извлечение без заголовков."""
+        numbers: list[float] = []
+
         for cell in row:
             value = self._extract_first_number(cell)
             if value is not None:
                 numbers.append(float(value))
 
         if len(numbers) >= 2:
-            # Первое число из диапазона температур — t_ot
             for num in numbers:
                 if data.t_ot is None and -30 <= num <= 25:
                     data.t_ot = float(num)
                     break
 
-            # Второе число из диапазона продолжительности — z_ot
             for num in numbers:
                 if data.z_ot is None and 1 <= num <= 400:
                     data.z_ot = int(round(num))
                     break
 
-            # Третье число из диапазона отрицательных температур — t_n
             for num in numbers:
                 if data.t_n is None and -70 <= num <= -5:
                     data.t_n = float(num)
                     break
 
-        # Если не нашли по диапазонам, пробуем по порядку
         if len(numbers) >= 3 and (data.t_ot is None or data.z_ot is None):
             for i, num in enumerate(numbers):
                 if i == 0 and data.t_ot is None and -30 <= num <= 25:
@@ -293,12 +309,12 @@ class TableCalculator:
                     data.t_n = float(num)
 
     @staticmethod
-    def _extract_first_number(text: str) -> Optional[float]:
+    def _extract_first_number(text: str) -> float | None:
         """Извлекает первое число из строки."""
         if not text:
             return None
 
-        match = re.search(r"-?\d+[.,]?\d*", text)
+        match = re.search(r"-?\d+(?:[.,]\d+)?", text)
         if not match:
             return None
 
@@ -307,9 +323,9 @@ class TableCalculator:
         except ValueError:
             return None
 
-    def calculate_degree_days_from_table(self, city_name: str, t_v: float = 20.0) -> Dict[str, Any]:
+    def calculate_degree_days_from_table(self, city_name: str, t_v: float = 20.0) -> dict[str, Any]:
         """Рассчитывает ГСОП по данным климатической таблицы."""
-        result: Dict[str, Any] = {
+        result: dict[str, Any] = {
             "city": city_name,
             "t_v": t_v,
             "success": False,
@@ -378,12 +394,12 @@ class TableCalculator:
 
             result["answer"] = "\n".join(answer_lines)
 
-        except (ValueError, TypeError, AttributeError) as e:
-            result["answer"] = f"❌ Ошибка при расчёте: {e}"
+        except (ValueError, TypeError, AttributeError) as exc:
+            result["answer"] = f"❌ Ошибка при расчёте: {exc}"
 
         return result
 
-    def calculate_gsop_from_table(self, city_name: str, t_v: float = 20.0) -> Dict[str, Any]:
+    def calculate_gsop_from_table(self, city_name: str, t_v: float = 20.0) -> dict[str, Any]:
         """Алиас для calculate_degree_days_from_table."""
         return self.calculate_degree_days_from_table(city_name, t_v)
 
@@ -392,9 +408,9 @@ class TableCalculator:
         city_name: str,
         air_flow: float,
         t_v: float = 20.0,
-    ) -> Dict[str, Any]:
+    ) -> dict[str, Any]:
         """Рассчитывает расход теплоты на вентиляцию по данным таблицы."""
-        result: Dict[str, Any] = {
+        result: dict[str, Any] = {
             "city": city_name,
             "air_flow": air_flow,
             "t_v": t_v,
@@ -409,19 +425,22 @@ class TableCalculator:
         degree_days_result = self.calculate_degree_days_from_table(city_name, t_v)
 
         if not degree_days_result["success"]:
-            result["answer"] = degree_days_result["answer"]
-            result["source"] = degree_days_result.get("source", "")
+            result["answer"] = str(degree_days_result["answer"])
+            result["source"] = str(degree_days_result.get("source", ""))
             result["table"] = degree_days_result.get("table")
             return result
 
         data = degree_days_result["data"]
+        if not isinstance(data, ClimateData):
+            result["answer"] = f"⚠️ Не удалось получить климатические данные для {city_name}"
+            return result
 
         if data.t_n is None:
             result["answer"] = (
                 f"⚠️ Не найдена температура наружного воздуха t_н для {city_name}. "
                 "Она нужна для расчёта вентиляции."
             )
-            result["source"] = degree_days_result.get("source", "")
+            result["source"] = str(degree_days_result.get("source", ""))
             result["table"] = degree_days_result.get("table")
             return result
 
@@ -430,7 +449,7 @@ class TableCalculator:
         result["degree_days_result"] = degree_days_result
         result["ventilation"] = q_vent
         result["success"] = True
-        result["source"] = degree_days_result.get("source", "")
+        result["source"] = str(degree_days_result.get("source", ""))
         result["table"] = degree_days_result.get("table")
 
         answer_lines = [
@@ -460,9 +479,9 @@ class TableCalculator:
         area: float,
         resistance: float,
         t_v: float = 20.0,
-    ) -> Dict[str, Any]:
+    ) -> dict[str, Any]:
         """Рассчитывает теплопотери через ограждение по данным таблицы."""
-        result: Dict[str, Any] = {
+        result: dict[str, Any] = {
             "city": city_name,
             "area": area,
             "resistance": resistance,
@@ -518,18 +537,18 @@ class TableCalculator:
 
             result["answer"] = "\n".join(answer_lines)
 
-        except (ValueError, TypeError, AttributeError) as e:
-            result["answer"] = f"❌ Ошибка при расчёте: {e}"
+        except (ValueError, TypeError, AttributeError, ZeroDivisionError) as exc:
+            result["answer"] = f"❌ Ошибка при расчёте: {exc}"
 
         return result
 
-    def get_cities_from_table(self, query: str = "климатические параметры городов") -> List[str]:
+    def get_cities_from_table(self, query: str = "климатические параметры городов") -> list[str]:
         """Извлекает список городов из найденной климатической таблицы."""
         table = self.find_climate_table(query)
         if not table:
             return []
 
-        cities: List[str] = []
+        cities: list[str] = []
         for row in table.rows:
             for cell in row:
                 if self._is_city_name(cell):

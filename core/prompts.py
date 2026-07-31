@@ -5,7 +5,7 @@
 
 from __future__ import annotations
 
-from typing import Any, Optional
+from typing import Any
 
 SYSTEM_PROMPT = """
 Ты — инженерный помощник по строительной документации. Твоя задача — давать точные, полные и логичные ответы.
@@ -218,7 +218,7 @@ def format_definition_result(
     term: str,
     definition: str,
     source: str,
-    example: Optional[str] = None
+    example: str | None = None
 ) -> str:
     """Форматирует определение термина для вывода."""
     lines = [
@@ -238,7 +238,7 @@ def format_definition_result(
 def format_search_result(
     answer: str,
     sources: list[str | dict[str, Any]],
-    key_points: Optional[list[str]] = None
+    key_points: list[str] | None = None
 ) -> str:
     """Форматирует результат поиска для вывода."""
     lines = [
@@ -452,7 +452,7 @@ QUICK_DEFINITIONS: dict[str, dict[str, str]] = {
 }
 
 
-def get_quick_definition(term: str) -> Optional[dict[str, str]]:
+def get_quick_definition(term: str) -> dict[str, str] | None:
     """Возвращает быстрое определение термина или None."""
     if not term:
         return None
