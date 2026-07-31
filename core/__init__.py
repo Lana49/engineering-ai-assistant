@@ -2,7 +2,7 @@
 """Основные модули инженерной базы знаний."""
 
 from core.agent_loop import AgentLoop
-from utils.config import PROCESSED_DIR, RAW_DIR
+from core.config import PROCESSED_DIR, RAW_DIR
 from core.error_handler import ErrorHandler
 from core.formula_engine import FormulaEngine
 from core.parser import DocumentParser, parse_file, parse_directory
