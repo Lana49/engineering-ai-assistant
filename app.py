@@ -8,10 +8,12 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import time
 from datetime import datetime
 
 import streamlit as st
+from reportlab.lib.colors import HexColor
 
 try:
     from huggingface_hub import snapshot_download
@@ -55,7 +57,16 @@ def run_async_safely(async_func, *args, **kwargs):
 
 
 def call_maybe_async(func, *args, **kwargs):
-    """Универсальный вызов sync/async функции."""
+    """
+    Универсальный безопасный вызов sync/async функции.
+    Исправлена проблема с None и невызываемыми объектами.
+    """
+    if func is None:
+        raise ValueError("Передана пустая функция (None) в call_maybe_async")
+
+    if not callable(func):
+        raise TypeError(f"Объект {type(func).__name__} не является вызываемым")
+
     result = func(*args, **kwargs)
     if asyncio.iscoroutine(result):
         return run_async_safely(lambda: result)
@@ -166,7 +177,7 @@ def export_history_to_docx():
     except ImportError:
         st.error("❌ Для экспорта истории нужен python-docx: pip install python-docx")
         return None
-    except Exception as e:
+    except (OSError, ValueError) as e:
         st.error(f"❌ Ошибка: {e}")
         return None
 
@@ -184,7 +195,7 @@ def export_to_docx(answer: str, sources: list, tables: list = None, formulas: li
         doc = Document()
 
         title = doc.add_heading("Инженерный отчёт", 0)
-        title.alignment = WD_ALIGN_PARAGRAPH.CENTER
+        title.alignment = WD_ALIGN_PARAGRAPH.CENTER  # Исправлено
 
         doc.add_paragraph(f"Дата: {datetime.now().strftime('%d.%m.%Y %H:%M')}")
         doc.add_paragraph()
@@ -235,7 +246,7 @@ def export_to_docx(answer: str, sources: list, tables: list = None, formulas: li
     except ImportError:
         st.error("❌ python-docx не установлен. pip install python-docx")
         return None
-    except Exception as e:
+    except (OSError, ValueError) as e:
         st.error(f"❌ Ошибка создания DOCX: {e}")
         return None
 
@@ -263,7 +274,7 @@ def export_to_pdf(answer: str, sources: list, tables: list = None, formulas: lis
             "TitleStyle",
             parent=styles["Title"],
             fontSize=24,
-            textColor="#1a5276",
+            textColor=HexColor("#1a5276"),
             alignment=TA_CENTER,
             spaceAfter=20,
         )
@@ -272,7 +283,7 @@ def export_to_pdf(answer: str, sources: list, tables: list = None, formulas: lis
             "HeadingStyle",
             parent=styles["Heading1"],
             fontSize=16,
-            textColor="#2e86c1",
+            textColor=HexColor("#2e86c1"),
             spaceAfter=12,
             spaceBefore=12,
         )
@@ -313,12 +324,19 @@ def export_to_pdf(answer: str, sources: list, tables: list = None, formulas: lis
     except ImportError:
         st.warning("⚠️ reportlab не установлен. Будет создан DOCX вместо PDF.")
         return export_to_docx(answer, sources, tables, formulas, filename.replace(".pdf", ".docx"))
-    except Exception as e:
+    except (OSError, ValueError) as e:
         st.error(f"❌ Ошибка создания PDF: {e}")
         return None
 
 
-def render_export_buttons(answer: str, sources: list, tables: list, formulas: list, key_suffix: str = "current", response_id: int = None):
+def render_export_buttons(
+    answer: str,
+    sources: list,
+    tables: list,
+    formulas: list,
+    key_suffix: str = "current",
+    response_id: int | None = None
+):
     """
     Отображение кнопок экспорта с уникальными ключами.
     Исправлена проблема StreamlitDuplicateElementKey.
@@ -412,8 +430,6 @@ def force_rebuild_index(qa: QASystem) -> bool:
         print(f"   embeddings shape: {qa.chunk_embeddings.shape}")
 
     print("💾 Сохраняем индекс...")
-
-    # ПРОВЕРЯЕМ ПРАВА НА ЗАПИСЬ
     PROCESSED_DIR.mkdir(parents=True, exist_ok=True)
     print(f"📁 Папка для сохранения: {PROCESSED_DIR}")
     print(f"📁 Права на запись: {os.access(PROCESSED_DIR, os.W_OK)}")
@@ -425,7 +441,7 @@ def force_rebuild_index(qa: QASystem) -> bool:
         if INDEX_FILE.exists():
             size = INDEX_FILE.stat().st_size
             print(f"   Размер файла: {size} bytes")
-            if size < 1000000:  # Меньше 1MB — подозрительно
+            if size < 1000000:
                 print(f"⚠️ ВНИМАНИЕ: размер индекса слишком мал ({size} bytes)")
                 return False
         else:
@@ -434,15 +450,35 @@ def force_rebuild_index(qa: QASystem) -> bool:
     else:
         print("❌ Ошибка сохранения индекса")
         return False
+
+    print("=" * 50)
     return True
+
+
+def get_llm_status(qa_system: QASystem) -> dict[str, str]:
+    """Безопасно получает статус LLM."""
+    status: dict[str, str] = {
+        "use_llm": str(qa_system.use_llm),
+        "llm_provider": qa_system.llm_provider,
+        "llm_available": str(qa_system.llm_available),
+        "selected_provider": "unknown",
+        "ollama_alive": str(qa_system.is_ollama_alive()),
+        "ollama_model": qa_system.ollama_model,
+        "gemini_available": str(qa_system.gemini_available),
+    }
+    try:
+        if hasattr(qa_system, 'get_selected_provider'):
+            status["selected_provider"] = qa_system.get_selected_provider()
+    except (AttributeError, TypeError, ValueError):
+        pass
+    return status
 
 
 def init_qa_system() -> QASystem:
     """Инициализирует QA-систему с загрузкой или построением индекса."""
-    # ← ИСПРАВЛЕНО: явно указываем llm_provider="ollama"
     qa = QASystem(
         use_llm=True,
-        llm_provider="ollama",  # ← ИЗМЕНЕНО с "mixed" на "ollama"
+        llm_provider="ollama",
         use_embeddings=True,
         ollama_base_url="http://localhost:11434",
         ollama_model="llama3.1:8b",
@@ -454,7 +490,7 @@ def init_qa_system() -> QASystem:
             qa.load_index(INDEX_FILE)
             print(f"✅ Индекс загружен: {len(qa.chunks)} чанков")
             return qa
-        except Exception as e:
+        except (OSError, ValueError, TypeError) as e:
             print(f"⚠️ Ошибка загрузки индекса: {e}")
             print("🔄 Будет выполнена перестройка...")
 
@@ -508,21 +544,19 @@ def auto_load_documents() -> bool:
 
     if not INDEX_FILE.exists():
         st.sidebar.info("🔄 Индекс отсутствует. Выполняется перестройка...")
-        with st.sidebar:
-            with st.spinner("📚 Индексация документов..."):
-                if force_rebuild_index(qa_system):
-                    st.success("✅ Индекс перестроен")
-                    st.rerun()
-                    return True
-                else:
-                    st.error("❌ Не удалось перестроить индекс")
-                    return False
+        with st.spinner("📚 Индексация документов..."):
+            if force_rebuild_index(qa_system):
+                st.success("✅ Индекс перестроен")
+                return True
+            else:
+                st.error("❌ Не удалось перестроить индекс")
+                return False
 
     try:
         if qa_system.load_index(INDEX_FILE):
             st.sidebar.success(f"✅ Индекс загружен\n📄 {len(qa_system.chunks)} фрагментов")
             return True
-    except Exception as e:
+    except (OSError, ValueError, TypeError) as e:
         st.sidebar.warning(f"⚠️ Ошибка загрузки индекса: {e}")
 
     return False
@@ -530,7 +564,11 @@ def auto_load_documents() -> bool:
 
 # ========= ОСНОВНОЙ ИНТЕРФЕЙС =========
 
-def render_sidebar(qa_system: QASystem, formula_engine: FormulaEngine, error_handler: ErrorHandler) -> None:
+def render_sidebar(
+    qa_system: QASystem,
+    formula_engine: FormulaEngine,
+    error_handler: ErrorHandler
+) -> None:
     """Рендер боковой панели."""
     with st.sidebar:
         st.header("📚 О системе")
@@ -563,13 +601,14 @@ def render_sidebar(qa_system: QASystem, formula_engine: FormulaEngine, error_han
 
         # ========= ДИАГНОСТИКА LLM =========
         st.subheader("🤖 Статус LLM")
-        st.write(f"use_llm: `{qa_system.use_llm}`")
-        st.write(f"llm_provider: `{qa_system.llm_provider}`")
-        st.write(f"llm_available: `{qa_system.llm_available}`")
-        st.write(f"selected_provider: `{qa_system._select_provider()}`")
-        st.write(f"ollama_alive: `{qa_system.is_ollama_alive()}`")
-        st.write(f"ollama_model: `{qa_system.ollama_model}`")
-        st.write(f"gemini_available: `{qa_system.gemini_available}`")
+        llm_status = get_llm_status(qa_system)
+        st.write(f"use_llm: `{llm_status['use_llm']}`")
+        st.write(f"llm_provider: `{llm_status['llm_provider']}`")
+        st.write(f"llm_available: `{llm_status['llm_available']}`")
+        st.write(f"selected_provider: `{llm_status['selected_provider']}`")
+        st.write(f"ollama_alive: `{llm_status['ollama_alive']}`")
+        st.write(f"ollama_model: `{llm_status['ollama_model']}`")
+        st.write(f"gemini_available: `{llm_status['gemini_available']}`")
         st.divider()
 
         auto_load_documents()
@@ -681,7 +720,7 @@ def render_sidebar(qa_system: QASystem, formula_engine: FormulaEngine, error_han
                     st.error(f"{i}. {err.get('type', 'Error')}: {err.get('message', '')[:100]}")
 
 
-def render_sources(sources) -> None:
+def render_sources(sources: list) -> None:
     """Рендерит источники."""
     with st.expander("📚 Источники", expanded=False):
         for src in sources[:5]:
@@ -692,7 +731,7 @@ def render_sources(sources) -> None:
             st.caption(f"📄 {doc_name}")
 
 
-def render_tables(tables) -> None:
+def render_tables(tables: list) -> None:
     """Рендерит таблицы."""
     with st.expander("📊 Таблицы", expanded=False):
         for table in tables[:3]:
@@ -707,7 +746,7 @@ def render_tables(tables) -> None:
                 st.write(table)
 
 
-def render_formulas(formulas) -> None:
+def render_formulas(formulas: list) -> None:
     """Рендерит формулы."""
     with st.expander("📐 Формулы", expanded=False):
         for formula in formulas[:3]:
@@ -717,7 +756,7 @@ def render_formulas(formulas) -> None:
                 st.code(str(formula))
 
 
-def render_reasoning(steps) -> None:
+def render_reasoning(steps: list) -> None:
     """Рендерит цепочку рассуждений."""
     with st.expander("🧠 Цепочка рассуждений", expanded=False):
         for step in steps:

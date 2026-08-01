@@ -17,7 +17,7 @@ import subprocess
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, List, Tuple, Optional
 
 SUPPORTED_EXTENSIONS = {".pdf", ".docx", ".doc", ".rtf"}
 
@@ -39,7 +39,7 @@ def safe_print(message: str) -> None:
     """Безопасный вывод в консоль."""
     try:
         print(message)
-    except (OSError, UnicodeEncodeError):  # ← ИСПРАВЛЕНО: конкретные исключения
+    except (OSError, UnicodeEncodeError):
         pass
 
 
@@ -47,7 +47,7 @@ def safe_print(message: str) -> None:
 # PDF
 # =========================
 
-def read_pdf_pymupdf(file_path: str | Path) -> tuple[str, str | None]:
+def read_pdf_pymupdf(file_path: str | Path) -> Tuple[str, Optional[str]]:
     """Читает PDF через PyMuPDF."""
     try:
         import pymupdf
@@ -62,7 +62,7 @@ def read_pdf_pymupdf(file_path: str | Path) -> tuple[str, str | None]:
         return "", "файл пустой или не найден"
 
     try:
-        parts: list[str] = []
+        parts: List[str] = []
         with pymupdf.open(str(path)) as doc:  # type: ignore
             for page_num, page in enumerate(doc, start=1):
                 try:
@@ -80,7 +80,7 @@ def read_pdf_pymupdf(file_path: str | Path) -> tuple[str, str | None]:
         return "", f"PyMuPDF ошибка: {exc}"
 
 
-def read_pdf_pdfplumber(file_path: str | Path) -> tuple[str, str | None]:
+def read_pdf_pdfplumber(file_path: str | Path) -> Tuple[str, Optional[str]]:
     """Читает PDF через pdfplumber как fallback."""
     try:
         import pdfplumber
@@ -92,7 +92,7 @@ def read_pdf_pdfplumber(file_path: str | Path) -> tuple[str, str | None]:
         return "", "файл пустой или не найден"
 
     try:
-        parts: list[str] = []
+        parts: List[str] = []
         with pdfplumber.open(str(path)) as pdf:
             for page_num, page in enumerate(pdf.pages, start=1):
                 try:
@@ -110,7 +110,7 @@ def read_pdf_pdfplumber(file_path: str | Path) -> tuple[str, str | None]:
         return "", f"pdfplumber ошибка: {exc}"
 
 
-def read_pdf_ocr(file_path: str | Path) -> tuple[str, str | None]:
+def read_pdf_ocr(file_path: str | Path) -> Tuple[str, Optional[str]]:
     """OCR fallback для сканированных PDF через Tesseract."""
     path = Path(file_path)
     if not path.exists() or not path.is_file() or path.stat().st_size == 0:
@@ -138,7 +138,7 @@ def read_pdf_ocr(file_path: str | Path) -> tuple[str, str | None]:
         return "", "Tesseract не установлен в системе"
 
     try:
-        parts: list[str] = []
+        parts: List[str] = []
         with pymupdf.open(str(path)) as doc:  # type: ignore
             total_pages = len(doc)
             safe_print(f"📄 OCR страниц {path.name}: {total_pages}")
@@ -149,9 +149,17 @@ def read_pdf_ocr(file_path: str | Path) -> tuple[str, str | None]:
                     pix = page.get_pixmap(matrix=matrix)
 
                     if pix.alpha:
-                        img = Image.frombytes("RGBA", [pix.width, pix.height], pix.samples).convert("RGB")
+                        img = Image.frombytes(
+                            "RGBA",
+                            (pix.width, pix.height),  # ← tuple[int, int]
+                            pix.samples
+                        ).convert("RGB")
                     else:
-                        img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
+                        img = Image.frombytes(
+                            "RGB",
+                            (pix.width, pix.height),  # ← tuple[int, int]
+                            pix.samples
+                        )
 
                     text = pytesseract.image_to_string(
                         img,
@@ -174,7 +182,7 @@ def read_pdf_ocr(file_path: str | Path) -> tuple[str, str | None]:
         return "", f"OCR ошибка: {exc}"
 
 
-def read_pdf(file_path: str | Path) -> tuple[str, str | None]:
+def read_pdf(file_path: str | Path) -> Tuple[str, Optional[str]]:
     """Читает PDF с несколькими fallback-стратегиями."""
     path = Path(file_path)
     if not path.exists() or not path.is_file() or path.stat().st_size == 0:
@@ -194,7 +202,7 @@ def read_pdf(file_path: str | Path) -> tuple[str, str | None]:
 # DOCX
 # =========================
 
-def read_docx(file_path: str | Path) -> tuple[str, str | None]:
+def read_docx(file_path: str | Path) -> Tuple[str, Optional[str]]:
     """Читает DOCX через python-docx."""
     try:
         from docx import Document
@@ -207,7 +215,7 @@ def read_docx(file_path: str | Path) -> tuple[str, str | None]:
 
     try:
         doc = Document(str(path))
-        parts: list[str] = []
+        parts: List[str] = []
 
         for paragraph in doc.paragraphs:
             text = paragraph.text.strip()
@@ -224,7 +232,7 @@ def read_docx(file_path: str | Path) -> tuple[str, str | None]:
         if text:
             return text, "python-docx"
         return "", "текст не извлечён"
-    except (OSError, ValueError, TypeError, ImportError) as exc:  # ← ИСПРАВЛЕНО
+    except (OSError, ValueError, TypeError, ImportError) as exc:
         return "", f"python-docx ошибка: {exc}"
 
 
@@ -232,7 +240,7 @@ def read_docx(file_path: str | Path) -> tuple[str, str | None]:
 # DOC
 # =========================
 
-def read_doc_textutil(file_path: str | Path) -> tuple[str, str | None]:
+def read_doc_textutil(file_path: str | Path) -> Tuple[str, Optional[str]]:
     """Читает .doc через textutil на macOS."""
     if not IS_MACOS:
         return "", "textutil доступен только на macOS"
@@ -261,7 +269,7 @@ def read_doc_textutil(file_path: str | Path) -> tuple[str, str | None]:
         return "", f"textutil ошибка: {exc}"
 
 
-def read_doc_textract(file_path: str | Path) -> tuple[str, str | None]:
+def read_doc_textract(file_path: str | Path) -> Tuple[str, Optional[str]]:
     """Читает .doc через textract."""
     try:
         import textract  # noqa: F401
@@ -279,11 +287,11 @@ def read_doc_textract(file_path: str | Path) -> tuple[str, str | None]:
         if text:
             return text, "textract"
         return "", "textract не вернул текст"
-    except (OSError, ValueError, TypeError, RuntimeError) as exc:  # ← ИСПРАВЛЕНО
+    except (OSError, ValueError, TypeError, RuntimeError) as exc:
         return "", f"textract ошибка: {exc}"
 
 
-def read_doc_antiword(file_path: str | Path) -> tuple[str, str | None]:
+def read_doc_antiword(file_path: str | Path) -> Tuple[str, Optional[str]]:
     """Читает .doc через antiword."""
     if not command_exists("antiword"):
         return "", "antiword не установлен"
@@ -309,7 +317,7 @@ def read_doc_antiword(file_path: str | Path) -> tuple[str, str | None]:
         return "", f"antiword ошибка: {exc}"
 
 
-def read_doc(file_path: str | Path) -> tuple[str, str | None]:
+def read_doc(file_path: str | Path) -> Tuple[str, Optional[str]]:
     """Читает .doc с платформенным fallback."""
     path = Path(file_path)
     if not path.exists() or not path.is_file() or path.stat().st_size == 0:
@@ -331,7 +339,6 @@ def read_doc(file_path: str | Path) -> tuple[str, str | None]:
         if text:
             return text, source
 
-    # fallback для других платформ
     text, source = read_doc_textract(path)
     if text:
         return text, source
@@ -343,7 +350,7 @@ def read_doc(file_path: str | Path) -> tuple[str, str | None]:
 # RTF
 # =========================
 
-def read_rtf(file_path: str | Path) -> tuple[str, str | None]:
+def read_rtf(file_path: str | Path) -> Tuple[str, Optional[str]]:
     """Читает RTF через striprtf."""
     try:
         from striprtf.striprtf import rtf_to_text
@@ -371,7 +378,7 @@ def read_rtf(file_path: str | Path) -> tuple[str, str | None]:
 # Универсальное чтение
 # =========================
 
-def read_file(file_path: str | Path) -> tuple[str, str | None]:
+def read_file(file_path: str | Path) -> Tuple[str, Optional[str]]:
     """Универсальное чтение файла по расширению."""
     path = Path(file_path)
 
@@ -405,7 +412,7 @@ class ParsedDocument:
     filepath: str
     filetype: str
     text: str
-    chunks: list[dict[str, Any]] = field(default_factory=list)
+    chunks: List[dict[str, Any]] = field(default_factory=list)
     metadata: dict[str, Any] = field(default_factory=dict)
 
 
@@ -433,10 +440,10 @@ class DocumentParser:
         text = re.sub(r"\n{3,}", "\n\n", text)
         return text.strip()
 
-    def split_paragraphs(self, text: str) -> list[str]:
+    def split_paragraphs(self, text: str) -> List[str]:
         """Разбивает текст на логические параграфы."""
         parts = re.split(r"\n\s*\n", text)
-        result: list[str] = []
+        result: List[str] = []
 
         for part in parts:
             part = part.strip()
@@ -449,13 +456,13 @@ class DocumentParser:
 
         return result
 
-    def split_long_text(self, text: str) -> list[str]:
+    def split_long_text(self, text: str) -> List[str]:
         """Разбивает длинный текст по предложениям."""
         sentences = re.split(r"(?<=[.!?])\s+", text)
         if len(sentences) < 2:
             return self.hard_split(text)
 
-        result: list[str] = []
+        result: List[str] = []
         current = ""
 
         for sentence in sentences:
@@ -481,9 +488,9 @@ class DocumentParser:
 
         return result
 
-    def hard_split(self, text: str) -> list[str]:
+    def hard_split(self, text: str) -> List[str]:
         """Принудительно разбивает длинный текст."""
-        parts: list[str] = []
+        parts: List[str] = []
         start = 0
 
         while start < len(text):
@@ -516,9 +523,9 @@ class DocumentParser:
         return text
 
     @staticmethod
-    def extract_formulas(text: str) -> list[dict[str, Any]]:
+    def extract_formulas(text: str) -> List[dict[str, Any]]:
         """Пытается извлечь простые формулы."""
-        formulas: list[dict[str, Any]] = []
+        formulas: List[dict[str, Any]] = []
         patterns = [
             r"[A-Za-zА-Яа-я0-9_]+\s*=\s*[^=\n]{3,120}",
             r"\bQ\s*=\s*[^=\n]{3,120}",
@@ -538,7 +545,7 @@ class DocumentParser:
                     }
                 )
 
-        unique: list[dict[str, Any]] = []
+        unique: List[dict[str, Any]] = []
         seen: set[str] = set()
         for item in formulas:
             key = item["raw"]
@@ -571,7 +578,7 @@ class DocumentParser:
     def build_metadata(
         path: Path,
         text: str,
-        chunks: list[dict[str, Any]],
+        chunks: List[dict[str, Any]],
         source: str | None = None,
     ) -> dict[str, Any]:
         """Собирает метаданные документа."""
@@ -636,7 +643,7 @@ class DocumentParser:
         safe_print(f"✅ Текст извлечён из {path.name}: {len(text)} символов через {source}")
 
         raw_chunks = self.split_paragraphs(text)
-        chunks: list[dict[str, Any]] = []
+        chunks: List[dict[str, Any]] = []
 
         for idx, chunk_text in enumerate(raw_chunks):
             formulas = self.extract_formulas(chunk_text)
@@ -663,7 +670,7 @@ class DocumentParser:
             "metadata": metadata,
         }
 
-    def parse_directory(self, directory: str | Path, recursive: bool = True) -> list[dict[str, Any]]:
+    def parse_directory(self, directory: str | Path, recursive: bool = True) -> List[dict[str, Any]]:
         """Парсит директорию с документами."""
         base = Path(directory)
         if not base.exists() or not base.is_dir():
@@ -684,8 +691,8 @@ class DocumentParser:
             for p in unsupported_files[:10]:
                 safe_print(f"   - {p.name} [{p.suffix}]")
 
-        parsed: list[dict[str, Any]] = []
-        failed: list[str] = []
+        parsed: List[dict[str, Any]] = []
+        failed: List[str] = []
 
         for path in sorted(supported_files):
             try:
@@ -713,7 +720,7 @@ def parse_file(file_path: str | Path, **kwargs: Any) -> dict[str, Any]:
     return parser.parse_file(file_path)
 
 
-def parse_directory(directory: str | Path, **kwargs: Any) -> list[dict[str, Any]]:
+def parse_directory(directory: str | Path, **kwargs: Any) -> List[dict[str, Any]]:
     """Удобная функция парсинга директории."""
     parser = DocumentParser(
         chunk_size=kwargs.pop("chunk_size", 1200),
