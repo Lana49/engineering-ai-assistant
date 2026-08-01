@@ -13,6 +13,7 @@ from typing import Any
 
 from core.prompts import get_quick_definition
 from core.retrieval_memory import RetrievalMemory
+from core.table_extractor import extract_tables, tables_to_dicts
 
 # Правильный импорт конфига
 try:
@@ -120,7 +121,7 @@ class AgentLoop:
             step6 = self._generate_final_response(step4.result, step5.result, context_info)
             self.reasoning_steps.append(step6)
 
-            final_response = self._format_response(step6.result, context_info, query_type)
+            final_response = self._format_response(step6.result, query_type)
 
             if step5.result and step5.result.get("needs_clarification", False):
                 final_response["needs_clarification"] = True
@@ -345,13 +346,7 @@ class AgentLoop:
         reranked.sort(key=lambda x: x.get("score", 0.0), reverse=True)
         return reranked
 
-    def _search_chunks(
-        self,
-        query: str,
-        query_type: QueryType,
-        entities: dict[str, Any] | None = None,
-        keywords: list[str] | None = None,
-    ) -> ReasoningStep:
+    def _search_chunks(self, query, query_type, entities=None, keywords=None):
         """Расширенный поиск по индексу с памятью и повторным ранжированием."""
         step = ReasoningStep(
             step_id=2,
@@ -401,12 +396,13 @@ class AgentLoop:
             enriched_chunks = []
             for chunk in reranked:
                 text = chunk.get("text", "")
-                tables = self._extract_tables(text, chunk.get("doc_name", ""))
+                # Используем extract_tables из table_extractor
+                tables = extract_tables(text, chunk.get("doc_name", ""))
                 formulas = self._extract_formulas(text)
 
                 enriched_chunks.append({
                     **chunk,
-                    "tables": tables,
+                    "tables": tables_to_dicts(tables),
                     "formulas": formulas
                 })
 
@@ -426,49 +422,7 @@ class AgentLoop:
 
         return step
 
-    @staticmethod
-    def _extract_tables(text: str, doc_name: str) -> list[dict[str, Any]]:
-        """Извлекает таблицы из текста."""
-        tables = []
-        lines = text.split("\n")
-        in_table = False
-        table_lines = []
-        table_title = ""
-
-        for i, line in enumerate(lines):
-            if "[ТАБЛИЦА" in line:
-                in_table = True
-                table_lines = []
-                if i > 0 and len(lines[i - 1].strip()) < 100:
-                    table_title = lines[i - 1].strip()
-                else:
-                    table_title = f"Таблица {len(tables) + 1}"
-                continue
-
-            if in_table:
-                if line.strip() == "":
-                    if table_lines:
-                        tables.append({
-                            "title": table_title,
-                            "content": "\n".join(table_lines),
-                            "rows": [l for l in table_lines if l.strip()],
-                            "doc_name": doc_name
-                        })
-                        table_lines = []
-                        table_title = ""
-                    in_table = False
-                else:
-                    table_lines.append(line.strip())
-
-        if table_lines:
-            tables.append({
-                "title": table_title,
-                "content": "\n".join(table_lines),
-                "rows": [l for l in table_lines if l.strip()],
-                "doc_name": doc_name
-            })
-
-        return tables
+    # УДАЛЕНА _extract_tables — используем из table_extractor
 
     @staticmethod
     def _extract_formulas(text: str) -> list[dict[str, Any]]:
@@ -1060,7 +1014,6 @@ class AgentLoop:
     def _format_response(
         self,
         result: dict[str, Any],
-        context: ContextInfo,
         query_type: QueryType
     ) -> dict[str, Any]:
         """Форматирует ответ."""

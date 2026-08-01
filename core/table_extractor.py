@@ -1,206 +1,180 @@
 # core/table_extractor.py
 """
-Модуль для интеллектуального извлечения таблиц из текста.
+Извлечение таблиц из текстов документов.
+Единый источник для всех операций с таблицами.
 """
 
 from __future__ import annotations
 
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
-try:
-    import pandas as pd
-    PANDAS_AVAILABLE = True
-except ImportError:
-    pd = None
-    PANDAS_AVAILABLE = False
 
-
-@dataclass(slots=True)
+@dataclass
 class ExtractedTable:
-    """Класс для хранения извлечённой таблицы."""
-    title: str
-    headers: list[str]
-    rows: list[list[str]]
-    raw_text: str
-    source: str
+    """Структура извлечённой таблицы."""
+    title: str = ""
+    headers: list[str] = field(default_factory=list)
+    rows: list[list[str]] = field(default_factory=list)
+    raw_text: str = ""
+    source: str = ""
     confidence: float = 0.0
-
-    def to_markdown(self) -> str:
-        """Преобразует таблицу в Markdown."""
-        if not self.headers or not self.rows:
-            return f"**{self.title}**\n\n(Таблица пуста или не распознана)"
-
-        lines = [
-            f"**{self.title}**",
-            "",
-            "| " + " | ".join(self.headers) + " |",
-            "| " + " | ".join(["---"] * len(self.headers)) + " |",
-        ]
-
-        for row in self.rows[:20]:
-            padded = row + [""] * (len(self.headers) - len(row))
-            visible = padded[:len(self.headers)]
-            lines.append("| " + " | ".join(str(cell).strip()[:80] for cell in visible) + " |")
-
-        if len(self.rows) > 20:
-            lines.append(f"*... и ещё {len(self.rows) - 20} строк*")
-
-        return "\n".join(lines)
-
-    def to_dataframe(self):
-        """Преобразует в pandas DataFrame."""
-        if not PANDAS_AVAILABLE or pd is None:
-            return None
-
-        if not self.headers:
-            return pd.DataFrame(self.rows)
-
-        rows_padded: list[list[str]] = []
-        for row in self.rows:
-            padded = row + [""] * (len(self.headers) - len(row))
-            rows_padded.append(padded[:len(self.headers)])
-
-        return pd.DataFrame(rows_padded, columns=self.headers)
+    metadata: dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
-        """Преобразует в словарь для JSON."""
+        """Преобразует в словарь для JSON-сериализации."""
         return {
             "title": self.title,
             "headers": self.headers,
-            "rows": self.rows[:50],
-            "row_count": len(self.rows),
+            "rows": self.rows,
+            "content": self.raw_text,
+            "raw_text": self.raw_text,
+            "doc_name": self.source,
             "source": self.source,
             "confidence": self.confidence,
+            "metadata": self.metadata,
+            "row_count": len(self.rows),
         }
+
+    def is_valid(self, min_rows: int = 2) -> bool:
+        """Проверяет, что таблица содержит достаточно данных."""
+        return len(self.rows) >= min_rows and bool(self.raw_text.strip())
 
 
 class TableExtractor:
-    """Извлекает таблицы из текста по структурным признакам."""
+    """
+    Извлекает таблицы из текста различными методами.
+    """
 
-    def __init__(self) -> None:
-        self._cache: dict[str, list[ExtractedTable]] = {}
+    def __init__(self):
+        self._seen: set[tuple[str, str]] = set()
 
-    def extract(self, text: str, source: str = "", min_rows: int = 2) -> list[ExtractedTable]:
-        """Извлекает таблицы из текста."""
+    def extract(
+        self,
+        text: str,
+        source: str = "",
+        min_rows: int = 2,
+        max_tables: int = 10,
+    ) -> list[ExtractedTable]:
+        """Извлекает таблицы из текста всеми доступными методами."""
         if not text or not text.strip():
             return []
 
-        cache_key = f"{source}_{hash(text[:1000])}_{min_rows}"
-        if cache_key in self._cache:
-            return self._cache[cache_key]
+        all_tables: list[ExtractedTable] = []
 
-        tables: list[ExtractedTable] = []
-        tables.extend(self._extract_pipe_tables(text, source))
-        tables.extend(self._extract_marker_tables(text, source))
-        tables.extend(self._extract_aligned_tables(text, source))
-        tables.extend(self._extract_keyword_tables(text, source))
+        # 1. Таблицы с маркером [ТАБЛИЦА ...]
+        marker_tables = self._extract_marker_tables(text, source)
+        all_tables.extend(marker_tables)
 
-        unique_tables = self._deduplicate_tables(tables)
-        unique_tables.sort(key=lambda item: item.confidence, reverse=True)
+        # 2. Таблицы в Markdown-формате (с |)
+        pipe_tables = self._extract_pipe_tables(text, source)
+        all_tables.extend(pipe_tables)
 
-        filtered = [table for table in unique_tables if len(table.rows) >= min_rows]
-        self._cache[cache_key] = filtered
-        return filtered
+        # 3. Таблицы по выравниванию (пробелы)
+        aligned_tables = self._extract_aligned_tables(text, source)
+        all_tables.extend(aligned_tables)
 
-    def _extract_pipe_tables(self, text: str, source: str) -> list[ExtractedTable]:
-        """Извлекает таблицы с разделителями |."""
-        tables: list[ExtractedTable] = []
-        lines = text.splitlines()
-        i = 0
+        # 4. Таблицы по ключевым словам
+        keyword_tables = self._extract_keyword_tables(text, source)
+        all_tables.extend(keyword_tables)
 
-        while i < len(lines):
-            line = lines[i].strip()
-            if "|" in line and len([p for p in line.split("|") if p.strip()]) >= 2:
-                title = self._find_title(lines, i)
-                table_lines: list[str] = []
-                j = i
+        # Дедупликация и фильтрация
+        unique_tables = self._deduplicate_tables(all_tables)
+        valid_tables = [t for t in unique_tables if t.is_valid(min_rows)]
+        valid_tables.sort(key=lambda t: t.confidence, reverse=True)
 
-                while j < len(lines) and "|" in lines[j]:
-                    current = lines[j].strip()
-                    if current:
-                        table_lines.append(current)
-                    j += 1
-
-                if len(table_lines) >= 2:
-                    headers, rows = self._parse_pipe_table(table_lines)
-                    if headers or rows:
-                        tables.append(
-                            ExtractedTable(
-                                title=title,
-                                headers=headers,
-                                rows=rows,
-                                raw_text="\n".join(table_lines),
-                                source=source,
-                                confidence=0.90,
-                            )
-                        )
-                i = j
-            else:
-                i += 1
-
-        return tables
+        return valid_tables[:max_tables]
 
     def _extract_marker_tables(self, text: str, source: str) -> list[ExtractedTable]:
-        """Извлекает таблицы по маркеру [ТАБЛИЦА]."""
-        tables: list[ExtractedTable] = []
-        lines = text.splitlines()
+        """Извлекает таблицы по маркеру [ТАБЛИЦА ...]."""
+        tables = []
+        lines = text.split("\n")
         in_table = False
-        table_lines: list[str] = []
-        title = "Таблица"
+        table_lines = []
+        table_title = ""
 
         for i, line in enumerate(lines):
-            stripped = line.strip()
-
-            if "[ТАБЛИЦА]" in stripped:
+            if "[ТАБЛИЦА" in line:
                 in_table = True
                 table_lines = []
+
                 if i > 0 and len(lines[i - 1].strip()) < 100:
-                    title = lines[i - 1].strip() or "Таблица"
+                    table_title = lines[i - 1].strip()
+                else:
+                    table_title = f"Таблица {len(tables) + 1}"
                 continue
 
             if in_table:
-                if not stripped:
+                if line.strip() == "":
                     if table_lines:
-                        headers, rows = self._parse_plain_table(table_lines)
-                        if rows:
-                            tables.append(
-                                ExtractedTable(
-                                    title=title,
-                                    headers=headers,
-                                    rows=rows,
-                                    raw_text="\n".join(table_lines),
-                                    source=source,
-                                    confidence=0.85,
-                                )
-                            )
+                        table = self._build_table_from_lines(
+                            table_lines, table_title, source, confidence=0.95
+                        )
+                        if table.is_valid():
+                            tables.append(table)
+                        table_lines = []
+                        table_title = ""
                     in_table = False
-                    title = "Таблица"
-                    table_lines = []
                 else:
-                    table_lines.append(stripped)
+                    table_lines.append(line.strip())
 
         if in_table and table_lines:
-            headers, rows = self._parse_plain_table(table_lines)
-            if rows:
-                tables.append(
-                    ExtractedTable(
-                        title=title,
-                        headers=headers,
-                        rows=rows,
-                        raw_text="\n".join(table_lines),
-                        source=source,
-                        confidence=0.80,
+            table = self._build_table_from_lines(
+                table_lines, table_title, source, confidence=0.95
+            )
+            if table.is_valid():
+                tables.append(table)
+
+        return tables
+
+    def _extract_pipe_tables(self, text: str, source: str) -> list[ExtractedTable]:
+        """Извлекает Markdown-таблицы с разделителями |."""
+        tables = []
+        lines = text.split("\n")
+        table_lines = []
+        in_table = False
+
+        for line in lines:
+            if "|" in line:
+                stripped = line.strip()
+                if stripped.count("|") >= 2:
+                    if not in_table:
+                        in_table = True
+                        table_lines = []
+                    table_lines.append(stripped)
+                else:
+                    if in_table and table_lines:
+                        table = self._build_table_from_pipe_lines(
+                            table_lines, source, confidence=0.85
+                        )
+                        if table.is_valid():
+                            tables.append(table)
+                        table_lines = []
+                    in_table = False
+            else:
+                if in_table and table_lines:
+                    table = self._build_table_from_pipe_lines(
+                        table_lines, source, confidence=0.85
                     )
-                )
+                    if table.is_valid():
+                        tables.append(table)
+                    table_lines = []
+                in_table = False
+
+        if in_table and table_lines:
+            table = self._build_table_from_pipe_lines(
+                table_lines, source, confidence=0.85
+            )
+            if table.is_valid():
+                tables.append(table)
 
         return tables
 
     def _extract_aligned_tables(self, text: str, source: str) -> list[ExtractedTable]:
-        """Извлекает таблицы по выравниванию текста в колонки."""
-        tables: list[ExtractedTable] = []
-        lines = text.splitlines()
+        """Извлекает таблицы по выравниванию текста."""
+        tables = []
+        lines = text.split("\n")
         i = 0
 
         while i < len(lines):
@@ -209,382 +183,297 @@ class TableExtractor:
                 i += 1
                 continue
 
-            parts = re.split(r"\s{3,}", line)
-            if len(parts) >= 3:
-                title = self._find_title(lines, i)
-                table_lines = [line]
-                j = i + 1
+            if re.search(r"\d+\s*[мМ]?[м²³]?[°С]?", line):
+                parts = re.split(r"\s{2,}", line)
+                if len(parts) >= 3:
+                    table_lines = [line]
+                    j = i + 1
 
-                while j < len(lines):
-                    next_line = lines[j].strip()
-                    next_parts = re.split(r"\s{3,}", next_line)
-                    if next_line and len(next_parts) >= 3:
-                        table_lines.append(next_line)
-                        j += 1
-                    else:
-                        break
+                    while j < len(lines):
+                        next_line = lines[j].strip()
+                        if not next_line:
+                            break
+                        next_parts = re.split(r"\s{2,}", next_line)
+                        if len(next_parts) >= 3 and any(
+                            re.search(r"\d", p) for p in next_parts
+                        ):
+                            table_lines.append(next_line)
+                            j += 1
+                        else:
+                            break
 
-                if len(table_lines) >= 2:
-                    parsed_rows = [re.split(r"\s{3,}", item.strip()) for item in table_lines]
-                    parsed_rows = [row for row in parsed_rows if any(cell.strip() for cell in row)]
-
-                    if len(parsed_rows) >= 2:
-                        headers = [cell.strip() for cell in parsed_rows[0]]
-                        rows = [[cell.strip() for cell in row] for row in parsed_rows[1:]]
-                        tables.append(
-                            ExtractedTable(
-                                title=title,
-                                headers=headers,
-                                rows=rows,
-                                raw_text="\n".join(table_lines),
-                                source=source,
-                                confidence=0.60,
-                            )
+                    if len(table_lines) >= 3:
+                        table = self._build_table_from_aligned_lines(
+                            table_lines, source, confidence=0.7
                         )
-                i = j
-            else:
-                i += 1
+                        if table.is_valid():
+                            tables.append(table)
+                        i = j
+                        continue
+            i += 1
 
         return tables
 
     def _extract_keyword_tables(self, text: str, source: str) -> list[ExtractedTable]:
         """Извлекает таблицы по ключевым словам."""
-        tables: list[ExtractedTable] = []
+        tables = []
         keywords = [
-            "таблица", "табл", "table",
-            "показатели", "значения", "параметры",
-            "данные", "список", "перечень",
-            "температура", "давление", "расход",
-            "город", "регион", "климат",
+            "таблица", "табл", "таблиц", "показатели", "значения",
+            "параметры", "характеристики", "нормативы", "требования",
         ]
 
-        lines = text.splitlines()
+        lines = text.split("\n")
+        i = 0
 
-        for i, line in enumerate(lines):
-            line_lower = line.lower().strip()
-            has_keyword = any(keyword in line_lower for keyword in keywords)
-            has_numbers = bool(re.search(r"\d+[.,]?\d*", line))
-
-            if has_keyword and has_numbers and len(line.strip()) > 30:
-                table_lines = [line.strip()]
+        while i < len(lines):
+            line_lower = lines[i].strip().lower()
+            if any(kw in line_lower for kw in keywords) and ":" in lines[i]:
+                title = lines[i].strip()
+                table_lines = []
                 j = i + 1
-                collected = 0
 
-                while j < len(lines) and collected < 10:
+                while j < len(lines):
                     next_line = lines[j].strip()
-
-                    if next_line and re.search(r"\d+[.,]?\d*", next_line):
+                    if not next_line:
+                        break
+                    if any(kw in next_line.lower() for kw in keywords):
+                        break
+                    if re.search(r"\d+\s*[мМ]?[м²³]?[°С]?", next_line):
                         table_lines.append(next_line)
-                        collected += 1
-                    elif next_line and len(next_line) < 80 and table_lines:
-                        table_lines[-1] += " " + next_line
+                    elif len(next_line) > 50 and j < i + 5:
+                        table_lines.append(next_line)
                     else:
                         break
-
                     j += 1
 
-                if len(table_lines) >= 3:
-                    headers, rows = self._parse_plain_table(table_lines)
-                    if rows:
-                        prev_title = lines[i - 1].strip() if i > 0 else ""
-                        title = prev_title if prev_title and len(prev_title) < 80 else "Таблица"
-                        tables.append(
-                            ExtractedTable(
-                                title=title,
-                                headers=headers,
-                                rows=rows,
-                                raw_text="\n".join(table_lines),
-                                source=source,
-                                confidence=0.50,
-                            )
-                        )
+                if len(table_lines) >= 2:
+                    table = self._build_table_from_keyword_lines(
+                        table_lines, title, source, confidence=0.6
+                    )
+                    if table.is_valid():
+                        tables.append(table)
+                    i = j
+                    continue
+            i += 1
 
         return tables
 
     @staticmethod
-    def _find_title(lines: list[str], index: int) -> str:
-        """Находит заголовок таблицы."""
-        for j in range(max(0, index - 3), index):
-            line = lines[j].strip()
-            if line and len(line) < 100 and not line.startswith("|") and "|" not in line:
-                return line
-        return "Таблица"
+    def _build_table_from_lines(
+        lines: list[str],
+        title: str,
+        source: str,
+        confidence: float = 0.8,
+    ) -> ExtractedTable:
+        """Строит таблицу из строк."""
+        rows = []
+        for line in lines:
+            line = line.strip()
+            if line:
+                if "\t" in line:
+                    parts = line.split("\t")
+                else:
+                    parts = re.split(r"\s{2,}", line)
+                if len(parts) > 1:
+                    rows.append([p.strip() for p in parts])
+                else:
+                    rows.append([line])
+
+        headers = rows[0] if rows and len(rows) > 0 else []
+        data_rows = rows[1:] if len(rows) > 1 else []
+
+        return ExtractedTable(
+            title=title,
+            headers=headers,
+            rows=data_rows,
+            raw_text="\n".join(lines),
+            source=source,
+            confidence=confidence,
+        )
 
     @staticmethod
-    def _parse_pipe_table(lines: list[str]) -> tuple[list[str], list[list[str]]]:
-        """Парсит таблицу с разделителями |."""
-        if not lines:
-            return [], []
+    def _build_table_from_pipe_lines(
+        lines: list[str],
+        source: str,
+        confidence: float = 0.85,
+    ) -> ExtractedTable:
+        """Строит таблицу из строк с разделителями |."""
+        rows = []
+        title = f"Таблица из {source}" if source else "Таблица"
 
-        cleaned_lines = [line for line in lines if line.strip()]
-        if len(cleaned_lines) < 2:
-            return [], []
+        for line in lines:
+            line = line.strip()
+            if line:
+                if line.startswith("|"):
+                    line = line[1:]
+                if line.endswith("|"):
+                    line = line[:-1]
+                parts = [p.strip() for p in line.split("|")]
+                if any(parts):
+                    rows.append(parts)
 
-        if re.match(r"^\s*\|?\s*:?-+:?\s*(\|\s*:?-+:?\s*)+\|?\s*$", cleaned_lines[1]):
-            header_line = cleaned_lines[0]
-            data_lines = cleaned_lines[2:]
-        else:
-            header_line = cleaned_lines[0]
-            data_lines = cleaned_lines[1:]
+        filtered_rows = []
+        for row in rows:
+            if not all(p.replace("-", "").strip() == "" for p in row):
+                filtered_rows.append(row)
 
-        headers = TableExtractor._split_pipe_line(header_line)
-        rows: list[list[str]] = []
+        headers = filtered_rows[0] if filtered_rows else []
+        data_rows = filtered_rows[1:] if len(filtered_rows) > 1 else []
 
-        for line in data_lines:
-            row = TableExtractor._split_pipe_line(line)
-            if row and any(cell.strip() for cell in row):
-                rows.append(row)
-
-        return headers, rows
-
-    @staticmethod
-    def _split_pipe_line(line: str) -> list[str]:
-        """Разбивает строку по |."""
-        if not line:
-            return []
-
-        cleaned = line.strip()
-        if cleaned.startswith("|"):
-            cleaned = cleaned[1:]
-        if cleaned.endswith("|"):
-            cleaned = cleaned[:-1]
-
-        return [cell.strip() for cell in cleaned.split("|")]
+        return ExtractedTable(
+            title=title,
+            headers=headers,
+            rows=data_rows,
+            raw_text="\n".join(lines),
+            source=source,
+            confidence=confidence,
+        )
 
     @staticmethod
-    def _parse_plain_table(lines: list[str]) -> tuple[list[str], list[list[str]]]:
-        """Парсит обычную таблицу без |."""
-        if not lines:
-            return [], []
+    def _build_table_from_aligned_lines(
+        lines: list[str],
+        source: str,
+        confidence: float = 0.7,
+    ) -> ExtractedTable:
+        """Строит таблицу из выровненных строк."""
+        rows = []
+        title = f"Таблица из {source}" if source else "Таблица"
 
-        cleaned_lines = [line for line in lines if line.strip()]
-        if len(cleaned_lines) < 2:
-            return [], []
+        for line in lines:
+            line = line.strip()
+            if line:
+                parts = re.split(r"\s{2,}", line)
+                if len(parts) > 1:
+                    rows.append(parts)
+                else:
+                    rows.append([line])
 
-        first_line = cleaned_lines[0]
-        second_line = cleaned_lines[1]
+        headers = rows[0] if rows and len(rows) > 0 else []
+        data_rows = rows[1:] if len(rows) > 1 else []
 
-        if re.match(r"^[\d\s.,;:%()\-–—/]+$", second_line):
-            headers = TableExtractor._split_by_spaces(first_line)
-            data_lines = cleaned_lines[1:]
-        else:
-            headers = []
-            data_lines = cleaned_lines
-
-        rows: list[list[str]] = []
-        for line in data_lines:
-            row = TableExtractor._split_by_spaces(line)
-            if row and any(cell.strip() for cell in row):
-                rows.append(row)
-
-        return headers, rows
-
-    @staticmethod
-    def _split_by_spaces(line: str) -> list[str]:
-        """Разбивает строку по группам пробелов."""
-        parts = re.split(r"\s{2,}", line.strip())
-        if len(parts) >= 2:
-            return [part.strip() for part in parts if part.strip()]
-        return [part.strip() for part in line.strip().split() if part.strip()]
+        return ExtractedTable(
+            title=title,
+            headers=headers,
+            rows=data_rows,
+            raw_text="\n".join(lines),
+            source=source,
+            confidence=confidence,
+        )
 
     @staticmethod
-    def _deduplicate_tables(tables: list[ExtractedTable]) -> list[ExtractedTable]:
+    def _build_table_from_keyword_lines(
+        lines: list[str],
+        title: str,
+        source: str,
+        confidence: float = 0.6,
+    ) -> ExtractedTable:
+        """Строит таблицу из строк по ключевым словам."""
+        rows = []
+        for line in lines:
+            line = line.strip()
+            if line:
+                if "\t" in line:
+                    parts = line.split("\t")
+                else:
+                    parts = re.split(r"\s{2,}", line)
+                if len(parts) > 1:
+                    rows.append([p.strip() for p in parts])
+                else:
+                    rows.append([line])
+
+        headers = rows[0] if rows and len(rows) > 0 else []
+        data_rows = rows[1:] if len(rows) > 1 else []
+
+        return ExtractedTable(
+            title=title,
+            headers=headers,
+            rows=data_rows,
+            raw_text="\n".join(lines),
+            source=source,
+            confidence=confidence,
+        )
+
+    @staticmethod
+    def _deduplicate_tables(
+        tables: list[ExtractedTable],
+    ) -> list[ExtractedTable]:
         """Удаляет дубликаты таблиц."""
-        seen: set[tuple[str, str, str]] = set()
-        unique_tables: list[ExtractedTable] = []
+        unique = []
+        seen: set[tuple[str, str]] = set()
 
         for table in tables:
-            key = (
-                table.source.strip().lower(),
-                table.title.strip().lower(),
-                table.raw_text[:200].strip(),
-            )
+            key = (table.source, table.raw_text[:200])
             if key not in seen:
                 seen.add(key)
-                unique_tables.append(table)
+                unique.append(table)
 
-        return unique_tables
-
-    def deduplicate_tables(self, tables: list[ExtractedTable]) -> list[ExtractedTable]:
-        """Публичный метод для дедупликации таблиц."""
-        return self._deduplicate_tables(tables)
-
-    def extract_from_chunks(self, chunks: list[dict[str, Any]], source: str = "") -> list[ExtractedTable]:
-        """Извлекает таблицы из списка фрагментов."""
-        all_tables: list[ExtractedTable] = []
-
-        for chunk in chunks:
-            text = str(chunk.get("text", "") or "")
-            doc_name = str(chunk.get("doc_name") or chunk.get("docname") or source)
-            if not text.strip():
-                continue
-            tables = self.extract(text, doc_name)
-            all_tables.extend(tables)
-
-        return self._deduplicate_tables(all_tables)
-
-    def search_table(self, query: str, chunks: list[dict[str, Any]]) -> ExtractedTable | None:
-        """Ищет таблицу по запросу."""
-        all_tables = self.extract_from_chunks(chunks)
-        if not all_tables:
-            return None
-
-        query_lower = query.lower().strip()
-        scored_tables: list[tuple[ExtractedTable, float]] = []
-
-        for table in all_tables:
-            score = 0.0
-
-            if query_lower in table.title.lower():
-                score += 1.0
-
-            for header in table.headers:
-                if query_lower in header.lower():
-                    score += 0.3
-
-            for row in table.rows:
-                row_text = " ".join(row).lower()
-                if query_lower in row_text:
-                    score += 0.5
-
-            score += table.confidence * 0.2
-            scored_tables.append((table, score))
-
-        scored_tables.sort(key=lambda item: item[1], reverse=True)
-        return scored_tables[0][0] if scored_tables and scored_tables[0][1] > 0 else None
-
-    @staticmethod
-    def format_table_for_response(table: ExtractedTable | None) -> str:
-        """Форматирует таблицу для ответа пользователю."""
-        if not table:
-            return "Таблица не найдена"
-
-        lines = [
-            f"**📊 {table.title}**",
-            f"*Источник: {table.source}*",
-            "",
-            table.to_markdown(),
-            "",
-            f"*Всего строк: {len(table.rows)}*",
-        ]
-        return "\n".join(lines)
+        return unique
 
 
-def patch_qa_system_with_table_extractor() -> None:
-    """Добавляет улучшенное извлечение таблиц в QASystem."""
-    try:
-        from core.qa_engine import QASystem
-    except ImportError:
-        try:
-            from core.qaengine import QASystem
-        except ImportError:
-            return
+# ========= УДОБНЫЕ ФУНКЦИИ ДЛЯ ИМПОРТА =========
 
-    def enhanced_answer(self, question: str, top_k: int = 5) -> dict[str, Any]:
-        """Улучшенный ответ с распознаванием таблиц."""
-        extractor = TableExtractor()
+def extract_tables(text: str, doc_name: str = "", min_rows: int = 2) -> list[ExtractedTable]:
+    """Быстрый импорт: извлекает таблицы из текста."""
+    extractor = TableExtractor()
+    return extractor.extract(text, source=doc_name, min_rows=min_rows)
 
-        if hasattr(self, "search_with_formulas"):
-            result = self.search_with_formulas(question, top_k)
-            relevant = result.get("results", []) if isinstance(result, dict) else []
-            all_formulas = result.get("formulas", []) if isinstance(result, dict) else []
+
+def extract_tables_from_results(results: list[Any], min_rows: int = 2, limit: int = 3) -> list[ExtractedTable]:
+    """Извлекает таблицы из результатов поиска."""
+    extractor = TableExtractor()
+    all_tables: list[ExtractedTable] = []
+    seen: set[tuple[str, str]] = set()
+
+    for result in results[:limit]:
+        if hasattr(result, "text"):
+            text = getattr(result, "text", "")
+            doc_name = getattr(result, "doc_name", "Документ")
+        elif isinstance(result, dict):
+            text = result.get("text", "")
+            doc_name = result.get("doc_name", "Документ")
         else:
-            relevant = self.search(question, top_k=top_k) if hasattr(self, "search") else []
-            all_formulas = []
+            continue
 
-        if not relevant:
-            return {
-                "question": question,
-                "answer": "❌ Информация по вашему вопросу не найдена в документации.",
-                "sources": [],
-                "tables": [],
-                "formulas": [],
-            }
+        if not text.strip():
+            continue
 
-        all_tables: list[ExtractedTable] = []
+        tables = extractor.extract(text, source=doc_name, min_rows=min_rows)
+        for table in tables:
+            key = (table.source, table.raw_text[:200])
+            if key not in seen:
+                seen.add(key)
+                all_tables.append(table)
 
-        for chunk in relevant:
-            if not isinstance(chunk, dict):
-                continue
-            chunk_text = str(chunk.get("text", "") or "")
-            chunk_doc = str(chunk.get("doc_name") or chunk.get("docname") or "")
-            tables = extractor.extract(chunk_text, chunk_doc)
-            all_tables.extend(tables)
+    return all_tables
 
-        unique_tables = extractor.deduplicate_tables(all_tables)
 
-        if hasattr(self, "is_bad_chunk"):
-            cleaned_chunks = [
-                chunk for chunk in relevant
-                if isinstance(chunk, dict) and not self.is_bad_chunk(str(chunk.get("text", "")))
-            ]
-        else:
-            cleaned_chunks = [chunk for chunk in relevant if isinstance(chunk, dict)]
+def find_city_in_tables(tables: list[ExtractedTable], city: str) -> dict[str, Any] | None:
+    """Ищет город в таблицах и возвращает информацию о найденной строке."""
+    city_lower = city.lower().strip()
 
-        if not cleaned_chunks:
-            cleaned_chunks = [chunk for chunk in relevant[:2] if isinstance(chunk, dict)]
+    for table in tables:
+        for idx, row in enumerate(table.rows):
+            if isinstance(row, list):
+                for cell in row:
+                    if city_lower in str(cell).lower():
+                        return {
+                            "table": table,
+                            "row": row,
+                            "index": idx,
+                            "row_text": " ".join(str(c) for c in row)
+                        }
+            elif isinstance(row, str):
+                if city_lower in row.lower():
+                    return {
+                        "table": table,
+                        "row": row,
+                        "index": idx,
+                        "row_text": row
+                    }
 
-        answer_lines = ["**📌 Краткий ответ:**"]
+    return None
 
-        first_text = str(cleaned_chunks[0].get("text", "")).strip() if cleaned_chunks else ""
-        if first_text:
-            first_sentence = re.split(r"(?<=[.!?])\s+", first_text)[0].strip()
-            answer_lines.append(first_sentence if first_sentence else "Найдена релевантная информация в документации.")
-            answer_lines.append("")
-        else:
-            answer_lines.append("Найдена релевантная информация в документации.")
-            answer_lines.append("")
 
-        if unique_tables:
-            answer_lines.append("**📊 Найденные таблицы:**")
-            answer_lines.append("")
-
-            for i, table in enumerate(unique_tables[:2], start=1):
-                answer_lines.append(f"**Таблица {i}: {table.title}**")
-                answer_lines.append(f"*Источник: {table.source}*")
-                answer_lines.append("")
-
-                if table.headers:
-                    visible_headers = table.headers[:6]
-                    answer_lines.append("| " + " | ".join(visible_headers) + " |")
-                    answer_lines.append("| " + " | ".join(["---"] * len(visible_headers)) + " |")
-
-                    for row in table.rows[:5]:
-                        padded = row + [""] * (len(visible_headers) - len(row))
-                        answer_lines.append(
-                            "| " + " | ".join(str(cell).strip()[:30] for cell in padded[:len(visible_headers)]) + " |"
-                        )
-                else:
-                    for row in table.rows[:5]:
-                        answer_lines.append("- " + " | ".join(str(cell).strip() for cell in row[:6]))
-
-                if len(table.rows) > 5:
-                    answer_lines.append(f"*... и ещё {len(table.rows) - 5} строк*")
-
-                answer_lines.append("")
-
-        if all_formulas:
-            answer_lines.append("**📐 Найденные формулы:**")
-            for formula in all_formulas[:3]:
-                if isinstance(formula, dict):
-                    raw = str(formula.get("raw", "") or "")
-                    if raw:
-                        answer_lines.append(f"`{raw}`")
-
-        answer_lines.append("")
-        answer_lines.append("**📚 Источники:**")
-        for src in cleaned_chunks[:2]:
-            src_name = src.get("doc_name") or src.get("docname") or "Документ"
-            score = float(src.get("score", 0) or 0)
-            answer_lines.append(f"• {src_name} (релевантность: {score:.2f})")
-
-        return {
-            "question": question,
-            "answer": "\n".join(answer_lines),
-            "sources": cleaned_chunks,
-            "tables": [table.to_dict() for table in unique_tables[:5]],
-            "formulas": all_formulas[:5],
-            "_raw_tables": unique_tables,
-        }
-
-    QASystem.answer = enhanced_answer
+def tables_to_dicts(tables: list[ExtractedTable]) -> list[dict[str, Any]]:
+    """Преобразует список ExtractedTable в список словарей."""
+    return [t.to_dict() for t in tables]

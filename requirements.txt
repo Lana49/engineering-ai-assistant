@@ -38,8 +38,7 @@ plotly>=5.10.0
 networkx>=3.0
 
 # LLM
-google-generativeai>=0.8.0
-openai>=1.0.0
+google-genai>=1.0.0
 
 # Utils
 python-magic>=0.4.27

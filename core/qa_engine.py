@@ -1,15 +1,6 @@
 # -*- coding: utf-8 -*-
 """
 QA Engine для инженерной документации.
-
-Поддерживает:
-- Гибридный поиск: semantic + lexical
-- SentenceTransformers embeddings
-- TF-IDF fallback
-- LLM-ответы через Ollama / Gemini
-- Mixed-режим с автоматическим выбором провайдера
-- Сохранение/загрузка индекса
-- Совместимость с app.py
 """
 
 from __future__ import annotations
@@ -23,6 +14,8 @@ from typing import Any
 
 import numpy as np
 import requests
+
+from core.table_extractor import extract_tables_from_results, tables_to_dicts
 
 try:
     from dotenv import load_dotenv
@@ -40,10 +33,13 @@ try:
 except ImportError:
     SentenceTransformer = None
 
+# НОВЫЙ SDK — google.genai
 try:
-    import google.generativeai as genai
+    import google.genai as genai
+    GENAI_AVAILABLE = True
 except ImportError:
     genai = None
+    GENAI_AVAILABLE = False
 
 
 @dataclass(slots=True)
@@ -97,12 +93,19 @@ class QASystem:
         self.ollama_base_url = ollama_base_url.rstrip("/")
         self.ollama_model = ollama_model or "llama3.1:8b"
 
+        # Gemini — через google.genai
         self.gemini_api_key = (gemini_api_key or os.getenv("GEMINI_API_KEY", "")).strip()
         self.gemini_model = gemini_model or "gemini-2.0-flash"
-        self.gemini_available = bool(self.gemini_api_key) and genai is not None
+        self.gemini_available = bool(self.gemini_api_key) and GENAI_AVAILABLE
+        self.genai_client: Any = None  # ← ИСПРАВЛЕНО: явная аннотация типа
 
         if self.gemini_available and genai is not None:
-            genai.configure(api_key=self.gemini_api_key)
+            try:
+                self.genai_client = genai.Client(api_key=self.gemini_api_key)
+                print(f"✅ Gemini клиент инициализирован (модель: {self.gemini_model})")
+            except Exception as e:
+                print(f"⚠️ Ошибка инициализации Gemini: {e}")
+                self.gemini_available = False
 
         if model_name:
             if self.llm_provider in {"ollama", "mixed"}:
@@ -119,7 +122,7 @@ class QASystem:
         self.chunks: list[dict[str, Any]] = []
 
         self.embedding_model: SentenceTransformer | None = None
-        self.chunk_embeddings: np.ndarray | None = None
+        self.chunk_embeddings: np.ndarray | None = None  # ← ИСПРАВЛЕНО: тип
 
         self.vectorizer: TfidfVectorizer | None = None
         self.tfidf_matrix: Any = None
@@ -154,10 +157,22 @@ class QASystem:
         if self.use_llm:
             if self.llm_provider == "ollama":
                 self.llm_available = self.is_ollama_alive()
+                if self.llm_available:
+                    print(f"✅ Ollama доступен (модель: {self.ollama_model})")
+                else:
+                    print(f"⚠️ Ollama недоступен ({self.ollama_base_url})")
             elif self.llm_provider == "gemini":
                 self.llm_available = self.gemini_available
+                if self.llm_available:
+                    print(f"✅ Gemini доступен (модель: {self.gemini_model})")
+                else:
+                    print("⚠️ Gemini недоступен (нет API ключа или не установлен google-genai)")
             elif self.llm_provider == "mixed":
                 self.llm_available = self.is_ollama_alive() or self.gemini_available
+                if self.llm_available:
+                    print("✅ Mixed-режим: хотя бы один LLM доступен")
+                else:
+                    print("⚠️ Mixed-режим: ни один LLM не доступен")
             elif self.llm_provider == "none":
                 self.llm_available = False
 
@@ -221,7 +236,11 @@ class QASystem:
                 max_features=50000,
                 token_pattern=r"(?u)\b[\w\-/\.]+\b",
             )
-            self.tfidf_matrix = self.vectorizer.fit_transform(texts)
+            # ← ИСПРАВЛЕНО: проверка что vectorizer не None
+            if self.vectorizer is not None:
+                self.tfidf_matrix = self.vectorizer.fit_transform(texts)
+            else:
+                self.tfidf_matrix = None
         else:
             self.vectorizer = None
             self.tfidf_matrix = None
@@ -234,7 +253,8 @@ class QASystem:
                     normalize_embeddings=True,
                     show_progress_bar=False,
                 )
-                self.chunk_embeddings = np.asarray(embeddings, dtype=np.float32)
+                # ← ИСПРАВЛЕНО: корректное использование np.asarray
+                self.chunk_embeddings = np.asarray(embeddings, dtype=np.float32)  # type: ignore
             except Exception as e:
                 print(f"⚠️ Ошибка построения эмбеддингов: {e}")
                 self.chunk_embeddings = None
@@ -362,8 +382,8 @@ class QASystem:
                 normalize_embeddings=True,
                 show_progress_bar=False,
             )
-            query_emb = np.asarray(query_emb, dtype=np.float32)[0]
-            scores = np.dot(self.chunk_embeddings, query_emb)
+            query_emb = np.asarray(query_emb, dtype=np.float32)[0]  # type: ignore
+            scores = np.dot(self.chunk_embeddings, query_emb)  # type: ignore
 
             sorted_indices = np.argsort(scores)[::-1][:top_k]
             results: list[SearchResult] = []
@@ -436,8 +456,8 @@ class QASystem:
                     normalize_embeddings=True,
                     show_progress_bar=False,
                 )
-                query_emb = np.asarray(query_emb, dtype=np.float32)[0]
-                semantic_scores = np.dot(self.chunk_embeddings, query_emb)
+                query_emb = np.asarray(query_emb, dtype=np.float32)[0]  # type: ignore
+                semantic_scores = np.dot(self.chunk_embeddings, query_emb)  # type: ignore
             except Exception as e:
                 print(f"⚠️ Ошибка semantic части hybrid search: {e}")
 
@@ -483,12 +503,7 @@ class QASystem:
 
         return results
 
-    def answer(
-        self,
-        question: str,
-        top_k: int | None = None,
-        search_type: str = "hybrid",
-    ) -> dict[str, Any]:
+    def answer(self, question: str, top_k: int | None = None, search_type: str = "hybrid") -> dict[str, Any]:
         """Отвечает на вопрос."""
         results = self.search(question, top_k=top_k, search_type=search_type)
         context = self._build_context(results)
@@ -519,7 +534,7 @@ class QASystem:
                 return {
                     "answer": llm_answer,
                     "sources": self._build_sources(results),
-                    "tables": self._extract_tables_from_results(results),
+                    "tables": tables_to_dicts(extract_tables_from_results(results)),
                     "formulas": self._extract_formulas_from_results(results),
                     "provider": provider,
                     "used_llm": True,
@@ -530,7 +545,7 @@ class QASystem:
         return {
             "answer": fallback_answer,
             "sources": self._build_sources(results),
-            "tables": self._extract_tables_from_results(results),
+            "tables": tables_to_dicts(extract_tables_from_results(results)),
             "formulas": self._extract_formulas_from_results(results),
             "provider": "none",
             "used_llm": False,
@@ -597,23 +612,7 @@ class QASystem:
                 })
         return sources[:5]
 
-    @staticmethod
-    def _extract_tables_from_results(results: list[SearchResult]) -> list[dict[str, Any]]:
-        """Извлекает таблицы."""
-        tables = []
-        for result in results[:3]:
-            text = result.text
-            if "|" in text:
-                lines = [line.strip() for line in text.split("\n") if "|" in line]
-                if lines:
-                    rows = [line.split("|") for line in lines[:10]]
-                    tables.append({
-                        "title": f"Таблица из {result.doc_name}",
-                        "headers": rows[0] if rows else [],
-                        "rows": rows[1:] if len(rows) > 1 else rows,
-                        "content": "\n".join(lines[:10]),
-                    })
-        return tables
+    # ← УДАЛЕНА _extract_tables_from_results — используем из table_extractor
 
     @staticmethod
     def _extract_formulas_from_results(results: list[SearchResult]) -> list[dict[str, Any]]:
@@ -670,15 +669,18 @@ class QASystem:
             return None
 
     def _ask_gemini(self, prompt: str) -> str | None:
-        """Запрос к Gemini."""
-        if not self.gemini_available or genai is None:
+        """Запрос к Gemini через google.genai SDK."""
+        if not self.gemini_available or self.genai_client is None:
             return None
 
         try:
-            model = genai.GenerativeModel(self.gemini_model)
-            response = model.generate_content(prompt)
-            text = getattr(response, "text", None)
-            return text.strip() if text else None
+            response = self.genai_client.models.generate_content(
+                model=self.gemini_model,
+                contents=[prompt],
+            )
+            if hasattr(response, 'text') and response.text:
+                return response.text.strip()
+            return None
         except Exception as e:
             print(f"⚠️ Ошибка Gemini: {e}")
             return None

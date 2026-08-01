@@ -19,6 +19,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from core.table_calculator import TableCalculator
+
 
 @dataclass(slots=True)
 class Material:
@@ -332,7 +334,8 @@ class FormulaEngine:
             formula_meta = self.formulas[formula_key]
             self.reasoning_steps.append(f"Определена формула: {formula_meta['name']}")
 
-            if formula_key == "gsop":
+            # Для ГСОП, вентиляции и теплопотерь пытаемся найти данные в таблице
+            if formula_key in ["gsop", "ventilation_heat", "heat_loss"]:
                 table_result = await self._try_table_calculation(query)
                 if table_result:
                     return table_result
@@ -368,24 +371,70 @@ class FormulaEngine:
             }
 
     async def _try_table_calculation(self, query: str) -> dict[str, Any] | None:
+        """
+        Пытается выполнить расчёт на основе данных из таблицы.
+        Поддерживает: ГСОП, вентиляцию, теплопотери.
+        """
+        import re
+
+        if self._table_calculator is None:
+            self._table_calculator = TableCalculator(self.qa_system)
+
         city = self._extract_city_from_text(query)
         if not city:
             return None
 
+        query_lower = query.lower()
+
+        # Определяем тип расчёта
+        is_ventilation = "вентиляц" in query_lower or "расход теплоты" in query_lower or "нагрев воздуха" in query_lower
+        is_heat_loss = "теплопотер" in query_lower or "потери тепла" in query_lower or "ограждени" in query_lower
+
         try:
-            from core.table_calculator import TableCalculator
+            if is_ventilation:
+                # Ищем расход воздуха
+                flow_match = re.search(r'(\d+[.,]?\d*)\s*м³/ч', query_lower)
+                if not flow_match:
+                    flow_match = re.search(r'расход\s*(\d+[.,]?\d*)', query_lower)
+                    if not flow_match:
+                        flow_match = re.search(r'L\s*=\s*(\d+[.,]?\d*)', query_lower)
 
-            if self._table_calculator is None:
-                self._table_calculator = TableCalculator(self.qa_system)
+                if flow_match:
+                    air_flow = float(flow_match.group(1).replace(',', '.'))
+                    result = self._table_calculator.calculate_ventilation_from_table(city, air_flow)
+                    if result and result.get("answer"):
+                        return result
+                return None
 
-            result = self._table_calculator.calculate_gsop_from_table(city)
-            if isinstance(result, dict) and result.get("answer"):
-                return result
+            elif is_heat_loss:
+                # Ищем площадь и сопротивление
+                area_match = re.search(r'площадь\s*(\d+[.,]?\d*)', query_lower)
+                res_match = re.search(r'сопротивление\s*(\d+[.,]?\d*)', query_lower)
 
-        except (ImportError, AttributeError, TypeError, ValueError):
+                if not area_match:
+                    area_match = re.search(r'A\s*=\s*(\d+[.,]?\d*)', query_lower)
+                if not res_match:
+                    res_match = re.search(r'R\s*=\s*(\d+[.,]?\d*)', query_lower)
+
+                if area_match and res_match:
+                    area = float(area_match.group(1).replace(',', '.'))
+                    resistance = float(res_match.group(1).replace(',', '.'))
+                    result = self._table_calculator.calculate_heat_loss_from_table(city, area, resistance)
+                    if result and result.get("answer"):
+                        return result
+                return None
+
+            else:
+                # По умолчанию — ГСОП
+                result = self._table_calculator.calculate_gsop_from_table(city)
+                if result and result.get("answer"):
+                    return result
+                return None
+
+        except (ImportError, AttributeError, TypeError, ValueError) as e:
+            # Логируем ошибку, но не прерываем выполнение
+            print(f"⚠️ Ошибка при расчёте из таблицы: {e}")
             return None
-
-        return None
 
     def _get_reasoning_chain(self) -> str:
         if not self.reasoning_steps:
