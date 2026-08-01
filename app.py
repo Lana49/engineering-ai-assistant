@@ -412,17 +412,29 @@ def force_rebuild_index(qa: QASystem) -> bool:
         print(f"   embeddings shape: {qa.chunk_embeddings.shape}")
 
     print("💾 Сохраняем индекс...")
+
+    # ПРОВЕРЯЕМ ПРАВА НА ЗАПИСЬ
+    PROCESSED_DIR.mkdir(parents=True, exist_ok=True)
+    print(f"📁 Папка для сохранения: {PROCESSED_DIR}")
+    print(f"📁 Права на запись: {os.access(PROCESSED_DIR, os.W_OK)}")
+
     save_result = qa.save_index(INDEX_FILE)
 
     if save_result:
         print(f"✅ Индекс сохранён: {INDEX_FILE}")
         if INDEX_FILE.exists():
-            print(f"   Размер файла: {INDEX_FILE.stat().st_size} bytes")
+            size = INDEX_FILE.stat().st_size
+            print(f"   Размер файла: {size} bytes")
+            if size < 1000000:  # Меньше 1MB — подозрительно
+                print(f"⚠️ ВНИМАНИЕ: размер индекса слишком мал ({size} bytes)")
+                return False
+        else:
+            print("❌ Файл не найден после сохранения!")
+            return False
     else:
         print("❌ Ошибка сохранения индекса")
-
-    print("=" * 50)
-    return save_result
+        return False
+    return True
 
 
 def init_qa_system() -> QASystem:
