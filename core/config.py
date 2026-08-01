@@ -34,7 +34,7 @@ IS_HF_SPACE = bool(
     or os.getenv("SYSTEM") == "spaces"
 )
 
-LLM_PROVIDER = os.getenv("LLM_PROVIDER", "ollama").strip().lower()
+LLM_PROVIDER = os.getenv("LLM_PROVIDER", "gemeni").strip().lower()
 OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434").strip()
 OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "llama3.1:8b").strip()
 

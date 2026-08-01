@@ -118,10 +118,10 @@ def sync_hf_dataset_to_raw(force: bool = False) -> bool:
     RAW_DIR.mkdir(parents=True, exist_ok=True)
 
     existing_docs = (
-        list(RAW_DIR.glob("*.docx"))
-        + list(RAW_DIR.glob("*.pdf"))
-        + list(RAW_DIR.glob("*.rtf"))
-        + list(RAW_DIR.glob("*.doc"))
+            list(RAW_DIR.glob("*.docx"))
+            + list(RAW_DIR.glob("*.pdf"))
+            + list(RAW_DIR.glob("*.rtf"))
+            + list(RAW_DIR.glob("*.doc"))
     )
 
     if existing_docs and not force:
@@ -137,10 +137,10 @@ def sync_hf_dataset_to_raw(force: bool = False) -> bool:
         )
 
         downloaded_docs = (
-            list(RAW_DIR.glob("*.docx"))
-            + list(RAW_DIR.glob("*.pdf"))
-            + list(RAW_DIR.glob("*.rtf"))
-            + list(RAW_DIR.glob("*.doc"))
+                list(RAW_DIR.glob("*.docx"))
+                + list(RAW_DIR.glob("*.pdf"))
+                + list(RAW_DIR.glob("*.rtf"))
+                + list(RAW_DIR.glob("*.doc"))
         )
 
         print(f"✅ Dataset синхронизирован. Найдено документов: {len(downloaded_docs)}")
@@ -195,7 +195,7 @@ def export_to_docx(answer: str, sources: list, tables: list = None, formulas: li
         doc = Document()
 
         title = doc.add_heading("Инженерный отчёт", 0)
-        title.alignment = WD_ALIGN_PARAGRAPH.CENTER  # Исправлено
+        title.alignment = WD_ALIGN_PARAGRAPH.CENTER
 
         doc.add_paragraph(f"Дата: {datetime.now().strftime('%d.%m.%Y %H:%M')}")
         doc.add_paragraph()
@@ -330,12 +330,12 @@ def export_to_pdf(answer: str, sources: list, tables: list = None, formulas: lis
 
 
 def render_export_buttons(
-    answer: str,
-    sources: list,
-    tables: list,
-    formulas: list,
-    key_suffix: str = "current",
-    response_id: int | None = None
+        answer: str,
+        sources: list,
+        tables: list,
+        formulas: list,
+        key_suffix: str = "current",
+        response_id: int | None = None
 ):
     """
     Отображение кнопок экспорта с уникальными ключами.
@@ -476,12 +476,17 @@ def get_llm_status(qa_system: QASystem) -> dict[str, str]:
 
 def init_qa_system() -> QASystem:
     """Инициализирует QA-систему с загрузкой или построением индекса."""
+    # Исправлено: безопасная передача Gemini API ключа
+    gemini_key = os.getenv("GEMINI_API_KEY")
+    if not gemini_key:
+        print("⚠️ GEMINI_API_KEY не задан, будет использован fallback без LLM")
+
     qa = QASystem(
-        use_llm=True,
-        llm_provider="ollama",
+        use_llm=bool(gemini_key),  # Включаем LLM только если есть ключ
+        llm_provider="gemini" if gemini_key else "none",
         use_embeddings=True,
-        ollama_base_url="http://localhost:11434",
-        ollama_model="llama3.1:8b",
+        gemini_api_key=gemini_key,
+        gemini_model="gemini-2.0-flash",
     )
 
     if INDEX_FILE.exists():
@@ -565,9 +570,9 @@ def auto_load_documents() -> bool:
 # ========= ОСНОВНОЙ ИНТЕРФЕЙС =========
 
 def render_sidebar(
-    qa_system: QASystem,
-    formula_engine: FormulaEngine,
-    error_handler: ErrorHandler
+        qa_system: QASystem,
+        formula_engine: FormulaEngine,
+        error_handler: ErrorHandler
 ) -> None:
     """Рендер боковой панели."""
     with st.sidebar:
@@ -674,10 +679,10 @@ def render_sidebar(
 
         st.subheader("📊 Статистика базы")
         docs_count = (
-            len(list(RAW_DIR.glob("*.docx")))
-            + len(list(RAW_DIR.glob("*.pdf")))
-            + len(list(RAW_DIR.glob("*.rtf")))
-            + len(list(RAW_DIR.glob("*.doc")))
+                len(list(RAW_DIR.glob("*.docx")))
+                + len(list(RAW_DIR.glob("*.pdf")))
+                + len(list(RAW_DIR.glob("*.rtf")))
+                + len(list(RAW_DIR.glob("*.doc")))
         )
         chunks_count = len(qa_system.chunks) if qa_system.is_ready else 0
 
