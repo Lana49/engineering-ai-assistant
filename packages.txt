@@ -6,3 +6,6 @@ default-jre
 antiword
 catdoc
 poppler-utils
+tesseract-ocr
+tesseract-ocr-rus
+antiword

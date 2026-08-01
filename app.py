@@ -1,22 +1,19 @@
 # -*- coding: utf-8 -*-
 """
 Инженерный чат-бот для работы с документацией.
-Объединяет интерфейс чат-бота с технологиями инженерной базы знаний.
+С ПРИНУДИТЕЛЬНЫМ ПОСТРОЕНИЕМ ИНДЕКСА.
 """
 
 from __future__ import annotations
 
 import asyncio
 import json
-import os
-import sys
 import time
 from datetime import datetime
-from pathlib import Path
+
 
 import streamlit as st
 
-# ИСПРАВЛЕНО: правильный импорт snapshot_download
 try:
     from huggingface_hub import snapshot_download
 except ImportError:
@@ -31,8 +28,6 @@ from core.parser import parse_directory
 from core.prompts import get_quick_definition
 from core.qa_engine import QASystem
 from core.table_calculator import patch_app_with_table_calculator
-# ИСПРАВЛЕНО: правильный импорт из table_extractor
-from core.table_extractor import extract_tables, tables_to_dicts, ExtractedTable
 
 st.set_page_config(
     page_title="Инженерный чат-бот",
@@ -42,6 +37,7 @@ st.set_page_config(
 )
 
 HISTORY_FILE = PROCESSED_DIR / "chat_history.json"
+INDEX_FILE = PROCESSED_DIR / "faiss_index.pkl"
 
 
 # ========= ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ =========
@@ -105,7 +101,6 @@ def sync_hf_dataset_to_raw(force: bool = False) -> bool:
         print("ℹ️ HF_DATASET_REPO_ID не задан, синхронизация dataset пропущена")
         return False
 
-    # ИСПРАВЛЕНО: проверка наличия snapshot_download
     if snapshot_download is None:
         print("❌ huggingface-hub не установлен. Установите: pip install huggingface-hub")
         return False
@@ -368,7 +363,70 @@ def render_export_buttons(answer: str, sources: list, tables: list, formulas: li
             st.success("✅ Текст скопирован!")
 
 
-# ========= ИНИЦИАЛИЗАЦИЯ QA СИСТЕМЫ =========
+# ========= ИНИЦИАЛИЗАЦИЯ QA СИСТЕМЫ С ПРИНУДИТЕЛЬНЫМ ПОСТРОЕНИЕМ =========
+
+def force_rebuild_index(qa: QASystem) -> bool:
+    """
+    ПРИНУДИТЕЛЬНО перестраивает индекс с эмбеддингами.
+    Выводит подробную диагностику.
+    """
+    print("🔨 ПРИНУДИТЕЛЬНАЯ ПЕРЕСТРОЙКА ИНДЕКСА")
+
+    # 1. Проверяем наличие документов
+    if not RAW_DIR.exists():
+        print(f"❌ Папка {RAW_DIR} не существует")
+        return False
+
+    docs = list(RAW_DIR.glob("*.docx")) + list(RAW_DIR.glob("*.pdf")) + \
+           list(RAW_DIR.glob("*.rtf")) + list(RAW_DIR.glob("*.doc"))
+
+    print(f"📄 Найдено документов в RAW_DIR: {len(docs)}")
+
+    if not docs:
+        print("❌ Нет документов для индексации")
+        return False
+
+    # 2. Парсим документы
+    print("📖 Начинаем парсинг документов...")
+    parsed_docs = parse_directory(RAW_DIR, recursive=True)
+
+    if not parsed_docs:
+        print("❌ Парсинг не вернул ни одного документа")
+        return False
+
+    print(f"📄 Распарсено документов: {len(parsed_docs)}")
+
+    # Считаем чанки
+    total_chunks = sum(len(doc.get("chunks", [])) for doc in parsed_docs)
+    print(f"🧩 Всего чанков: {total_chunks}")
+
+    # 3. Строим индекс
+    print("🔨 Строим индекс с эмбеддингами...")
+    result = qa.build_index(parsed_docs)
+
+    if not result:
+        print("❌ build_index вернул False")
+        return False
+
+    print(f"✅ Индекс построен: {len(qa.chunks)} чанков")
+    print(f"   embedding_model: {qa.embedding_model is not None}")
+    print(f"   chunk_embeddings: {qa.chunk_embeddings is not None}")
+    if qa.chunk_embeddings is not None:
+        print(f"   embeddings shape: {qa.chunk_embeddings.shape}")
+
+    # 4. Сохраняем индекс
+    print("💾 Сохраняем индекс...")
+    save_result = qa.save_index(INDEX_FILE)
+
+    if save_result:
+        print(f"✅ Индекс сохранён: {INDEX_FILE}")
+        if INDEX_FILE.exists():
+            print(f"   Размер файла: {INDEX_FILE.stat().st_size} bytes")
+    else:
+        print("❌ Ошибка сохранения индекса")
+
+    return save_result
+
 
 def init_qa_system() -> QASystem:
     """Инициализирует QA-систему с загрузкой или построением индекса."""
@@ -378,59 +436,39 @@ def init_qa_system() -> QASystem:
         use_embeddings=True,
     )
 
-    index_path = PROCESSED_DIR / "faiss_index.pkl"
+    # Проверяем наличие индекса
+    if INDEX_FILE.exists():
+        print(f"📂 Индекс найден: {INDEX_FILE}")
+        try:
+            qa.load_index(INDEX_FILE)
+            print(f"✅ Индекс загружен: {len(qa.chunks)} чанков")
+            return qa
+        except Exception as e:
+            print(f"⚠️ Ошибка загрузки индекса: {e}")
+            print("🔄 Будет выполнена перестройка...")
 
-    try:
-        if index_path.exists():
-            qa.load_index(index_path)
-            print(f"📂 Индекс загружен: {index_path}")
-        else:
-            print("📥 Индекс не найден. Парсим документы...")
-            print("🔄 Проверяю наличие документов...")
-            sync_hf_dataset_to_raw()
-            _build_index(qa, index_path)
-    except Exception as exc:
-        print(f"⚠️ Ошибка загрузки индекса: {exc}")
-        st.warning("⚠️ Индекс повреждён или несовместим. Выполняется пересборка...")
-        sync_hf_dataset_to_raw()
-        _build_index(qa, index_path)
+    # Индекса нет или он повреждён — строим заново
+    print("📥 Индекс не найден или повреждён. Выполняется синхронизация и парсинг...")
+
+    # Синхронизируем dataset
+    sync_hf_dataset_to_raw()
+
+    # Принудительно перестраиваем индекс
+    force_rebuild_index(qa)
 
     return qa
-
-
-def _build_index(qa: QASystem, index_path) -> None:
-    """Строит индекс по документам."""
-    if not RAW_DIR.exists() or not list(RAW_DIR.glob("*")):
-        st.warning("⚠️ Папка с документами пуста. Загрузите документы в data/raw/")
-        return
-
-    parsed_docs = parse_directory(RAW_DIR, recursive=True)
-    if parsed_docs:
-        qa.build_index(parsed_docs)
-        qa.save_index(index_path)
-        print(f"✅ Индекс построен и сохранён: {index_path}")
-    else:
-        st.warning("⚠️ Не удалось распарсить документы")
 
 
 def init_session_state() -> None:
     """Инициализирует состояние сессии."""
     if "qa_system" not in st.session_state:
         with st.spinner("Загрузка системы..."):
-            # Синхронизируем датасет
-            with st.status("📥 Загрузка документов...", expanded=True) as status:
-                status.write("Скачивание датасета с Hugging Face...")
-                sync_hf_dataset_to_raw()
-                status.write("✅ Документы загружены")
-
             st.session_state.qa_system = init_qa_system()
             st.session_state.formula_engine = FormulaEngine(st.session_state.qa_system)
             st.session_state.agent_loop = AgentLoop(
                 st.session_state.qa_system,
                 st.session_state.formula_engine,
             )
-            # ИСПРАВЛЕНО: удален вызов несуществующей функции
-            # patch_qa_system_with_table_extractor() - больше не нужна
             patch_app_with_table_calculator()
 
     if "error_handler" not in st.session_state:
@@ -458,41 +496,29 @@ def auto_load_documents() -> bool:
     qa_system = st.session_state.qa_system
 
     if qa_system.is_ready:
-        st.sidebar.success(f"✅ База знаний готова\n📄 {len(qa_system.chunks)} фрагментов")
+        chunks_count = len(qa_system.chunks) if hasattr(qa_system, 'chunks') else 0
+        st.sidebar.success(f"✅ База знаний готова\n📄 {chunks_count} фрагментов")
         return True
 
-    index_path = PROCESSED_DIR / "faiss_index.pkl"
-
-    if index_path.exists():
-        try:
-            if qa_system.load_index(index_path):
-                st.sidebar.success(f"✅ Индекс загружен\n📄 {len(qa_system.chunks)} фрагментов")
-                return True
-        except Exception as e:
-            st.sidebar.warning(f"⚠️ Ошибка загрузки индекса: {e}")
-
-    docs = (
-        list(RAW_DIR.glob("*.docx"))
-        + list(RAW_DIR.glob("*.pdf"))
-        + list(RAW_DIR.glob("*.rtf"))
-        + list(RAW_DIR.glob("*.doc"))
-    )
-
-    if not docs:
-        st.sidebar.info("📁 Папка документов пуста. Проверьте загрузку dataset.")
-        return False
-
-    with st.sidebar:
-        st.info(f"📚 Индексация {len(docs)} документов...")
-
-    if qa_system.index_documents(RAW_DIR):
-        index_path.parent.mkdir(parents=True, exist_ok=True)
-        qa_system.save_index(index_path)
+    # Если индекс не готов — пытаемся перестроить
+    if not INDEX_FILE.exists():
+        st.sidebar.info("🔄 Индекс отсутствует. Выполняется перестройка...")
         with st.sidebar:
-            st.success(f"✅ Загружено {len(qa_system.chunks)} фрагментов")
-        return True
+            with st.spinner("📚 Индексация документов..."):
+                if force_rebuild_index(qa_system):
+                    st.success("✅ Индекс перестроен")
+                    st.rerun()
+                    return True
+                else:
+                    st.error("❌ Не удалось перестроить индекс")
+                    return False
+    try:
+        if qa_system.load_index(INDEX_FILE):
+            st.sidebar.success(f"✅ Индекс загружен\n📄 {len(qa_system.chunks)} фрагментов")
+            return True
+    except Exception as e:
+        st.sidebar.warning(f"⚠️ Ошибка загрузки индекса: {e}")
 
-    st.sidebar.error("❌ Ошибка индексации")
     return False
 
 
@@ -511,15 +537,32 @@ def render_sidebar(qa_system: QASystem, formula_engine: FormulaEngine, error_han
         """)
         st.divider()
 
+        # Диагностика
+        st.subheader("🔍 Диагностика индекса")
+        st.write(f"INDEX_FILE: `{INDEX_FILE}`")
+        st.write(f"Файл существует: `{INDEX_FILE.exists()}`")
+        if INDEX_FILE.exists():
+            st.write(f"Размер: `{INDEX_FILE.stat().st_size}` bytes")
+
+        chunks_count = len(qa_system.chunks) if hasattr(qa_system, 'chunks') else 0
+        st.write(f"Чанков в памяти: `{chunks_count}`")
+        st.write(f"is_ready: `{qa_system.is_ready}`")
+
+        if qa_system.chunk_embeddings is not None:
+            st.write(f"Эмбеддинги: `{qa_system.chunk_embeddings.shape}`")
+        else:
+            st.write("Эмбеддинги: `Нет`")
+
+        st.divider()
+
         auto_load_documents()
         st.divider()
 
         col1, col2 = st.columns(2)
         with col1:
             if st.button("🔄 Перезагрузить индекс", use_container_width=True):
-                index_path = PROCESSED_DIR / "faiss_index.pkl"
-                if index_path.exists():
-                    qa_system.load_index(index_path)
+                if INDEX_FILE.exists():
+                    qa_system.load_index(INDEX_FILE)
                     st.success(f"✅ Индекс перезагружен: {len(qa_system.chunks)} фрагментов")
                     st.rerun()
                 else:
@@ -527,9 +570,9 @@ def render_sidebar(qa_system: QASystem, formula_engine: FormulaEngine, error_han
 
         with col2:
             if st.button("🗑️ Очистить индекс", use_container_width=True):
-                index_path = PROCESSED_DIR / "faiss_index.pkl"
-                if index_path.exists():
-                    index_path.unlink(missing_ok=True)
+                if INDEX_FILE.exists():
+                    INDEX_FILE.unlink(missing_ok=True)
+                    qa_system.is_ready = False
                     st.success("✅ Индекс очищен")
                     st.rerun()
 
@@ -541,13 +584,19 @@ def render_sidebar(qa_system: QASystem, formula_engine: FormulaEngine, error_han
                     st.error("❌ Не удалось синхронизировать dataset")
                 st.rerun()
 
+        # КНОПКА ПРИНУДИТЕЛЬНОЙ ПЕРЕСТРОЙКИ
+        if st.button("🔨 Перестроить индекс (с эмбеддингами)", use_container_width=True):
+            with st.spinner("🔄 Перестройка индекса..."):
+                if force_rebuild_index(qa_system):
+                    st.success("✅ Индекс перестроен")
+                    st.rerun()
+                else:
+                    st.error("❌ Ошибка перестройки индекса")
+
         if not qa_system.is_ready:
             if st.button("📚 Индексировать документы", key="index_btn", use_container_width=True):
                 with st.spinner("Индексация..."):
-                    if qa_system.index_documents(RAW_DIR):
-                        index_path = PROCESSED_DIR / "faiss_index.pkl"
-                        index_path.parent.mkdir(parents=True, exist_ok=True)
-                        qa_system.save_index(index_path)
+                    if force_rebuild_index(qa_system):
                         st.success(f"✅ Проиндексировано {len(qa_system.chunks)} фрагментов")
                         st.rerun()
                     else:

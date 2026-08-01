@@ -1,16 +1,19 @@
 # -*- coding: utf-8 -*-
 """
 QA Engine для инженерной документации.
+Диагностическая версия: считает документы, чанки, батчи эмбеддингов
+и подробно показывает причины, почему индекс не сохранился.
 """
 
 from __future__ import annotations
 
+import math
 import os
 import pickle
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, Optional
 
 import numpy as np
 import requests
@@ -33,7 +36,6 @@ try:
 except ImportError:
     SentenceTransformer = None
 
-# НОВЫЙ SDK — google.genai
 try:
     import google.genai as genai
     GENAI_AVAILABLE = True
@@ -73,17 +75,18 @@ class QASystem:
         self,
         use_llm: bool = False,
         llm_provider: str = "ollama",
-        model_name: str | None = None,
+        model_name: Optional[str] = None,
         top_k: int = 5,
         min_score: float = 0.15,
         ollama_base_url: str = "http://localhost:11434",
         ollama_model: str = "llama3.1:8b",
-        gemini_api_key: str | None = None,
+        gemini_api_key: Optional[str] = None,
         gemini_model: str = "gemini-2.0-flash",
         embedding_model_name: str = "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2",
         use_embeddings: bool = True,
         semantic_weight: float = 0.7,
         lexical_weight: float = 0.3,
+        embedding_batch_size: int = 32,
     ):
         self.use_llm = use_llm
         self.llm_provider = (llm_provider or "ollama").strip().lower()
@@ -91,44 +94,41 @@ class QASystem:
         self.min_score = min_score
 
         self.ollama_base_url = ollama_base_url.rstrip("/")
-        self.ollama_model = ollama_model or "llama3.1:8b"
+        self.ollama_model = model_name if model_name and self.llm_provider in {"ollama", "mixed"} else ollama_model
 
-        # Gemini — через google.genai
         self.gemini_api_key = (gemini_api_key or os.getenv("GEMINI_API_KEY", "")).strip()
-        self.gemini_model = gemini_model or "gemini-2.0-flash"
+        self.gemini_model = model_name if model_name and self.llm_provider == "gemini" else gemini_model
         self.gemini_available = bool(self.gemini_api_key) and GENAI_AVAILABLE
-        self.genai_client: Any = None  # ← ИСПРАВЛЕНО: явная аннотация типа
+        self.genai_client: Any = None
 
         if self.gemini_available and genai is not None:
             try:
-                self.genai_client = genai.Client(api_key=self.gemini_api_key)
+                self.genai_client = genai.Client(api_key=self.gemini_api_key)  # type: ignore
                 print(f"✅ Gemini клиент инициализирован (модель: {self.gemini_model})")
             except Exception as e:
                 print(f"⚠️ Ошибка инициализации Gemini: {e}")
                 self.gemini_available = False
 
-        if model_name:
-            if self.llm_provider in {"ollama", "mixed"}:
-                self.ollama_model = model_name
-            elif self.llm_provider == "gemini":
-                self.gemini_model = model_name
-
         self.embedding_model_name = embedding_model_name
         self.use_embeddings = use_embeddings
         self.semantic_weight = semantic_weight
         self.lexical_weight = lexical_weight
+        self.embedding_batch_size = max(1, int(embedding_batch_size))
 
         self.documents: list[dict[str, Any]] = []
         self.chunks: list[dict[str, Any]] = []
 
-        self.embedding_model: SentenceTransformer | None = None
-        self.chunk_embeddings: np.ndarray | None = None  # ← ИСПРАВЛЕНО: тип
-
-        self.vectorizer: TfidfVectorizer | None = None
+        self.embedding_model: Optional[SentenceTransformer] = None  # Исправлено
+        self.chunk_embeddings: Any = None  # Исправлено
+        self.vectorizer: Optional[TfidfVectorizer] = None
         self.tfidf_matrix: Any = None
 
         self.is_ready = False
         self.llm_available = False
+
+        self.last_index_diagnostics: dict[str, Any] = {}
+        self.last_save_diagnostics: dict[str, Any] = {}
+        self.last_load_diagnostics: dict[str, Any] = {}
 
         if TfidfVectorizer is None:
             print("⚠️ scikit-learn не установлен")
@@ -139,8 +139,41 @@ class QASystem:
         if self.use_llm:
             self._validate_llm_config()
 
+    def _reset_index_diagnostics(self) -> None:
+        self.last_index_diagnostics = {
+            "documents_total": 0,
+            "documents_with_chunks": 0,
+            "doc_type_counts": {},
+            "chunks_total": 0,
+            "chunks_nonempty": 0,
+            "chunks_skipped_empty": 0,
+            "embeddings_enabled": self.use_embeddings,
+            "embedding_model_loaded": self.embedding_model is not None,
+            "embedding_batches_started": False,
+            "embedding_batch_size": self.embedding_batch_size,
+            "embedding_batches_total": 0,
+            "embedding_texts_total": 0,
+            "tfidf_enabled": TfidfVectorizer is not None,
+            "tfidf_built": False,
+            "success": False,
+            "error": "",
+        }
+
+    def _try_load_embedding_model(self) -> None:
+        if SentenceTransformer is None:
+            print("⚠️ sentence-transformers не установлен")
+            self.embedding_model = None
+            return
+
+        try:
+            print(f"📥 Загружаю embedding model: {self.embedding_model_name}")
+            self.embedding_model = SentenceTransformer(self.embedding_model_name)
+            print("✅ Embedding model загружена")
+        except Exception as e:
+            print(f"⚠️ Не удалось загрузить embedding model: {e}")
+            self.embedding_model = None
+
     def is_ollama_alive(self) -> bool:
-        """Проверяет доступность Ollama."""
         try:
             response = requests.get(f"{self.ollama_base_url}/api/tags", timeout=2)
             return response.status_code == 200
@@ -148,38 +181,43 @@ class QASystem:
             return False
 
     def is_ollama_available(self) -> bool:
-        """Алиас для совместимости."""
         return self.is_ollama_alive()
 
     def _validate_llm_config(self) -> None:
-        """Проверяет доступность LLM-провайдеров."""
         self.llm_available = False
-        if self.use_llm:
-            if self.llm_provider == "ollama":
-                self.llm_available = self.is_ollama_alive()
-                if self.llm_available:
-                    print(f"✅ Ollama доступен (модель: {self.ollama_model})")
-                else:
-                    print(f"⚠️ Ollama недоступен ({self.ollama_base_url})")
-            elif self.llm_provider == "gemini":
-                self.llm_available = self.gemini_available
-                if self.llm_available:
-                    print(f"✅ Gemini доступен (модель: {self.gemini_model})")
-                else:
-                    print("⚠️ Gemini недоступен (нет API ключа или не установлен google-genai)")
-            elif self.llm_provider == "mixed":
-                self.llm_available = self.is_ollama_alive() or self.gemini_available
-                if self.llm_available:
-                    print("✅ Mixed-режим: хотя бы один LLM доступен")
-                else:
-                    print("⚠️ Mixed-режим: ни один LLM не доступен")
-            elif self.llm_provider == "none":
-                self.llm_available = False
 
-        print(f"ℹ️ LLM provider={self.llm_provider}, available={self.llm_available}")
+        if not self.use_llm:
+            print("ℹ️ LLM отключён")
+            return
+
+        if self.llm_provider == "ollama":
+            self.llm_available = self.is_ollama_alive()
+            print(
+                f"{'✅' if self.llm_available else '⚠️'} "
+                f"Ollama {'доступен' if self.llm_available else 'недоступен'} "
+                f"(base_url={self.ollama_base_url}, model={self.ollama_model})"
+            )
+        elif self.llm_provider == "gemini":
+            self.llm_available = self.gemini_available
+            print(
+                f"{'✅' if self.llm_available else '⚠️'} "
+                f"Gemini {'доступен' if self.llm_available else 'недоступен'} "
+                f"(model={self.gemini_model})"
+            )
+        elif self.llm_provider == "mixed":
+            self.llm_available = self.is_ollama_alive() or self.gemini_available
+            print(
+                f"{'✅' if self.llm_available else '⚠️'} Mixed LLM provider, "
+                f"available={self.llm_available}"
+            )
+        elif self.llm_provider == "none":
+            self.llm_available = False
+            print("ℹ️ LLM provider=none")
+        else:
+            self.llm_available = False
+            print(f"⚠️ Неизвестный LLM provider: {self.llm_provider}")
 
     def _select_provider(self) -> str:
-        """Выбирает активного провайдера."""
         if not self.use_llm:
             return "none"
 
@@ -194,95 +232,204 @@ class QASystem:
                 return "ollama"
             if self.gemini_available:
                 return "gemini"
+            return "none"
 
         return "none"
 
     def build_index(self, parsed_docs: list[dict[str, Any]]) -> bool:
-        """Строит индекс по документам."""
-        self.documents = parsed_docs or []
-        self.chunks = []
+        """Строит индекс по документам с подробной диагностикой батчей."""
+        self._reset_index_diagnostics()
 
-        for doc in self.documents:
-            doc_name = doc.get("doc_name", "")
-            filepath = doc.get("filepath", "")
-            filetype = doc.get("filetype", "")
-            doc_metadata = doc.get("metadata", {}) or {}
+        try:
+            self.documents = parsed_docs or []
+            self.chunks = []
 
-            for chunk in doc.get("chunks", []) or []:
-                text = (chunk.get("text") or "").strip()
-                if not text:
-                    continue
+            self.last_index_diagnostics["documents_total"] = len(self.documents)
 
-                self.chunks.append({
-                    "doc_name": chunk.get("doc_name", doc_name),
-                    "chunk_id": chunk.get("chunk_id", 0),
-                    "text": text,
-                    "filepath": filepath,
-                    "filetype": filetype,
-                    "metadata": {**doc_metadata, **chunk.get("metadata", {})},
-                })
+            doc_type_counts: dict[str, int] = {}
+            docs_with_chunks = 0
+            skipped_empty = 0
 
-        if not self.chunks:
-            print("⚠️ Нет фрагментов для индексации")
+            for doc in self.documents:
+                doc_name = doc.get("doc_name", "")
+                file_path = doc.get("filepath", doc.get("file_path", ""))
+                file_type = doc.get("filetype", doc.get("file_type", "unknown"))
+                doc_metadata = doc.get("metadata", {}) or {}
+                doc_chunks = doc.get("chunks", []) or []
+
+                doc_type_counts[file_type] = doc_type_counts.get(file_type, 0) + 1
+                if doc_chunks:
+                    docs_with_chunks += 1
+
+                for chunk in doc_chunks:
+                    text = (chunk.get("text") or "").strip()
+                    if not text:
+                        skipped_empty += 1
+                        continue
+
+                    self.chunks.append(
+                        {
+                            "doc_name": chunk.get("doc_name", doc_name),
+                            "chunk_id": chunk.get("chunk_id", 0),
+                            "text": text,
+                            "filepath": file_path,
+                            "filetype": file_type,
+                            "metadata": {
+                                **doc_metadata,
+                                **(chunk.get("metadata", {}) or {}),
+                            },
+                        }
+                    )
+
+            self.last_index_diagnostics["documents_with_chunks"] = docs_with_chunks
+            self.last_index_diagnostics["doc_type_counts"] = doc_type_counts
+            self.last_index_diagnostics["chunks_total"] = len(self.chunks)
+            self.last_index_diagnostics["chunks_nonempty"] = len(self.chunks)
+            self.last_index_diagnostics["chunks_skipped_empty"] = skipped_empty
+
+
+            print("📊 INDEX BUILD DIAGNOSTICS")
+            print(f"📄 Документов получено: {len(self.documents)}")
+            print(f"📄 Документов с чанками: {docs_with_chunks}")
+            print(f"🧩 Всего непустых чанков: {len(self.chunks)}")
+            print(f"🗑️ Пустых чанков пропущено: {skipped_empty}")
+            print(f"🗂️ Типы документов: {doc_type_counts}")
+
+            if not self.chunks:
+                print("❌ После сборки нет ни одного непустого чанка")
+                self.is_ready = False
+                self.last_index_diagnostics["error"] = "no_nonempty_chunks"
+                return False
+
+            texts = [c["text"] for c in self.chunks]
+
+            # ============ TF-IDF ============
+            if TfidfVectorizer is not None:
+                self.vectorizer = TfidfVectorizer(
+                    lowercase=True,
+                    ngram_range=(1, 2),
+                    max_features=50000,
+                    token_pattern=r"(?u)\b[\w\-./]+\b",
+                )
+                if self.vectorizer is not None:
+                    self.tfidf_matrix = self.vectorizer.fit_transform(texts)
+                    self.last_index_diagnostics["tfidf_built"] = True
+                    print(f"✅ TF-IDF построен: shape={self.tfidf_matrix.shape}")
+                else:
+                    self.tfidf_matrix = None
+            else:
+                self.vectorizer = None
+                self.tfidf_matrix = None
+                print("⚠️ TF-IDF пропущен: scikit-learn недоступен")
+
+            # ============ ЭМБЕДДИНГИ С БАТЧАМИ ============
+            if self.embedding_model is not None and texts:
+                total_texts = len(texts)
+                batch_size = self.embedding_batch_size
+                total_batches = math.ceil(total_texts / batch_size)
+
+                self.last_index_diagnostics["embedding_batches_started"] = True
+                self.last_index_diagnostics["embedding_batches_total"] = total_batches
+                self.last_index_diagnostics["embedding_texts_total"] = total_texts
+
+                print("🚀 ЗАПУСК БАТЧЕЙ ЭМБЕДДИНГОВ")
+                print(f"   model={self.embedding_model_name}")
+                print(f"   texts={total_texts}")
+                print(f"   batch_size={batch_size}")
+                print(f"   total_batches={total_batches}")
+
+                all_embeddings: list[np.ndarray] = []
+
+                for batch_idx in range(total_batches):
+                    start = batch_idx * batch_size
+                    end = min(start + batch_size, total_texts)
+                    batch_texts = texts[start:end]
+
+                    print(
+                        f"   📦 Batch {batch_idx + 1}/{total_batches}: "
+                        f"items={len(batch_texts)} range=[{start}:{end}]"
+                    )
+
+                    batch_embeddings = self.embedding_model.encode(
+                        batch_texts,
+                        normalize_embeddings=True,
+                        show_progress_bar=False,
+                    )
+                    all_embeddings.append(np.asarray(batch_embeddings, dtype=np.float32))  # type: ignore
+
+                # Объединяем все батчи
+                self.chunk_embeddings = np.vstack(all_embeddings) if all_embeddings else None  # type: ignore
+
+                print(
+                    f"✅ ЭМБЕДДИНГИ ПОСТРОЕНЫ: "
+                    f"shape={None if self.chunk_embeddings is None else self.chunk_embeddings.shape}"
+                )
+
+            else:
+                self.chunk_embeddings = None
+                if not self.use_embeddings:
+                    print("ℹ️ Эмбеддинги отключены настройкой use_embeddings=False")
+                elif self.embedding_model is None:
+                    print("⚠️ Эмбеддинги не построены: embedding model не загружена")
+
+            self.is_ready = True
+            self.last_index_diagnostics["success"] = True
+            print("✅ Индекс успешно построен")
+            return True
+
+        except Exception as e:
             self.is_ready = False
+            self.last_index_diagnostics["error"] = str(e)
+            print(f"❌ build_index failed: {e}")
+            import traceback
+            traceback.print_exc()
             return False
 
-        texts = [c["text"] for c in self.chunks]
-
-        if TfidfVectorizer is not None:
-            self.vectorizer = TfidfVectorizer(
-                lowercase=True,
-                ngram_range=(1, 2),
-                max_features=50000,
-                token_pattern=r"(?u)\b[\w\-/\.]+\b",
-            )
-            # ← ИСПРАВЛЕНО: проверка что vectorizer не None
-            if self.vectorizer is not None:
-                self.tfidf_matrix = self.vectorizer.fit_transform(texts)
-            else:
-                self.tfidf_matrix = None
-        else:
-            self.vectorizer = None
-            self.tfidf_matrix = None
-            print("⚠️ TF-IDF недоступен: scikit-learn не установлен")
-
-        if self.embedding_model is not None and texts:
-            try:
-                embeddings = self.embedding_model.encode(
-                    texts,
-                    normalize_embeddings=True,
-                    show_progress_bar=False,
-                )
-                # ← ИСПРАВЛЕНО: корректное использование np.asarray
-                self.chunk_embeddings = np.asarray(embeddings, dtype=np.float32)  # type: ignore
-            except Exception as e:
-                print(f"⚠️ Ошибка построения эмбеддингов: {e}")
-                self.chunk_embeddings = None
-        else:
-            self.chunk_embeddings = None
-
-        self.is_ready = True
-        print(f"✅ Индекс построен: {len(self.chunks)} фрагментов")
-        return True
-
     def index_documents(self, directory: str | Path) -> bool:
-        """Индексирует документы из директории."""
         try:
             from core.parser import DocumentParser
 
+            directory = Path(directory)
+            print(f"📂 index_documents: directory={directory}")
+
             parser = DocumentParser(chunk_size=1200, chunk_overlap=200)
             docs = parser.parse_directory(directory, recursive=True)
+
+            print(f"📄 parser.parse_directory returned documents={len(docs) if docs else 0}")
             return self.build_index(docs)
+
         except ImportError as e:
             print(f"❌ Не удалось импортировать parser: {e}")
             return False
         except Exception as e:
             print(f"❌ Ошибка индексации: {e}")
+            import traceback
+            traceback.print_exc()
             return False
 
     def save_index(self, index_path: str | Path) -> bool:
-        """Сохраняет индекс на диск."""
+        """Сохраняет индекс на диск с проверкой."""
+        self.last_save_diagnostics = {
+            "path": str(index_path),
+            "documents_total": len(self.documents),
+            "chunks_total": len(self.chunks),
+            "has_embeddings": self.chunk_embeddings is not None,
+            "has_tfidf": self.tfidf_matrix is not None,
+            "success": False,
+            "file_exists_after_save": False,
+            "file_size_bytes": 0,
+            "error": "",
+        }
+
         try:
+            index_path = Path(index_path)
+            index_path.parent.mkdir(parents=True, exist_ok=True)
+
+            if not self.documents:
+                print("⚠️ save_index: documents пустой")
+            if not self.chunks:
+                print("⚠️ save_index: chunks пустой")
+
             data = {
                 "documents": self.documents,
                 "chunks": self.chunks,
@@ -298,27 +445,70 @@ class QASystem:
                 "ollama_model": self.ollama_model,
                 "gemini_model": self.gemini_model,
                 "llm_provider": self.llm_provider,
+                "diagnostics": self.last_index_diagnostics,
             }
 
-            index_path = Path(index_path)
-            index_path.parent.mkdir(parents=True, exist_ok=True)
+            print("💾 SAVE INDEX DIAGNOSTICS:")
+            print(f"   path={index_path}")
+            print(f"   documents={len(self.documents)}")
+            print(f"   chunks={len(self.chunks)}")
+            print(f"   embeddings_present={self.chunk_embeddings is not None}")
+            if self.chunk_embeddings is not None:
+                print(f"   embeddings_shape={self.chunk_embeddings.shape}")
+            print(f"   tfidf_present={self.tfidf_matrix is not None}")
 
             with open(index_path, "wb") as f:
-                pickle.dump(data, f)
+                pickle.dump(data, f, protocol=pickle.HIGHEST_PROTOCOL)
 
-            print(f"✅ Индекс сохранён: {index_path}")
+            file_exists = index_path.exists()
+            file_size = index_path.stat().st_size if file_exists else 0
+
+            self.last_save_diagnostics["file_exists_after_save"] = file_exists
+            self.last_save_diagnostics["file_size_bytes"] = file_size
+            self.last_save_diagnostics["success"] = file_exists and file_size > 0
+
+            if not file_exists:
+                print(f"❌ Индекс не сохранился: файл не создан: {index_path}")
+                return False
+
+            if file_size <= 0:
+                print(f"❌ Индекс не сохранился корректно: пустой файл: {index_path}")
+                return False
+
+            print(f"✅ Индекс сохранён: {index_path} ({file_size} bytes)")
             return True
+
         except Exception as e:
+            self.last_save_diagnostics["error"] = str(e)
             print(f"❌ Ошибка сохранения индекса: {e}")
+            import traceback
+            traceback.print_exc()
             return False
 
     def load_index(self, index_path: str | Path) -> bool:
         """Загружает индекс с диска."""
+        self.last_load_diagnostics = {
+            "path": str(index_path),
+            "success": False,
+            "file_exists_before_load": False,
+            "file_size_bytes": 0,
+            "error": "",
+        }
+
         try:
             index_path = Path(index_path)
+            self.last_load_diagnostics["file_exists_before_load"] = index_path.exists()
+
             if not index_path.exists():
-                print(f"⚠️ Индекс не найден: {index_path}")
+                print(f"⚠️ load_index: файл не найден: {index_path}")
+                self.last_load_diagnostics["error"] = "file_not_found"
                 return False
+
+            self.last_load_diagnostics["file_size_bytes"] = index_path.stat().st_size
+            print(
+                f"📥 Загружаю индекс: {index_path} "
+                f"({self.last_load_diagnostics['file_size_bytes']} bytes)"
+            )
 
             with open(index_path, "rb") as f:
                 data = pickle.load(f)
@@ -331,181 +521,124 @@ class QASystem:
             self.use_embeddings = data.get("use_embeddings", self.use_embeddings)
             self.semantic_weight = data.get("semantic_weight", self.semantic_weight)
             self.lexical_weight = data.get("lexical_weight", self.lexical_weight)
-            self.chunk_embeddings = data.get("chunk_embeddings", None)
-            self.vectorizer = data.get("vectorizer", None)
-            self.tfidf_matrix = data.get("tfidf_matrix", None)
+            self.chunk_embeddings = data.get("chunk_embeddings")
+            self.vectorizer = data.get("vectorizer")
+            self.tfidf_matrix = data.get("tfidf_matrix")
             self.ollama_model = data.get("ollama_model", self.ollama_model)
             self.gemini_model = data.get("gemini_model", self.gemini_model)
             self.llm_provider = data.get("llm_provider", self.llm_provider)
-
-            if self.use_embeddings and self.embedding_model is None:
-                self._try_load_embedding_model()
-
-            if self.use_llm:
-                self._validate_llm_config()
+            self.last_index_diagnostics = data.get("diagnostics", {})
 
             self.is_ready = bool(self.chunks)
-            print(f"✅ Индекс загружен: {len(self.chunks)} фрагментов")
-            return True
+            self.last_load_diagnostics["success"] = self.is_ready
+
+            print("✅ Индекс загружен")
+            print(f"   documents={len(self.documents)}")
+            print(f"   chunks={len(self.chunks)}")
+            print(f"   embeddings_present={self.chunk_embeddings is not None}")
+            if self.chunk_embeddings is not None:
+                print(f"   embeddings_shape={self.chunk_embeddings.shape}")
+            print(f"   tfidf_present={self.tfidf_matrix is not None}")
+
+            return self.is_ready
+
         except Exception as e:
+            self.last_load_diagnostics["error"] = str(e)
             print(f"❌ Ошибка загрузки индекса: {e}")
-            self.is_ready = False
+            import traceback
+            traceback.print_exc()
             return False
+
+    def get_diagnostics(self) -> dict[str, Any]:
+        """Возвращает полную диагностику состояния."""
+        return {
+            "is_ready": self.is_ready,
+            "documents_total": len(self.documents),
+            "chunks_total": len(self.chunks),
+            "has_embeddings": self.chunk_embeddings is not None,
+            "embeddings_shape": str(self.chunk_embeddings.shape) if self.chunk_embeddings is not None else None,
+            "has_tfidf": self.tfidf_matrix is not None,
+            "last_index_diagnostics": self.last_index_diagnostics,
+            "last_save_diagnostics": self.last_save_diagnostics,
+            "last_load_diagnostics": self.last_load_diagnostics,
+        }
 
     def search(
         self,
         query: str,
-        top_k: int | None = None,
-        search_type: str = "hybrid",
+        top_k: Optional[int] = None,
     ) -> list[SearchResult]:
-        """Поиск по индексу."""
+        """Поиск по индексу (гибридный)."""
         if not self.is_ready or not self.chunks:
             return []
 
+        query = (query or "").strip()
+        if not query:
+            return []
+
         top_k = top_k or self.top_k
+        lexical_scores = np.zeros(len(self.chunks), dtype=np.float32)  # type: ignore
+        semantic_scores = np.zeros(len(self.chunks), dtype=np.float32)  # type: ignore
 
-        if search_type == "semantic":
-            return self._search_semantic(query, top_k)
-        if search_type == "lexical":
-            return self._search_lexical(query, top_k)
-
-        return self._search_hybrid(query, top_k)
-
-    def _search_semantic(self, query: str, top_k: int) -> list[SearchResult]:
-        """Семантический поиск."""
-        if self.chunk_embeddings is None or self.embedding_model is None:
-            return []
-
-        try:
-            query_emb = self.embedding_model.encode(
-                [query],
-                normalize_embeddings=True,
-                show_progress_bar=False,
-            )
-            query_emb = np.asarray(query_emb, dtype=np.float32)[0]  # type: ignore
-            scores = np.dot(self.chunk_embeddings, query_emb)  # type: ignore
-
-            sorted_indices = np.argsort(scores)[::-1][:top_k]
-            results: list[SearchResult] = []
-
-            for idx in sorted_indices:
-                score = float(scores[idx])
-                if score < self.min_score:
-                    continue
-                chunk = self.chunks[idx]
-                results.append(
-                    SearchResult(
-                        doc_name=chunk["doc_name"],
-                        chunk_id=chunk["chunk_id"],
-                        text=chunk["text"],
-                        score=score,
-                        semantic_score=score,
-                        lexical_score=0.0,
-                        filepath=chunk.get("filepath", ""),
-                        metadata=chunk.get("metadata", {}),
-                    )
-                )
-            return results
-        except Exception as e:
-            print(f"⚠️ Ошибка semantic search: {e}")
-            return []
-
-    def _search_lexical(self, query: str, top_k: int) -> list[SearchResult]:
-        """Лексический поиск."""
-        if self.vectorizer is None or self.tfidf_matrix is None:
-            return []
-
-        try:
-            query_vec = self.vectorizer.transform([query])
-            scores = (self.tfidf_matrix @ query_vec.T).toarray().ravel()
-
-            sorted_indices = np.argsort(scores)[::-1][:top_k]
-            results: list[SearchResult] = []
-
-            for idx in sorted_indices:
-                score = float(scores[idx])
-                if score < max(self.min_score * 0.5, 0.01):
-                    continue
-                chunk = self.chunks[idx]
-                results.append(
-                    SearchResult(
-                        doc_name=chunk["doc_name"],
-                        chunk_id=chunk["chunk_id"],
-                        text=chunk["text"],
-                        score=score,
-                        semantic_score=0.0,
-                        lexical_score=score,
-                        filepath=chunk.get("filepath", ""),
-                        metadata=chunk.get("metadata", {}),
-                    )
-                )
-            return results
-        except Exception as e:
-            print(f"⚠️ Ошибка lexical search: {e}")
-            return []
-
-    def _search_hybrid(self, query: str, top_k: int) -> list[SearchResult]:
-        """Гибридный поиск."""
-        semantic_scores = np.zeros(len(self.chunks), dtype=np.float32)
-        lexical_scores = np.zeros(len(self.chunks), dtype=np.float32)
-
-        if self.chunk_embeddings is not None and self.embedding_model is not None:
+        # Лексический поиск (TF-IDF)
+        if self.vectorizer is not None and self.tfidf_matrix is not None:
             try:
-                query_emb = self.embedding_model.encode(
+                query_vec = self.vectorizer.transform([query])
+                sim = (self.tfidf_matrix @ query_vec.T).toarray().ravel()
+                lexical_scores = sim.astype(np.float32)  # type: ignore
+            except Exception as e:
+                print(f"⚠️ Ошибка lexical search: {e}")
+
+        # Семантический поиск (эмбеддинги)
+        if self.embedding_model is not None and self.chunk_embeddings is not None:
+            try:
+                q_emb = self.embedding_model.encode(
                     [query],
                     normalize_embeddings=True,
                     show_progress_bar=False,
                 )
-                query_emb = np.asarray(query_emb, dtype=np.float32)[0]  # type: ignore
-                semantic_scores = np.dot(self.chunk_embeddings, query_emb)  # type: ignore
+                q_emb = np.asarray(q_emb, dtype=np.float32)[0]  # type: ignore
+                semantic_scores = self.chunk_embeddings @ q_emb  # type: ignore
             except Exception as e:
-                print(f"⚠️ Ошибка semantic части hybrid search: {e}")
+                print(f"⚠️ Ошибка semantic search: {e}")
 
-        if self.vectorizer is not None and self.tfidf_matrix is not None:
-            try:
-                query_vec = self.vectorizer.transform([query])
-                lexical_scores = (self.tfidf_matrix @ query_vec.T).toarray().ravel()
-            except Exception as e:
-                print(f"⚠️ Ошибка lexical части hybrid search: {e}")
+        # Гибридная комбинация
+        if self.chunk_embeddings is not None:
+            scores = self.semantic_weight * semantic_scores + self.lexical_weight * lexical_scores
+        else:
+            scores = lexical_scores
 
-        combined = self.semantic_weight * semantic_scores + self.lexical_weight * lexical_scores
-        sorted_indices = np.argsort(combined)[::-1][:max(top_k * 2, top_k)]
-
+        ranked_ids = np.argsort(scores)[::-1][:top_k]  # type: ignore
         results: list[SearchResult] = []
-        seen = set()
 
-        for idx in sorted_indices:
-            score = float(combined[idx])
-            if score < max(self.min_score * 0.5, 0.01):
+        for idx in ranked_ids:
+            score = float(scores[idx])
+            if score < self.min_score:
                 continue
 
             chunk = self.chunks[idx]
-            key = (chunk["doc_name"], chunk["chunk_id"])
-            if key in seen:
-                continue
-            seen.add(key)
-
             results.append(
                 SearchResult(
-                    doc_name=chunk["doc_name"],
-                    chunk_id=chunk["chunk_id"],
-                    text=chunk["text"],
+                    doc_name=chunk.get("doc_name", ""),
+                    chunk_id=int(chunk.get("chunk_id", 0)),
+                    text=chunk.get("text", ""),
                     score=score,
-                    semantic_score=float(semantic_scores[idx]),
-                    lexical_score=float(lexical_scores[idx]),
+                    semantic_score=float(semantic_scores[idx]) if len(semantic_scores) else 0.0,
+                    lexical_score=float(lexical_scores[idx]) if len(lexical_scores) else 0.0,
                     filepath=chunk.get("filepath", ""),
-                    metadata=chunk.get("metadata", {}),
+                    metadata=chunk.get("metadata", {}) or {},
                 )
             )
 
-            if len(results) >= top_k:
-                break
-
         return results
 
-    def answer(self, question: str, top_k: int | None = None, search_type: str = "hybrid") -> dict[str, Any]:
+    def answer(
+        self,
+        question: str,
+        top_k: Optional[int] = None,
+    ) -> dict[str, Any]:
         """Отвечает на вопрос."""
-        results = self.search(question, top_k=top_k, search_type=search_type)
+        results = self.search(question, top_k=top_k)
         context = self._build_context(results)
 
         if not results:
@@ -570,20 +703,6 @@ class QASystem:
 
         return {"found": False, "definition": "", "source": ""}
 
-    def _try_load_embedding_model(self) -> None:
-        """Загружает модель эмбеддингов."""
-        if SentenceTransformer is None:
-            self.embedding_model = None
-            print("⚠️ sentence-transformers не установлен")
-            return
-
-        try:
-            self.embedding_model = SentenceTransformer(self.embedding_model_name)
-            print(f"✅ Эмбеддинг модель загружена: {self.embedding_model_name}")
-        except Exception as e:
-            self.embedding_model = None
-            print(f"⚠️ Не удалось загрузить эмбеддинг модель: {e}")
-
     @staticmethod
     def _build_context(results: list[SearchResult]) -> str:
         """Собирает контекст."""
@@ -611,8 +730,6 @@ class QASystem:
                     "filepath": item.filepath,
                 })
         return sources[:5]
-
-    # ← УДАЛЕНА _extract_tables_from_results — используем из table_extractor
 
     @staticmethod
     def _extract_formulas_from_results(results: list[SearchResult]) -> list[dict[str, Any]]:
@@ -648,7 +765,7 @@ class QASystem:
 
         return best
 
-    def _ask_ollama(self, prompt: str) -> str | None:
+    def _ask_ollama(self, prompt: str) -> Optional[str]:
         """Запрос к Ollama."""
         try:
             response = requests.post(
@@ -668,7 +785,7 @@ class QASystem:
             print(f"⚠️ Ошибка Ollama: {e}")
             return None
 
-    def _ask_gemini(self, prompt: str) -> str | None:
+    def _ask_gemini(self, prompt: str) -> Optional[str]:
         """Запрос к Gemini через google.genai SDK."""
         if not self.gemini_available or self.genai_client is None:
             return None
