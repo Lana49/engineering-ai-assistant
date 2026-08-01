@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """
 Инженерный чат-бот для работы с документацией.
-С ПРИНУДИТЕЛЬНЫМ ПОСТРОЕНИЕМ ИНДЕКСА.
+С ПРИНУДИТЕЛЬНЫМ ПОСТРОЕНИЕМ ИНДЕКСА И ПОДДЕРЖКОЙ LLM.
 """
 
 from __future__ import annotations
@@ -10,7 +10,6 @@ import asyncio
 import json
 import time
 from datetime import datetime
-
 
 import streamlit as st
 
@@ -370,9 +369,10 @@ def force_rebuild_index(qa: QASystem) -> bool:
     ПРИНУДИТЕЛЬНО перестраивает индекс с эмбеддингами.
     Выводит подробную диагностику.
     """
+    print("=" * 50)
     print("🔨 ПРИНУДИТЕЛЬНАЯ ПЕРЕСТРОЙКА ИНДЕКСА")
+    print("=" * 50)
 
-    # 1. Проверяем наличие документов
     if not RAW_DIR.exists():
         print(f"❌ Папка {RAW_DIR} не существует")
         return False
@@ -386,7 +386,6 @@ def force_rebuild_index(qa: QASystem) -> bool:
         print("❌ Нет документов для индексации")
         return False
 
-    # 2. Парсим документы
     print("📖 Начинаем парсинг документов...")
     parsed_docs = parse_directory(RAW_DIR, recursive=True)
 
@@ -396,11 +395,9 @@ def force_rebuild_index(qa: QASystem) -> bool:
 
     print(f"📄 Распарсено документов: {len(parsed_docs)}")
 
-    # Считаем чанки
     total_chunks = sum(len(doc.get("chunks", [])) for doc in parsed_docs)
     print(f"🧩 Всего чанков: {total_chunks}")
 
-    # 3. Строим индекс
     print("🔨 Строим индекс с эмбеддингами...")
     result = qa.build_index(parsed_docs)
 
@@ -414,7 +411,6 @@ def force_rebuild_index(qa: QASystem) -> bool:
     if qa.chunk_embeddings is not None:
         print(f"   embeddings shape: {qa.chunk_embeddings.shape}")
 
-    # 4. Сохраняем индекс
     print("💾 Сохраняем индекс...")
     save_result = qa.save_index(INDEX_FILE)
 
@@ -425,18 +421,21 @@ def force_rebuild_index(qa: QASystem) -> bool:
     else:
         print("❌ Ошибка сохранения индекса")
 
+    print("=" * 50)
     return save_result
 
 
 def init_qa_system() -> QASystem:
     """Инициализирует QA-систему с загрузкой или построением индекса."""
+    # ← ИСПРАВЛЕНО: явно указываем llm_provider="ollama"
     qa = QASystem(
         use_llm=True,
-        llm_provider="ollama",
+        llm_provider="ollama",  # ← ИЗМЕНЕНО с "mixed" на "ollama"
         use_embeddings=True,
+        ollama_base_url="http://localhost:11434",
+        ollama_model="llama3.1:8b",
     )
 
-    # Проверяем наличие индекса
     if INDEX_FILE.exists():
         print(f"📂 Индекс найден: {INDEX_FILE}")
         try:
@@ -447,13 +446,8 @@ def init_qa_system() -> QASystem:
             print(f"⚠️ Ошибка загрузки индекса: {e}")
             print("🔄 Будет выполнена перестройка...")
 
-    # Индекса нет или он повреждён — строим заново
     print("📥 Индекс не найден или повреждён. Выполняется синхронизация и парсинг...")
-
-    # Синхронизируем dataset
     sync_hf_dataset_to_raw()
-
-    # Принудительно перестраиваем индекс
     force_rebuild_index(qa)
 
     return qa
@@ -500,7 +494,6 @@ def auto_load_documents() -> bool:
         st.sidebar.success(f"✅ База знаний готова\n📄 {chunks_count} фрагментов")
         return True
 
-    # Если индекс не готов — пытаемся перестроить
     if not INDEX_FILE.exists():
         st.sidebar.info("🔄 Индекс отсутствует. Выполняется перестройка...")
         with st.sidebar:
@@ -512,6 +505,7 @@ def auto_load_documents() -> bool:
                 else:
                     st.error("❌ Не удалось перестроить индекс")
                     return False
+
     try:
         if qa_system.load_index(INDEX_FILE):
             st.sidebar.success(f"✅ Индекс загружен\n📄 {len(qa_system.chunks)} фрагментов")
@@ -537,7 +531,7 @@ def render_sidebar(qa_system: QASystem, formula_engine: FormulaEngine, error_han
         """)
         st.divider()
 
-        # Диагностика
+        # ========= ДИАГНОСТИКА ИНДЕКСА =========
         st.subheader("🔍 Диагностика индекса")
         st.write(f"INDEX_FILE: `{INDEX_FILE}`")
         st.write(f"Файл существует: `{INDEX_FILE.exists()}`")
@@ -553,6 +547,17 @@ def render_sidebar(qa_system: QASystem, formula_engine: FormulaEngine, error_han
         else:
             st.write("Эмбеддинги: `Нет`")
 
+        st.divider()
+
+        # ========= ДИАГНОСТИКА LLM =========
+        st.subheader("🤖 Статус LLM")
+        st.write(f"use_llm: `{qa_system.use_llm}`")
+        st.write(f"llm_provider: `{qa_system.llm_provider}`")
+        st.write(f"llm_available: `{qa_system.llm_available}`")
+        st.write(f"selected_provider: `{qa_system._select_provider()}`")
+        st.write(f"ollama_alive: `{qa_system.is_ollama_alive()}`")
+        st.write(f"ollama_model: `{qa_system.ollama_model}`")
+        st.write(f"gemini_available: `{qa_system.gemini_available}`")
         st.divider()
 
         auto_load_documents()
@@ -584,7 +589,6 @@ def render_sidebar(qa_system: QASystem, formula_engine: FormulaEngine, error_han
                     st.error("❌ Не удалось синхронизировать dataset")
                 st.rerun()
 
-        # КНОПКА ПРИНУДИТЕЛЬНОЙ ПЕРЕСТРОЙКИ
         if st.button("🔨 Перестроить индекс (с эмбеддингами)", use_container_width=True):
             with st.spinner("🔄 Перестройка индекса..."):
                 if force_rebuild_index(qa_system):
@@ -725,7 +729,6 @@ def main() -> None:
 
     render_sidebar(qa_system, formula_engine, error_handler)
 
-    # Отображение сообщений
     for message in st.session_state.messages:
         with st.chat_message(message["role"]):
             st.markdown(message["content"])
@@ -741,7 +744,6 @@ def main() -> None:
                         response_id=st.session_state.current_response_id,
                     )
 
-    # Обработка вопроса
     prompt = st.chat_input("Задайте вопрос по строительной документации...", key="main_chat_input")
     if prompt:
         st.session_state.messages.append({"role": "user", "content": prompt})
@@ -774,7 +776,6 @@ def main() -> None:
                     is_def = any(w in prompt_lower for w in def_triggers)
                     is_table = any(w in prompt_lower for w in table_triggers)
 
-                    # Быстрое определение
                     quick_def = get_quick_definition(prompt)
                     if quick_def:
                         response = (
@@ -788,7 +789,6 @@ def main() -> None:
                         st.stop()
 
                     if is_calc:
-                        # Расчётный запрос
                         result = call_maybe_async(formula_engine.answer_calculation, prompt)
                         response = result.get("answer", "Не удалось выполнить расчёт")
                         sources = result.get("sources", [])
@@ -799,7 +799,6 @@ def main() -> None:
                             formulas = [result["formula"]]
 
                     elif is_def:
-                        # Определение термина
                         clean_term = prompt_lower
                         for trigger in def_triggers:
                             clean_term = clean_term.replace(trigger, "").strip(" ?!.,:")
@@ -815,7 +814,6 @@ def main() -> None:
                             response = f"⚠️ В загруженных документах не найдено определение для термина «{clean_term}»."
 
                     elif is_table:
-                        # Поиск таблицы
                         result = qa_system.answer(prompt)
                         response = result.get("answer", "Таблица не найдена")
                         tables = result.get("tables", [])
@@ -833,7 +831,6 @@ def main() -> None:
                                     response += f"```\n{content}\n```\n"
 
                     else:
-                        # Агентский цикл для сложных запросов
                         result = call_maybe_async(agent_loop.run, prompt)
                         response = result.get("answer", "Не удалось получить ответ")
                         sources = result.get("sources", [])
@@ -845,7 +842,6 @@ def main() -> None:
                             if questions:
                                 response += "\n\n❓ **Уточните:**\n" + "\n".join([f"• {q}" for q in questions])
 
-                    # Показываем цепочку рассуждений
                     with st.sidebar:
                         with st.expander("🔍 Показать цепочку рассуждений"):
                             if is_calc:
@@ -853,11 +849,9 @@ def main() -> None:
                             else:
                                 st.markdown(agent_loop.get_reasoning_chain())
 
-                    # Новый уникальный id ответа
                     st.session_state.current_response_id += 1
                     current_id = st.session_state.current_response_id
 
-                    # Сохраняем для экспорта
                     st.session_state.current_answer = response
                     st.session_state.current_sources = sources
                     st.session_state.current_tables = tables
