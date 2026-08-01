@@ -3,9 +3,9 @@
 Парсер документов для инженерной базы знаний.
 
 Поддерживает:
-- .pdf   -> PyMuPDF + pdfplumber (fallback)
+- .pdf   -> PyMuPDF + pdfplumber + OCR (tesseract) как fallback
 - .docx  -> python-docx
-- .doc   -> textutil (macOS) / textract (Linux/Windows)
+- .doc   -> textutil (только macOS)
 - .rtf   -> striprtf
 """
 
@@ -19,6 +19,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+# Поддерживаемые расширения (только в нижнем регистре для проверки)
 SUPPORTED_EXTENSIONS = {".pdf", ".docx", ".doc", ".rtf"}
 
 # Определяем платформу
@@ -30,131 +31,189 @@ def command_exists(name: str) -> bool:
     return shutil.which(name) is not None
 
 
-def read_doc_textutil(file_path: str | Path) -> str:
-    """
-    Чтение .doc через встроенную утилиту macOS textutil.
-    Работает только на macOS.
-    """
-    if not IS_MACOS:
-        return ""
+def is_supported_file(path: Path) -> bool:
+    """Проверяет, поддерживается ли расширение файла (регистронезависимо)."""
+    return path.suffix.lower() in SUPPORTED_EXTENSIONS
 
-    path = Path(file_path)
-    if not path.exists() or path.stat().st_size == 0:
-        return ""
 
+# ============ PDF ============
+
+def read_pdf_pymupdf(file_path: str | Path) -> tuple[str, str | None]:
+    """
+    Читает PDF через PyMuPDF.
+    Возвращает (текст, сообщение_об_ошибке).
+    """
     try:
-        result = subprocess.run(
-            ["textutil", "-stdout", "-convert", "txt", str(path)],
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            timeout=60,
-        )
-        if result.returncode == 0 and result.stdout.strip():
-            return result.stdout.strip()
-        return ""
-    except (subprocess.TimeoutExpired, subprocess.SubprocessError, FileNotFoundError):
-        return ""
-
-
-def read_doc_textract(file_path: str | Path) -> str:
-    """
-    Чтение .doc через textract (Linux/Windows).
-    Проверяет наличие antiword перед вызовом.
-    """
-    # Проверяем, установлен ли textract
-    try:
-        import textract
+        import pymupdf
     except ImportError:
-        return ""
+        try:
+            import fitz as pymupdf  # type: ignore
+        except ImportError:
+            return "", "PyMuPDF не установлен"
 
     path = Path(file_path)
     if not path.exists() or path.stat().st_size == 0:
-        return ""
-
-    # Проверяем наличие antiword (textract требует его для .doc)
-    if not command_exists("antiword"):
-        return ""
+        return "", "файл пустой или не найден"
 
     try:
-        data = textract.process(str(path))
-        return data.decode("utf-8", errors="ignore").strip()
-    except Exception:
-        return ""
+        parts: list[str] = []
+        with pymupdf.open(str(path)) as doc:  # type: ignore
+            for page_num, page in enumerate(doc, start=1):
+                try:
+                    page_text = page.get_text("text") or ""
+                    if page_text.strip():
+                        parts.append(page_text.strip())
+                except (AttributeError, ValueError, TypeError) as page_exc:
+                    print(f"⚠️ PyMuPDF: ошибка страницы {page_num} в {path.name}: {page_exc}")
+
+        text = "\n\n".join(parts).strip()
+        if text:
+            return text, None
+        return "", "текст не извлечён (возможно, сканированный PDF)"
+    except (OSError, ValueError, TypeError, RuntimeError) as exc:
+        return "", f"PyMuPDF ошибка: {exc}"
 
 
-def read_doc_catdoc(file_path: str | Path) -> str:
+def read_pdf_pdfplumber(file_path: str | Path) -> tuple[str, str | None]:
     """
-    Чтение .doc через catdoc (альтернатива для Linux/macOS).
+    Читает PDF через pdfplumber как fallback.
+    Возвращает (текст, сообщение_об_ошибке).
+    """
+    try:
+        import pdfplumber
+    except ImportError:
+        return "", "pdfplumber не установлен"
+
+    path = Path(file_path)
+    if not path.exists() or path.stat().st_size == 0:
+        return "", "файл пустой или не найден"
+
+    try:
+        parts: list[str] = []
+        with pdfplumber.open(str(path)) as pdf:
+            for page_num, page in enumerate(pdf.pages, start=1):
+                try:
+                    text = page.extract_text() or ""
+                    if text.strip():
+                        parts.append(text.strip())
+                except (AttributeError, ValueError, TypeError) as page_exc:
+                    print(f"⚠️ pdfplumber: ошибка страницы {page_num} в {path.name}: {page_exc}")
+
+        text = "\n\n".join(parts).strip()
+        if text:
+            return text, None
+        return "", "текст не извлечён (возможно, сканированный PDF)"
+    except (OSError, ValueError, TypeError, RuntimeError) as exc:
+        return "", f"pdfplumber ошибка: {exc}"
+
+
+def read_pdf_ocr(file_path: str | Path) -> tuple[str, str | None]:
+    """
+    OCR fallback для сканированных PDF.
+    Использует Tesseract через pytesseract.
+    Возвращает (текст, сообщение_об_ошибке).
     """
     path = Path(file_path)
     if not path.exists() or path.stat().st_size == 0:
-        return ""
+        return "", "файл пустой или не найден"
 
-    if not command_exists("catdoc"):
-        return ""
+    # Проверяем наличие всех зависимостей
+    try:
+        import pymupdf
+    except ImportError:
+        try:
+            import fitz as pymupdf  # type: ignore
+        except ImportError:
+            return "", "PyMuPDF не установлен (нужен для OCR)"
 
     try:
-        result = subprocess.run(
-            ["catdoc", str(path)],
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            timeout=60,
-        )
-        if result.returncode == 0 and result.stdout.strip():
-            return result.stdout.strip()
-        return ""
-    except (subprocess.TimeoutExpired, subprocess.SubprocessError):
-        return ""
+        import pytesseract  # noqa: F401
+    except ImportError:
+        return "", "pytesseract не установлен (pip install pytesseract)"
+
+    try:
+        from PIL import Image  # noqa: F401
+    except ImportError:
+        return "", "Pillow не установлен (pip install Pillow)"
+
+    # Проверяем наличие tesseract в системе
+    if not command_exists("tesseract"):
+        return "", "Tesseract не установлен в системе"
+
+    try:
+        parts: list[str] = []
+        with pymupdf.open(str(path)) as doc:  # type: ignore
+            total_pages = len(doc)
+            print(f"📄 OCR страниц {path.name}: {total_pages}")
+
+            for page_num, page in enumerate(doc, start=1):
+                try:
+                    matrix = pymupdf.Matrix(2.5, 2.5)  # type: ignore
+                    pix = page.get_pixmap(matrix=matrix)
+
+                    img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
+
+                    text = pytesseract.image_to_string(
+                        img,
+                        lang="rus+eng",
+                        config="--psm 6 --oem 3"
+                    )
+                    if text.strip():
+                        parts.append(text.strip())
+                        print(f"   ✅ Страница {page_num}/{total_pages} распознана")
+                    else:
+                        print(f"   ⚠️ Страница {page_num}/{total_pages} пустая")
+                except (AttributeError, ValueError, TypeError, OSError) as page_exc:
+                    print(f"   ⚠️ Страница {page_num}/{total_pages} ошибка: {page_exc}")
+
+        text = "\n\n".join(parts).strip()
+        if text:
+            return text, None
+        return "", "OCR не распознал текст"
+    except (OSError, ValueError, TypeError, RuntimeError) as exc:
+        return "", f"OCR ошибка: {exc}"
 
 
-def read_doc(file_path: str | Path) -> str:
+def read_pdf(file_path: str | Path) -> tuple[str, str | None]:
     """
-    Чтение .doc с каскадным fallback:
-    1. textutil (macOS)
-    2. catdoc (Linux/macOS)
-    3. textract (Linux/Windows)
+    Читает PDF с несколькими fallback-стратегиями.
+    Возвращает (текст, причина_успеха/ошибки).
     """
     path = Path(file_path)
     if not path.exists() or not path.is_file() or path.stat().st_size == 0:
-        return ""
+        return "", "файл не существует или пустой"
 
-    # 1. Пробуем textutil на macOS
-    if IS_MACOS:
-        text = read_doc_textutil(path)
-        if text:
-            return text
+    print(f"📄 Чтение PDF: {path.name}")
 
-    # 2. Пробуем catdoc
-    text = read_doc_catdoc(path)
+    text, error = read_pdf_pymupdf(path)
     if text:
-        return text
+        return text, "PyMuPDF"
 
-    # 3. Пробуем textract
-    text = read_doc_textract(path)
+    text, error = read_pdf_pdfplumber(path)
     if text:
-        return text
+        return text, "pdfplumber"
 
-    print(f"⚠️ Не удалось извлечь текст из DOC {path.name}")
-    return ""
+    text, error = read_pdf_ocr(path)
+    if text:
+        return text, "OCR (Tesseract)"
+
+    return "", error or "все методы извлечения текста не сработали"
 
 
-def read_docx(file_path: str | Path) -> str:
+# ============ DOCX ============
+
+def read_docx(file_path: str | Path) -> tuple[str, str | None]:
     """Чтение DOCX файла через python-docx."""
     try:
         from docx import Document
     except ImportError:
-        print("⚠️ python-docx не установлен. Установите: pip install python-docx")
-        return ""
+        return "", "python-docx не установлен"
 
     path = Path(file_path)
-    try:
-        if not path.exists() or path.stat().st_size == 0:
-            return ""
+    if not path.exists() or path.stat().st_size == 0:
+        return "", "файл пустой или не найден"
 
+    try:
         doc = Document(str(path))
         parts: list[str] = []
 
@@ -169,114 +228,84 @@ def read_docx(file_path: str | Path) -> str:
                 if any(cells):
                     parts.append(" | ".join(cells))
 
-        return "\n".join(parts).strip()
-    except Exception as exc:
-        print(f"⚠️ Ошибка DOCX {path.name}: {exc}")
-        return ""
+        text = "\n".join(parts).strip()
+        if text:
+            return text, "python-docx"
+        return "", "текст не извлечён"
+    except (OSError, ValueError, TypeError, ImportError) as exc:
+        return "", f"python-docx ошибка: {exc}"
 
 
-def read_pdf_pymupdf(file_path: str | Path) -> str:
-    """Чтение PDF через PyMuPDF."""
-    try:
-        import pymupdf
-    except ImportError:
-        try:
-            import fitz as pymupdf
-        except ImportError:
-            print("⚠️ PyMuPDF не установлен. Установите: pip install PyMuPDF")
-            return ""
+# ============ DOC (старый формат) — только textutil для macOS ============
+
+def read_doc(file_path: str | Path) -> tuple[str, str | None]:
+    """Чтение .doc через textutil (только macOS)."""
+    if not IS_MACOS:
+        return "", "textutil доступен только на macOS"
 
     path = Path(file_path)
+    if not path.exists() or path.stat().st_size == 0:
+        return "", "файл пустой или не найден"
+
+    # Проверяем наличие textutil
+    if not command_exists("textutil"):
+        return "", "textutil не установлен в системе"
+
     try:
-        with pymupdf.open(str(path)) as doc:
-            parts: list[str] = []
-            for page in doc:
-                page_text = page.get_text() or ""
-                if page_text.strip():
-                    parts.append(page_text.strip())
-        return "\n".join(parts).strip()
-    except Exception as exc:
-        print(f"⚠️ PyMuPDF ошибка {path.name}: {exc}")
-        return ""
+        result = subprocess.run(
+            ["textutil", "-stdout", "-convert", "txt", str(path)],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=60,
+        )
+        if result.returncode == 0 and result.stdout.strip():
+            return result.stdout.strip(), "textutil"
+        return "", "textutil не вернул текст"
+    except (subprocess.TimeoutExpired, subprocess.SubprocessError, OSError) as exc:
+        return "", f"textutil ошибка: {exc}"
 
 
-def read_pdf_pdfplumber(file_path: str | Path) -> str:
-    """Чтение PDF через pdfplumber (fallback)."""
-    try:
-        import pdfplumber
-    except ImportError:
-        return ""
+# ============ RTF ============
 
-    path = Path(file_path)
-    try:
-        with pdfplumber.open(str(path)) as pdf:
-            parts: list[str] = []
-            for page in pdf.pages:
-                text = page.extract_text() or ""
-                if text.strip():
-                    parts.append(text.strip())
-        return "\n".join(parts).strip()
-    except Exception as exc:
-        print(f"⚠️ pdfplumber ошибка {path.name}: {exc}")
-        return ""
-
-
-def read_pdf(file_path: str | Path) -> str:
-    """Чтение PDF с каскадным fallback."""
-    path = Path(file_path)
-    if not path.exists() or not path.is_file() or path.stat().st_size == 0:
-        return ""
-
-    text = read_pdf_pymupdf(path)
-    if text:
-        return text
-
-    text = read_pdf_pdfplumber(path)
-    if text:
-        return text
-
-    print(f"⚠️ Не удалось извлечь текст из PDF {path.name}")
-    return ""
-
-
-def read_rtf(file_path: str | Path) -> str:
-    """Чтение RTF файла через striprtf с поддержкой кодировок."""
+def read_rtf(file_path: str | Path) -> tuple[str, str | None]:
+    """Чтение RTF файла через striprtf."""
     try:
         from striprtf.striprtf import rtf_to_text
     except ImportError:
-        print("⚠️ striprtf не установлен. Установите: pip install striprtf")
-        return ""
+        return "", "striprtf не установлен"
 
     path = Path(file_path)
-    try:
-        if not path.exists() or path.stat().st_size == 0:
-            return ""
+    if not path.exists() or path.stat().st_size == 0:
+        return "", "файл пустой или не найден"
 
-        for encoding in ("utf-8", "cp1251", "latin-1"):
-            try:
-                content = path.read_text(encoding=encoding, errors="replace")
-                if content.strip():
-                    return rtf_to_text(content).strip()
-            except Exception:
-                continue
+    for encoding in ("utf-8", "cp1251", "latin-1"):
+        try:
+            content = path.read_text(encoding=encoding, errors="replace")
+            if content.strip():
+                text = rtf_to_text(content).strip()
+                if text:
+                    return text, f"striprtf ({encoding})"
+        except (OSError, UnicodeDecodeError):
+            continue
 
-        return ""
-    except Exception as exc:
-        print(f"⚠️ Ошибка RTF {path.name}: {exc}")
-        return ""
+    return "", "не удалось прочитать RTF"
 
 
-def read_file(file_path: str | Path) -> str:
+# ============ УНИВЕРСАЛЬНОЕ ЧТЕНИЕ ============
+
+def read_file(file_path: str | Path) -> tuple[str, str | None]:
     """Универсальное чтение файла с каскадными fallback."""
     path = Path(file_path)
 
     if not path.exists() or not path.is_file() or path.stat().st_size == 0:
-        return ""
+        return "", "файл не существует или пустой"
 
+    # Регистронезависимая проверка расширения
     suffix = path.suffix.lower()
     if suffix not in SUPPORTED_EXTENSIONS:
-        print(f"⚠️ Неподдерживаемый формат: {path.name}")
-        return ""
+        return "", f"неподдерживаемый формат: {path.suffix}"
 
     if suffix == ".docx":
         return read_docx(path)
@@ -287,8 +316,10 @@ def read_file(file_path: str | Path) -> str:
     if suffix == ".rtf":
         return read_rtf(path)
 
-    return ""
+    return "", "неизвестный формат"
 
+
+# ============ ПАРСЕР ============
 
 @dataclass(slots=True)
 class ParsedDocument:
@@ -452,7 +483,12 @@ class DocumentParser:
         return tabular_lines >= 2
 
     @staticmethod
-    def build_metadata(path: Path, text: str, chunks: list[dict[str, Any]]) -> dict[str, Any]:
+    def build_metadata(
+        path: Path,
+        text: str,
+        chunks: list[dict[str, Any]],
+        source: str | None = None
+    ) -> dict[str, Any]:
         """Собирает метаданные."""
         return {
             "parsed": True,
@@ -465,15 +501,18 @@ class DocumentParser:
             "chunk_count": len(chunks),
             "has_formulas": any(chunk.get("has_formula", False) for chunk in chunks),
             "has_table_like_content": any(chunk.get("has_table_like_content", False) for chunk in chunks),
+            "extraction_source": source or "unknown",
         }
 
     def parse_file(self, file_path: str | Path) -> dict[str, Any]:
         """Парсит один файл."""
         path = Path(file_path)
+        print(f"📄 Парсинг: {path.name}")
 
         try:
-            text = self.normalize_text(read_file(path))
-        except Exception as exc:
+            text, source = read_file(path)
+            text = self.normalize_text(text)
+        except (OSError, UnicodeDecodeError, ValueError) as exc:
             print(f"⚠️ Ошибка парсинга {path.name}: {exc}")
             return {
                 "doc_name": path.name,
@@ -490,6 +529,8 @@ class DocumentParser:
             }
 
         if not text:
+            reason = source or "неизвестная причина"
+            print(f"⚠️ Не удалось извлечь текст из {path.name}: {reason}")
             return {
                 "doc_name": path.name,
                 "filepath": str(path),
@@ -500,8 +541,11 @@ class DocumentParser:
                     "parsed": False,
                     "filename": path.name,
                     "suffix": path.suffix.lower(),
+                    "reason": reason,
                 },
             }
+
+        print(f"✅ Текст извлечён из {path.name}: {len(text)} символов через {source}")
 
         raw_chunks = self.split_paragraphs(text)
         chunks: list[dict[str, Any]] = []
@@ -518,7 +562,7 @@ class DocumentParser:
                 "has_table_like_content": self.detect_table_like_content(chunk_text),
             })
 
-        metadata = self.build_metadata(path, text, chunks)
+        metadata = self.build_metadata(path, text, chunks, source)
 
         return {
             "doc_name": path.name,
@@ -533,30 +577,43 @@ class DocumentParser:
         """Парсит директорию."""
         base = Path(directory)
         if not base.exists() or not base.is_dir():
+            print(f"⚠️ Директория не существует: {base}")
             return []
 
         pattern = "**/*" if recursive else "*"
-        files = [
-            p for p in base.glob(pattern)
-            if p.is_file() and p.suffix.lower() in SUPPORTED_EXTENSIONS
-        ]
+        all_files = [p for p in base.glob(pattern) if p.is_file()]
+
+        supported_files = [p for p in all_files if is_supported_file(p)]
+        unsupported_files = [p for p in all_files if not is_supported_file(p)]
+
+        print(f"📦 Всего файлов в {base}: {len(all_files)}")
+        print(f"✅ Поддерживаемых: {len(supported_files)}")
+        print(f"⛔ Неподдерживаемых: {len(unsupported_files)}")
+
+        if unsupported_files:
+            print("Неподдерживаемые файлы (первые 10):")
+            for p in unsupported_files[:10]:
+                print(f"   - {p.name} [{p.suffix}]")
 
         parsed: list[dict[str, Any]] = []
-        skipped: list[str] = []
+        failed: list[str] = []
 
-        for path in sorted(files):
+        for path in sorted(supported_files):
             try:
                 item = self.parse_file(path)
                 if item.get("text"):
                     parsed.append(item)
                 else:
-                    skipped.append(path.name)
-            except Exception as exc:
+                    failed.append(path.name)
+            except (OSError, UnicodeDecodeError, ValueError) as exc:
                 print(f"⚠️ Критическая ошибка на файле {path.name}: {exc}")
-                skipped.append(path.name)
+                failed.append(path.name)
 
-        if skipped:
-            print(f"ℹ️ Пропущено файлов: {len(skipped)}")
+        print(f"✅ Успешно распарсено: {len(parsed)}")
+        if failed:
+            print(f"⚠️ Не удалось распарсить: {len(failed)}")
+            for name in failed[:10]:
+                print(f"   - {name}")
 
         return parsed
 
@@ -574,4 +631,5 @@ def parse_directory(directory: str | Path, **kwargs: Any) -> list[dict[str, Any]
         chunk_overlap=kwargs.pop("chunk_overlap", 200),
         min_chunk_size=kwargs.pop("min_chunk_size", 120),
     )
-    return parser.parse_directory(directory, **kwargs)
+    recursive = kwargs.pop("recursive", True)
+    return parser.parse_directory(directory, recursive=recursive)

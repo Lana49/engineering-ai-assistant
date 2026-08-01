@@ -28,6 +28,10 @@ docx2txt>=0.8
 pypandoc>=1.11
 textract
 
+# PDF OCR (для сканированных PDF)
+pytesseract>=0.3.10
+Pillow>=10.0.0
+
 # Export
 reportlab>=4.0.0
 
