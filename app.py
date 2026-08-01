@@ -432,7 +432,7 @@ def init_qa_system() -> QASystem:
     """Инициализирует QA-систему с загрузкой или построением индекса."""
     qa = QASystem(
         use_llm=True,
-        llm_provider="mixed",
+        llm_provider="ollama",
         use_embeddings=True,
     )
 
