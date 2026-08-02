@@ -18,7 +18,7 @@ ENV DEBIAN_FRONTEND=noninteractive \
     OLLAMA_MODELS=/app/data/models \
     \
     # Streamlit
-    STREAMLIT_SERVER_PORT=8501 \
+    STREAMLIT_SERVER_PORT=7860\
     STREAMLIT_SERVER_ADDRESS=0.0.0.0 \
     STREAMLIT_SERVER_HEADLESS=true \
     STREAMLIT_SERVER_ENABLE_CORS=false \
@@ -67,7 +67,7 @@ RUN chmod +x /app/start.sh
 VOLUME ["/app/data"]
 
 # ОТКРЫВАЕМ ПОРТЫ
-EXPOSE 8501
+EXPOSE 7860
 EXPOSE 11434
 
 # ЗАПУСК ПРИЛОЖЕНИЯ
