@@ -4,7 +4,7 @@ numpy==1.26.4
 pandas==2.2.2
 requests==2.32.3
 python-dotenv==1.0.1
-textract==1.6.5
+textract==1.6.4
 
 # ML & embeddings
 torch==2.3.1
