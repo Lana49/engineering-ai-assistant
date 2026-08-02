@@ -39,6 +39,11 @@ RUN apt-get update && apt-get install -y \
     libxrender-dev \
     libgomp1 \
     zstd \
+    # ========== УТИЛИТЫ ДЛЯ ПАРСИНГА ДОКУМЕНТОВ ==========
+    antiword \
+    catdoc \
+    poppler-utils \
+    unrtf \
     && rm -rf /var/lib/apt/lists/*
 
 # ============================================
