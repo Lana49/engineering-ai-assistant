@@ -1,13 +1,27 @@
 ---
-title: Engineering AI Assistant
+title: Инженерный помощник
 emoji: 🏗️
 colorFrom: blue
 colorTo: indigo
-sdk: streamlit
-app_file: app.py
+sdk: docker
+app_port: 8501
 pinned: false
+license: mit
 ---
 
-# Engineering AI Assistant
+# Инженерный помощник по строительной документации
 
-Инженерный помощник по строительной документации.
+🤖 Чат-бот с доступом к ГОСТам, СП и техническим регламентам.
+
+## Возможности
+- 📖 Ответы на вопросы по нормативной документации
+- 📐 Расчёт толщины изоляции и теплопотерь
+- 🌍 Вычисление ГСОП
+- 💨 Расчёт вентиляции
+- 🔍 Поиск таблиц и формул
+
+## Технологии
+- Ollama (локальный LLM)
+- Streamlit
+- FAISS (векторный поиск)
+- Sentence Transformers

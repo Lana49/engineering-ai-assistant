@@ -34,12 +34,10 @@ IS_HF_SPACE = bool(
     or os.getenv("SYSTEM") == "spaces"
 )
 
-LLM_PROVIDER = os.getenv("LLM_PROVIDER", "gemeni").strip().lower()
+LLM_PROVIDER = os.getenv("LLM_PROVIDER", "ollama").strip().lower()
 OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434").strip()
-OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "llama3.1:8b").strip()
+OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "phi3:mini").strip()
 
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
-GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.0-flash").strip()
 
 TOP_K = int(os.getenv("TOP_K", "5"))
 MIN_SCORE = float(os.getenv("MIN_SCORE", "0.15"))

@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """
 Инженерный чат-бот для работы с документацией.
-С ПРИНУДИТЕЛЬНЫМ ПОСТРОЕНИЕМ ИНДЕКСА И ПОДДЕРЖКОЙ LLM.
+С ПРИНУДИТЕЛЬНЫМ ПОСТРОЕНИЕМ ИНДЕКСА И ПОДДЕРЖКОЙ OLLAMA.
 """
 
 from __future__ import annotations
@@ -57,10 +57,7 @@ def run_async_safely(async_func, *args, **kwargs):
 
 
 def call_maybe_async(func, *args, **kwargs):
-    """
-    Универсальный безопасный вызов sync/async функции.
-    Исправлена проблема с None и невызываемыми объектами.
-    """
+    """Универсальный безопасный вызов sync/async функции."""
     if func is None:
         raise ValueError("Передана пустая функция (None) в call_maybe_async")
 
@@ -103,9 +100,7 @@ def save_history() -> None:
 # ========= СИНХРОНИЗАЦИЯ ДАТАСЕТА =========
 
 def sync_hf_dataset_to_raw(force: bool = False) -> bool:
-    """
-    Скачивает документы из Hugging Face Dataset repo в RAW_DIR.
-    """
+    """Скачивает документы из Hugging Face Dataset repo в RAW_DIR."""
     dataset_repo_id = (HF_DATASET_REPO_ID or "").strip()
     if not dataset_repo_id:
         print("ℹ️ HF_DATASET_REPO_ID не задан, синхронизация dataset пропущена")
@@ -337,10 +332,7 @@ def render_export_buttons(
         key_suffix: str = "current",
         response_id: int | None = None
 ):
-    """
-    Отображение кнопок экспорта с уникальными ключами.
-    Исправлена проблема StreamlitDuplicateElementKey.
-    """
+    """Отображение кнопок экспорта с уникальными ключами."""
     if response_id is None:
         response_id = st.session_state.get("current_response_id", 0)
 
@@ -380,13 +372,10 @@ def render_export_buttons(
             st.success("✅ Текст скопирован!")
 
 
-# ========= ИНИЦИАЛИЗАЦИЯ QA СИСТЕМЫ С ПРИНУДИТЕЛЬНЫМ ПОСТРОЕНИЕМ =========
+# ========= ИНИЦИАЛИЗАЦИЯ QA СИСТЕМЫ С OLLAMA =========
 
 def force_rebuild_index(qa: QASystem) -> bool:
-    """
-    ПРИНУДИТЕЛЬНО перестраивает индекс с эмбеддингами.
-    Выводит подробную диагностику.
-    """
+    """ПРИНУДИТЕЛЬНО перестраивает индекс с эмбеддингами."""
     print("=" * 50)
     print("🔨 ПРИНУДИТЕЛЬНАЯ ПЕРЕСТРОЙКА ИНДЕКСА")
     print("=" * 50)
@@ -475,20 +464,32 @@ def get_llm_status(qa_system: QASystem) -> dict[str, str]:
 
 
 def init_qa_system() -> QASystem:
-    """Инициализирует QA-систему с загрузкой или построением индекса."""
-    # Исправлено: безопасная передача Gemini API ключа
-    gemini_key = os.getenv("GEMINI_API_KEY")
-    if not gemini_key:
-        print("⚠️ GEMINI_API_KEY не задан, будет использован fallback без LLM")
+    """Инициализирует QA-систему с поддержкой Ollama."""
+    # Определяем, какой LLM использовать
+    use_llm = os.getenv("USE_LLM", "true").lower() == "true"
+    llm_provider = os.getenv("LLM_PROVIDER", "ollama").strip().lower()
+    ollama_base_url = os.getenv("OLLAMA_BASE_URL", "http://127.0.0.1:11434").strip()
+    ollama_model = os.getenv("OLLAMA_MODEL", "phi3:mini").strip()
+    gemini_api_key = os.getenv("GEMINI_API_KEY", "").strip()
+    gemini_model = os.getenv("GEMINI_MODEL", "gemini-2.0-flash").strip()
+
+    print(f"🔧 Инициализация QASystem:")
+    print(f"   use_llm: {use_llm}")
+    print(f"   llm_provider: {llm_provider}")
+    print(f"   ollama_base_url: {ollama_base_url}")
+    print(f"   ollama_model: {ollama_model}")
 
     qa = QASystem(
-        use_llm=bool(gemini_key),  # Включаем LLM только если есть ключ
-        llm_provider="gemini" if gemini_key else "none",
+        use_llm=use_llm,
+        llm_provider=llm_provider if use_llm else "none",
         use_embeddings=True,
-        gemini_api_key=gemini_key,
-        gemini_model="gemini-2.0-flash",
+        ollama_base_url=ollama_base_url,
+        ollama_model=ollama_model,
+        gemini_api_key=gemini_api_key if use_llm and llm_provider == "gemini" else None,
+        gemini_model=gemini_model,
     )
 
+    # Загружаем индекс если есть
     if INDEX_FILE.exists():
         print(f"📂 Индекс найден: {INDEX_FILE}")
         try:
