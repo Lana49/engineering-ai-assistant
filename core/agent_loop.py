@@ -163,6 +163,9 @@ class AgentLoop:
                 "error": str(e)
             }
 
+    # ============================================================
+    # 1. АНАЛИЗ ЗАПРОСА — ИСПРАВЛЕН
+    # ============================================================
     @staticmethod
     def _analyze_query(query: str) -> ReasoningStep:
         """Анализирует запрос и определяет его тип."""
@@ -172,17 +175,30 @@ class AgentLoop:
         )
 
         try:
-            query_lower = query.lower()
+            query_lower = query.lower().strip()
 
             calc_triggers = [
                 "рассчитай", "расчет", "вычисли", "посчитай", "формула",
                 "теплопотери", "кратность", "расход", "гсоп",
                 "r=", "q=", "площадь", "объем", "мощность"
             ]
-            def_triggers = [
-                "что такое", "определи", "определение", "термин",
-                "что значит", "что означает"
+
+            definition_prefixes = [
+                "что такое ",
+                "что значит ",
+                "что означает ",
+                "что это ",
+                "дай определение ",
+                "дайте определение ",
+                "определение ",
+                "определи ",
+                "термин ",
+                "понятие ",
+                "расшифруй ",
+                "расшифровка ",
+                "аббревиатура ",
             ]
+
             comp_triggers = [
                 "сравни", "разница", "отличие", "лучше", "хуже"
             ]
@@ -192,7 +208,7 @@ class AgentLoop:
             ]
 
             is_calc = any(w in query_lower for w in calc_triggers)
-            is_def = any(w in query_lower for w in def_triggers)
+            is_def = any(query_lower.startswith(prefix) for prefix in definition_prefixes)
             is_comp = any(w in query_lower for w in comp_triggers)
             is_reg = any(w in query_lower for w in reg_triggers)
 
@@ -207,10 +223,12 @@ class AgentLoop:
             else:
                 query_type = QueryType.SEARCH
 
-            keywords = re.findall(r"[A-Za-zА-Яа-я0-9./-]{3,}", query)
+            # Исправлено: явное приведение к строке и исправленное регулярное выражение
+            query_str = str(query)
+            keywords = re.findall(r"[A-Za-zА-Яа-я0-9._-]{3,}", query_str)
             keywords = [w.lower() for w in keywords if len(w) > 2]
 
-            numbers = re.findall(r"-?\d+[.,]?\d*", query)
+            numbers = re.findall(r"-?\d+(?:[.,]\d+)?", query_str)
             parsed_numbers = []
             for num in numbers:
                 try:
@@ -224,9 +242,10 @@ class AgentLoop:
 
             entities: dict[str, Any] = {}
 
+            # Исправлено: убрано избыточное экранирование внутри [...]
             document_codes = re.findall(
-                r"\b(?:сп|гост|снип|рд|санпин|мгсн)\s*[\d.\-]+\b",
-                query,
+                r"(СП\s?\d+\.\d+|ГОСТ\s?\d+(?:-\d+)?|СНиП\s?[\d.-]+)",
+                query_str,
                 flags=re.IGNORECASE
             )
             if document_codes:
@@ -234,8 +253,8 @@ class AgentLoop:
                 entities["documents"] = document_codes
 
             section_refs = re.findall(
-                r"\b(?:пункт|п\.|раздел|таблица|табл\.|приложение)\s*[\d.\-]+\b",
-                query,
+                r"(пункт\s?\d+(?:\.\d+)*|раздел\s?\d+(?:\.\d+)*)",
+                query_str,
                 flags=re.IGNORECASE
             )
             if section_refs:
@@ -243,34 +262,23 @@ class AgentLoop:
 
             domain_terms = [
                 w for w in keywords
-                if w not in {"что", "как", "где", "или", "для", "при", "это"}
+                if w not in {"что", "как", "для", "при", "это", "или", "если"}
             ]
             if domain_terms:
                 entities["domain_terms"] = domain_terms[:15]
 
-            if document_codes or section_refs:
-                entities["needs_exact_match"] = True
-
-            if "°c" in query_lower or "c" in query_lower:
-                entities["unit_type"] = "temperature"
-            if "м2" in query_lower or "м²" in query_lower:
-                entities["unit_type"] = "area"
-            if "м3" in query_lower or "м³" in query_lower:
-                entities["unit_type"] = "volume"
-
             step.result = {
                 "type": query_type,
-                "keywords": keywords[:20],
+                "keywords": keywords,
                 "entities": entities,
                 "parameters": parameters,
-                "raw_query": query
             }
             step.confidence = 0.9
 
-        except (re.error, ValueError, TypeError) as e:
+        except (ValueError, TypeError, AttributeError) as e:
             step.result = None
             step.confidence = 0.0
-            step.description += f" (Ошибка: {e})"
+            step.description = f"Ошибка анализа запроса: {e}"
 
         return step
 
@@ -396,7 +404,6 @@ class AgentLoop:
             enriched_chunks = []
             for chunk in reranked:
                 text = chunk.get("text", "")
-                # Используем extract_tables из table_extractor
                 tables = extract_tables(text, chunk.get("doc_name", ""))
                 formulas = self._extract_formulas(text)
 
@@ -421,8 +428,6 @@ class AgentLoop:
             step.description += f" (Ошибка: {e})"
 
         return step
-
-    # УДАЛЕНА _extract_tables — используем из table_extractor
 
     @staticmethod
     def _extract_formulas(text: str) -> list[dict[str, Any]]:
@@ -615,16 +620,41 @@ class AgentLoop:
 
         try:
             query = context.query.strip()
-            query_lower = query.lower()
+            query_lower = query.lower().strip()
+
+            definition_prefixes = [
+                "что такое ",
+                "что значит ",
+                "что означает ",
+                "что это ",
+                "дай определение ",
+                "дайте определение ",
+                "определение ",
+                "определи ",
+                "термин ",
+                "понятие ",
+                "расшифруй ",
+                "расшифровка ",
+                "аббревиатура ",
+            ]
 
             term = query_lower
-            for prefix in [
-                "что такое", "определение", "термин", "понятие",
-                "что значит", "что означает", "расшифруй",
-                "аббревиатура", "расшифровка", "что это",
-                "как понимать", "объясните", "поясните"
-            ]:
-                term = term.replace(prefix, "").strip()
+            for prefix in definition_prefixes:
+                if term.startswith(prefix):
+                    term = term[len(prefix):].strip(" ?!.,:;\"'«»()[]")
+                    break
+
+            if not term:
+                step.result = {
+                    "type": "definition",
+                    "answer": "Уточните термин для определения.",
+                    "sources": [],
+                    "tables": [],
+                    "formulas": [],
+                    "confidence": 0.2,
+                }
+                step.confidence = 0.2
+                return step
 
             quick = get_quick_definition(term)
             if quick:
@@ -634,9 +664,9 @@ class AgentLoop:
 
                 full_answer = definition
                 if example:
-                    full_answer += f"\n\nПример: {example}"
+                    full_answer += f"\n\n📌 Пример: {example}"
                 if source:
-                    full_answer += f"\n\nИсточник: {source}"
+                    full_answer += f"\n\n📚 Источник: {source}"
 
                 step.result = {
                     "type": "definition",
@@ -644,7 +674,7 @@ class AgentLoop:
                     "sources": [source] if source else [],
                     "tables": [],
                     "formulas": [],
-                    "confidence": 0.95
+                    "confidence": 0.95,
                 }
                 step.confidence = 0.95
                 return step
@@ -661,11 +691,11 @@ class AgentLoop:
                                 definition = {
                                     "found": True,
                                     "definition": sent.strip(),
-                                    "source": chunk.get("doc_name", "Документ")
+                                    "source": chunk.get("doc_name", ""),
                                 }
                                 break
-                        if definition.get("found"):
-                            break
+                    if definition.get("found"):
+                        break
 
             if definition.get("found"):
                 step.result = {
@@ -679,27 +709,27 @@ class AgentLoop:
                         f"{definition.get('definition', '')}\n\n"
                         f"📚 **Источник:** {definition.get('source', 'Нормативная база')}"
                     ),
-                    "sources": [{"doc_name": definition.get("source", "Нормативная база")}],
+                    "sources": [definition.get("source", "")] if definition.get("source") else [],
                     "tables": [],
                     "formulas": [],
-                    "confidence": 0.9
+                    "confidence": 0.9,
                 }
                 step.confidence = 0.9
             else:
                 step.result = {
                     "type": "definition",
-                    "answer": f"Определение для термина «{term}» не найдено.",
+                    "answer": f"⚠️ Определение для термина «{term}» не найдено.",
                     "sources": [],
                     "tables": [],
                     "formulas": [],
-                    "confidence": 0.2
+                    "confidence": 0.2,
                 }
                 step.confidence = 0.2
 
         except (ValueError, TypeError, AttributeError) as e:
             step.result = None
             step.confidence = 0.0
-            step.description += f" (Ошибка: {e})"
+            step.description = f"Ошибка поиска определения: {e}"
 
         return step
 

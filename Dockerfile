@@ -44,6 +44,10 @@ RUN apt-get update && apt-get install -y \
     catdoc \
     poppler-utils \
     unrtf \
+    # ========== OCR ДЛЯ СКАНИРОВАННЫХ PDF ==========
+    tesseract-ocr \
+    tesseract-ocr-rus \
+    tesseract-ocr-eng \
     && rm -rf /var/lib/apt/lists/*
 
 # ============================================

@@ -473,11 +473,17 @@ def init_qa_system() -> QASystem:
     gemini_api_key = os.getenv("GEMINI_API_KEY", "").strip()
     gemini_model = os.getenv("GEMINI_MODEL", "gemini-2.0-flash").strip()
 
+    # Флаг принудительной перестройки индекса
+    auto_sync = os.getenv("AUTO_SYNC_DATASET", "false").lower() == "true"
+    auto_rebuild = os.getenv("AUTO_REBUILD_INDEX", "false").lower() == "true"
+
     print(f"🔧 Инициализация QASystem:")
     print(f"   use_llm: {use_llm}")
     print(f"   llm_provider: {llm_provider}")
     print(f"   ollama_base_url: {ollama_base_url}")
     print(f"   ollama_model: {ollama_model}")
+    print(f"   auto_sync: {auto_sync}")
+    print(f"   auto_rebuild: {auto_rebuild}")
 
     qa = QASystem(
         use_llm=use_llm,
@@ -500,9 +506,16 @@ def init_qa_system() -> QASystem:
             print(f"⚠️ Ошибка загрузки индекса: {e}")
             print("🔄 Будет выполнена перестройка...")
 
-    print("📥 Индекс не найден или повреждён. Выполняется синхронизация и парсинг...")
-    sync_hf_dataset_to_raw()
-    force_rebuild_index(qa)
+    # Если индекс не загрузился
+    if auto_sync:
+        print("📥 AUTO_SYNC_DATASET=true → синхронизация dataset")
+        sync_hf_dataset_to_raw(force=False)
+
+    if auto_rebuild:
+        print("🔨 AUTO_REBUILD_INDEX=true → перестройка индекса")
+        force_rebuild_index(qa)
+    else:
+        print("⏭️ Автоперестройка индекса отключена")
 
     return qa
 
@@ -786,80 +799,132 @@ def main() -> None:
 
     render_sidebar(qa_system, formula_engine, error_handler)
 
-    for message in st.session_state.messages:
-        with st.chat_message(message["role"]):
-            st.markdown(message["content"])
+    # Отрисовка истории сообщений
+    for i, msg in enumerate(st.session_state.messages):
+        with st.chat_message(msg["role"]):
+            st.markdown(msg["content"])
 
-            if message["role"] == "assistant" and message == st.session_state.messages[-1]:
-                if st.session_state.current_answer:
+            if msg["role"] == "assistant":
+                has_sources = bool(msg.get("sources"))
+                has_tables = bool(msg.get("tables"))
+                has_formulas = bool(msg.get("formulas"))
+
+                if has_sources or has_tables or has_formulas:
+                    with st.expander("📎 Источники и материалы", expanded=False):
+                        if has_sources:
+                            st.markdown("**Источники:**")
+                            for src in msg.get("sources", []):
+                                if isinstance(src, dict):
+                                    st.markdown(f"- {src.get('doc_name', 'Документ')}")
+                                else:
+                                    st.markdown(f"- {src}")
+
+                        if has_tables:
+                            st.markdown("**Таблицы:**")
+                            for table in msg.get("tables", [])[:2]:
+                                if isinstance(table, dict):
+                                    st.markdown(f"- {table.get('title', 'Таблица')}")
+
+                        if has_formulas:
+                            st.markdown("**Формулы:**")
+                            for formula in msg.get("formulas", [])[:5]:
+                                if isinstance(formula, dict):
+                                    raw = formula.get("raw") or formula.get("expression") or formula.get("name") or "Формула"
+                                    st.markdown(f"- `{raw}`")
+                                else:
+                                    st.markdown(f"- `{formula}`")
+
                     render_export_buttons(
-                        st.session_state.current_answer,
-                        st.session_state.current_sources,
-                        st.session_state.current_tables,
-                        st.session_state.current_formulas,
-                        key_suffix="last",
-                        response_id=st.session_state.current_response_id,
+                        answer=msg["content"],
+                        sources=msg.get("sources", []),
+                        tables=msg.get("tables", []),
+                        formulas=msg.get("formulas", []),
+                        key_suffix=f"history_{i}",
+                        response_id=i,
                     )
 
     prompt = st.chat_input("Задайте вопрос по строительной документации...", key="main_chat_input")
-    if prompt:
-        st.session_state.messages.append({"role": "user", "content": prompt})
+    if not prompt:
+        return
 
-        with st.chat_message("user"):
-            st.markdown(prompt)
+    st.session_state.messages.append({"role": "user", "content": prompt})
 
-        response = "Не удалось сформировать ответ."
-        sources: list = []
-        tables: list = []
-        formulas: list = []
+    with st.chat_message("user"):
+        st.markdown(prompt)
 
-        with st.chat_message("assistant"):
-            with st.spinner("🔍 Анализирую запрос..."):
-                try:
-                    prompt_lower = prompt.lower()
+    response = "Не удалось сформировать ответ."
+    sources: list = []
+    tables: list = []
+    formulas: list = []
 
-                    calc_triggers = [
-                        "рассчитай", "вычисли", "посчитай", "толщин", "температур",
-                        "потери", "формул", "вентиляц", "расход", "гсоп", "градусо"
-                    ]
-                    def_triggers = [
-                        "что такое", "определение", "термин", "понятие", "что значит",
-                        "что означает", "расшифруй", "аббревиатура", "расшифровка",
-                        "что это", "как понимать", "объясните", "поясните"
-                    ]
-                    table_triggers = ["таблиц", "табл", "покажи таблиц", "выведи таблиц"]
+    with st.chat_message("assistant"):
+        with st.spinner("🔍 Анализирую запрос..."):
+            try:
+                prompt_clean = prompt.strip()
+                prompt_lower = prompt_clean.lower()
 
-                    is_calc = any(w in prompt_lower for w in calc_triggers)
-                    is_def = any(w in prompt_lower for w in def_triggers)
-                    is_table = any(w in prompt_lower for w in table_triggers)
+                # =========================================================
+                # ТРИГГЕРЫ — только в НАЧАЛЕ запроса
+                # =========================================================
+                calc_triggers = [
+                    "рассчитай", "вычисли", "посчитай", "толщин", "температур",
+                    "потери", "формул", "вентиляц", "расход", "гсоп", "градусо"
+                ]
 
-                    quick_def = get_quick_definition(prompt)
+                definition_triggers = [
+                    "что такое ",
+                    "что значит ",
+                    "что означает ",
+                    "что это ",
+                    "дай определение ",
+                    "дайте определение ",
+                    "определение ",
+                    "определи ",
+                    "термин ",
+                    "понятие ",
+                    "расшифруй ",
+                    "расшифровка ",
+                    "аббревиатура ",
+                ]
+
+                table_triggers = [
+                    "таблица",
+                    "таблицы",
+                    "таблицу",
+                    "таблиц",
+                    "табл",
+                    "покажи таблиц",
+                    "выведи таблиц",
+                ]
+
+                is_calc = any(w in prompt_lower for w in calc_triggers)
+                is_definition_query = any(prompt_lower.startswith(t) for t in definition_triggers)
+                is_table = any(w in prompt_lower for w in table_triggers)
+
+                # =========================================================
+                # 1. ОПРЕДЕЛЕНИЯ — ТОЛЬКО ПО ЯВНЫМ ТРИГГЕРАМ
+                # =========================================================
+                if is_definition_query:
+                    clean_term = prompt_lower
+                    for trigger in definition_triggers:
+                        if clean_term.startswith(trigger):
+                            clean_term = clean_term[len(trigger):].strip(" ?!.,:;\"'«»()[]")
+                            break
+
+                    if clean_term:
+                        quick_def = get_quick_definition(clean_term)
+                    else:
+                        quick_def = None
+
                     if quick_def:
                         response = (
-                            f"📖 **Быстрое определение:**\n\n"
+                            f"📖 **Определение:**\n\n"
                             f"{quick_def.get('definition', '')}\n\n"
                             f"📚 **Источник:** {quick_def.get('source', '')}"
                         )
                         if quick_def.get("example"):
                             response += f"\n\n📌 **Пример:** {quick_def['example']}"
-                        st.markdown(response)
-                        st.stop()
-
-                    if is_calc:
-                        result = call_maybe_async(formula_engine.answer_calculation, prompt)
-                        response = result.get("answer", "Не удалось выполнить расчёт")
-                        sources = result.get("sources", [])
-                        tables = result.get("tables", [])
-                        formulas = result.get("formulas", [])
-
-                        if not formulas and result.get("formula"):
-                            formulas = [result["formula"]]
-
-                    elif is_def:
-                        clean_term = prompt_lower
-                        for trigger in def_triggers:
-                            clean_term = clean_term.replace(trigger, "").strip(" ?!.,:")
-
+                    elif clean_term:
                         definition_result = qa_system.find_definition(clean_term)
                         if definition_result.get("found"):
                             response = (
@@ -869,74 +934,119 @@ def main() -> None:
                             )
                         else:
                             response = f"⚠️ В загруженных документах не найдено определение для термина «{clean_term}»."
-
-                    elif is_table:
-                        result = qa_system.answer(prompt)
-                        response = result.get("answer", "Таблица не найдена")
-                        tables = result.get("tables", [])
-                        sources = result.get("sources", [])
-                        formulas = result.get("formulas", [])
-
-                        if tables:
-                            response += "\n\n📊 **Найденные таблицы:**\n"
-                            for table in tables[:2]:
-                                if isinstance(table, dict):
-                                    response += f"\n**{table.get('title', 'Таблица')}**\n"
-                                    content = table.get("content", "")
-                                    if len(content) > 500:
-                                        content = content[:500] + "..."
-                                    response += f"```\n{content}\n```\n"
-
                     else:
-                        result = call_maybe_async(agent_loop.run, prompt)
-                        response = result.get("answer", "Не удалось получить ответ")
-                        sources = result.get("sources", [])
-                        tables = result.get("tables", [])
-                        formulas = result.get("formulas", [])
+                        response = "⚠️ Уточните термин для определения."
 
-                        if result.get("needs_clarification"):
-                            questions = result.get("questions", [])
-                            if questions:
-                                response += "\n\n❓ **Уточните:**\n" + "\n".join([f"• {q}" for q in questions])
+                # =========================================================
+                # 2. РАСЧЁТЫ
+                # =========================================================
+                elif is_calc:
+                    result = call_maybe_async(formula_engine.answer_calculation, prompt_clean)
+                    response = result.get("answer", "Не удалось выполнить расчёт")
+                    sources = result.get("sources", [])
+                    tables = result.get("tables", [])
+                    formulas = result.get("formulas", [])
 
-                    with st.sidebar:
-                        with st.expander("🔍 Показать цепочку рассуждений"):
-                            if is_calc:
-                                st.markdown(formula_engine.get_reasoning_chain())
-                            else:
-                                st.markdown(agent_loop.get_reasoning_chain())
+                    if not formulas and result.get("formula"):
+                        formulas = [result["formula"]]
 
-                    st.session_state.current_response_id += 1
-                    current_id = st.session_state.current_response_id
+                # =========================================================
+                # 3. ТАБЛИЦЫ
+                # =========================================================
+                elif is_table:
+                    result = qa_system.answer(prompt_clean)
+                    response = result.get("answer", "Таблица не найдена")
+                    tables = result.get("tables", [])
+                    sources = result.get("sources", [])
+                    formulas = result.get("formulas", [])
 
-                    st.session_state.current_answer = response
-                    st.session_state.current_sources = sources
-                    st.session_state.current_tables = tables
-                    st.session_state.current_formulas = formulas
+                    if tables:
+                        response += "\n\n📊 **Найденные таблицы:**\n"
+                        for table in tables[:2]:
+                            if isinstance(table, dict):
+                                response += f"\n**{table.get('title', 'Таблица')}**\n"
+                                content = table.get("content", "")
+                                if len(content) > 500:
+                                    content = content[:500] + "..."
+                                response += f"```\n{content}\n```\n"
 
-                    st.markdown(response)
+                # =========================================================
+                # 4. ВСЁ ОСТАЛЬНОЕ — AGENT LOOP
+                # =========================================================
+                else:
+                    result = call_maybe_async(agent_loop.run, prompt_clean)
+                    response = result.get("answer", "Не удалось получить ответ")
+                    sources = result.get("sources", [])
+                    tables = result.get("tables", [])
+                    formulas = result.get("formulas", [])
 
-                    render_export_buttons(
-                        response,
-                        sources,
-                        tables,
-                        formulas,
-                        key_suffix="current",
-                        response_id=current_id,
-                    )
+                    if result.get("needs_clarification"):
+                        questions = result.get("questions", [])
+                        if questions:
+                            response += "\n\n❓ **Уточните:**\n" + "\n".join([f"• {q}" for q in questions])
 
-                except Exception as e:
-                    error_info = error_handler.handle(e, {"query": prompt})
-                    response = error_info.get("user_message", f"❌ Ошибка: {e}")
-                    st.error(response)
+            except Exception as e:
+                error_info = error_handler.handle(e, {"query": prompt})
+                response = error_info.get("user_message", f"❌ Ошибка: {e}")
 
-        st.session_state.messages.append({"role": "assistant", "content": response})
-        save_history()
+        # =========================================================
+        # ОТОБРАЖЕНИЕ ОТВЕТА
+        # =========================================================
+        st.markdown(response)
 
-    st.divider()
-    st.caption("💡 Совет: для расчётов указывайте числа и параметры прямо в вопросе.")
-    st.caption("📧 По всем вопросам обращайтесь к разработчику.")
+        has_sources = bool(sources)
+        has_tables = bool(tables)
+        has_formulas = bool(formulas)
 
+        if has_sources or has_tables or has_formulas:
+            with st.expander("📎 Источники и материалы", expanded=False):
+                if has_sources:
+                    st.markdown("**Источники:**")
+                    for src in sources:
+                        if isinstance(src, dict):
+                            st.markdown(f"- {src.get('doc_name', 'Документ')}")
+                        else:
+                            st.markdown(f"- {src}")
+
+                if has_tables:
+                    st.markdown("**Таблицы:**")
+                    for table in tables[:5]:
+                        if isinstance(table, dict):
+                            st.markdown(f"- {table.get('title', 'Таблица')}")
+                        else:
+                            st.markdown(f"- {table}")
+
+                if has_formulas:
+                    st.markdown("**Формулы:**")
+                    for formula in formulas[:5]:
+                        if isinstance(formula, dict):
+                            raw = formula.get("raw") or formula.get("expression") or formula.get("name") or "Формула"
+                            st.markdown(f"- `{raw}`")
+                        else:
+                            st.markdown(f"- `{formula}`")
+
+        current_response_id = st.session_state.get("current_response_id", 0) + 1
+        st.session_state.current_response_id = current_response_id
+
+        render_export_buttons(
+            answer=response,
+            sources=sources,
+            tables=tables,
+            formulas=formulas,
+            key_suffix="current",
+            response_id=current_response_id,
+        )
+
+    # Сохраняем сообщение в историю
+    st.session_state.messages.append({
+        "role": "assistant",
+        "content": response,
+        "sources": sources,
+        "tables": tables,
+        "formulas": formulas,
+    })
+
+    save_history()
 
 if __name__ == "__main__":
     main()
