@@ -21,14 +21,18 @@ ENV DEBIAN_FRONTEND=noninteractive \
     STREAMLIT_SERVER_HEADLESS=true \
     STREAMLIT_SERVER_ENABLE_CORS=false \
     STREAMLIT_SERVER_ENABLE_XSRF_PROTECTION=false \
-    HF_HUB_ENABLE_HF_TRANSFER=1
+    HF_HUB_ENABLE_HF_TRANSFER=1 \
+    HF_HOME=/app/.cache/huggingface \
+    PATH="/root/.local/bin:${PATH}"
+
+WORKDIR /app
 
 # ============================================
 # УСТАНОВКА СИСТЕМНЫХ ЗАВИСИМОСТЕЙ
 # ============================================
-RUN apt-get update && apt-get install -y \
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    bash \
     curl \
-    wget \
     ca-certificates \
     procps \
     build-essential \
@@ -36,15 +40,13 @@ RUN apt-get update && apt-get install -y \
     libglib2.0-0 \
     libsm6 \
     libxext6 \
-    libxrender-dev \
+    libxrender1 \
     libgomp1 \
     zstd \
-    # ========== УТИЛИТЫ ДЛЯ ПАРСИНГА ДОКУМЕНТОВ ==========
     antiword \
     catdoc \
     poppler-utils \
     unrtf \
-    # ========== OCR ДЛЯ СКАНИРОВАННЫХ PDF ==========
     tesseract-ocr \
     tesseract-ocr-rus \
     tesseract-ocr-eng \
@@ -56,16 +58,16 @@ RUN apt-get update && apt-get install -y \
 RUN curl -fsSL https://ollama.com/install.sh | sh
 
 # Создаём директории для данных
-RUN mkdir -p /app/data/{models,raw,processed}
+RUN mkdir -p /app/data/models /app/data/raw /app/data/processed /app/.cache/huggingface && \
+    chmod -R 777 /app/data /app/.cache
 
 # ============================================
 # УСТАНОВКА PYTHON ЗАВИСИМОСТЕЙ
 # ============================================
-WORKDIR /app
-
 COPY requirements.txt .
-RUN pip install --upgrade pip && \
-    pip install -r requirements.txt --no-cache-dir
+
+RUN python -m pip install --upgrade pip setuptools wheel && \
+    python -m pip install --no-cache-dir -r requirements.txt
 
 # ============================================
 # КОПИРУЕМ ИСХОДНЫЙ КОД
@@ -84,6 +86,12 @@ VOLUME ["/app/data"]
 # ============================================
 EXPOSE 7860
 EXPOSE 11434
+
+# ============================================
+# HEALTHCHECK ДЛЯ HUGGING FACE SPACE
+# ============================================
+HEALTHCHECK --interval=30s --timeout=10s --start-period=90s --retries=5 \
+  CMD curl --fail http://127.0.0.1:7860/_stcore/health || exit 1
 
 # ============================================
 # ЗАПУСК
