@@ -1,7 +1,6 @@
 # -*- coding: utf-8 -*-
 """
 Инженерный чат-бот для работы с документацией.
-С ПРИНУДИТЕЛЬНЫМ ПОСТРОЕНИЕМ ИНДЕКСА И ПОДДЕРЖКОЙ OLLAMA.
 """
 
 from __future__ import annotations
@@ -40,8 +39,6 @@ st.set_page_config(
 HISTORY_FILE = PROCESSED_DIR / "chat_history.json"
 INDEX_FILE = PROCESSED_DIR / "faiss_index.pkl"
 
-
-# ========= ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ =========
 
 def run_async_safely(async_func, *args, **kwargs):
     """Безопасный запуск асинхронной функции в Streamlit."""
@@ -97,8 +94,6 @@ def save_history() -> None:
         json.dump(st.session_state.messages, f, ensure_ascii=False, indent=2)
 
 
-# ========= СИНХРОНИЗАЦИЯ ДАТАСЕТА =========
-
 def sync_hf_dataset_to_raw(force: bool = False) -> bool:
     """Скачивает документы из Hugging Face Dataset repo в RAW_DIR."""
     dataset_repo_id = (HF_DATASET_REPO_ID or "").strip()
@@ -113,10 +108,10 @@ def sync_hf_dataset_to_raw(force: bool = False) -> bool:
     RAW_DIR.mkdir(parents=True, exist_ok=True)
 
     existing_docs = (
-            list(RAW_DIR.glob("*.docx"))
-            + list(RAW_DIR.glob("*.pdf"))
-            + list(RAW_DIR.glob("*.rtf"))
-            + list(RAW_DIR.glob("*.doc"))
+        list(RAW_DIR.glob("*.docx"))
+        + list(RAW_DIR.glob("*.pdf"))
+        + list(RAW_DIR.glob("*.rtf"))
+        + list(RAW_DIR.glob("*.doc"))
     )
 
     if existing_docs and not force:
@@ -132,10 +127,10 @@ def sync_hf_dataset_to_raw(force: bool = False) -> bool:
         )
 
         downloaded_docs = (
-                list(RAW_DIR.glob("*.docx"))
-                + list(RAW_DIR.glob("*.pdf"))
-                + list(RAW_DIR.glob("*.rtf"))
-                + list(RAW_DIR.glob("*.doc"))
+            list(RAW_DIR.glob("*.docx"))
+            + list(RAW_DIR.glob("*.pdf"))
+            + list(RAW_DIR.glob("*.rtf"))
+            + list(RAW_DIR.glob("*.doc"))
         )
 
         print(f"✅ Dataset синхронизирован. Найдено документов: {len(downloaded_docs)}")
@@ -145,8 +140,6 @@ def sync_hf_dataset_to_raw(force: bool = False) -> bool:
         print(f"⚠️ Ошибка загрузки dataset из Hugging Face: {dataset_error}")
         return False
 
-
-# ========= ЭКСПОРТ =========
 
 def export_history_to_docx():
     """Экспорт истории чата в DOCX."""
@@ -372,72 +365,70 @@ def render_export_buttons(
             st.success("✅ Текст скопирован!")
 
 
-# ========= ИНИЦИАЛИЗАЦИЯ QA СИСТЕМЫ С OLLAMA =========
-
 def force_rebuild_index(qa: QASystem) -> bool:
-    """ПРИНУДИТЕЛЬНО перестраивает индекс с эмбеддингами."""
+    """Принудительно перестраивает индекс с эмбеддингами."""
     print("=" * 50)
-    print("🔨 ПРИНУДИТЕЛЬНАЯ ПЕРЕСТРОЙКА ИНДЕКСА")
+    print("ПРИНУДИТЕЛЬНАЯ ПЕРЕСТРОЙКА ИНДЕКСА")
     print("=" * 50)
 
     if not RAW_DIR.exists():
-        print(f"❌ Папка {RAW_DIR} не существует")
+        print(f"Папка {RAW_DIR} не существует")
         return False
 
     docs = list(RAW_DIR.glob("*.docx")) + list(RAW_DIR.glob("*.pdf")) + \
            list(RAW_DIR.glob("*.rtf")) + list(RAW_DIR.glob("*.doc"))
 
-    print(f"📄 Найдено документов в RAW_DIR: {len(docs)}")
+    print(f"Найдено документов в RAW_DIR: {len(docs)}")
 
     if not docs:
-        print("❌ Нет документов для индексации")
+        print("Нет документов для индексации")
         return False
 
-    print("📖 Начинаем парсинг документов...")
+    print("Начинаем парсинг документов...")
     parsed_docs = parse_directory(RAW_DIR, recursive=True)
 
     if not parsed_docs:
-        print("❌ Парсинг не вернул ни одного документа")
+        print("Парсинг не вернул ни одного документа")
         return False
 
-    print(f"📄 Распарсено документов: {len(parsed_docs)}")
+    print(f"Распарсено документов: {len(parsed_docs)}")
 
     total_chunks = sum(len(doc.get("chunks", [])) for doc in parsed_docs)
-    print(f"🧩 Всего чанков: {total_chunks}")
+    print(f"Всего чанков: {total_chunks}")
 
-    print("🔨 Строим индекс с эмбеддингами...")
+    print("Строим индекс с эмбеддингами...")
     result = qa.build_index(parsed_docs)
 
     if not result:
-        print("❌ build_index вернул False")
+        print("build_index вернул False")
         return False
 
-    print(f"✅ Индекс построен: {len(qa.chunks)} чанков")
+    print(f"Индекс построен: {len(qa.chunks)} чанков")
     print(f"   embedding_model: {qa.embedding_model is not None}")
     print(f"   chunk_embeddings: {qa.chunk_embeddings is not None}")
     if qa.chunk_embeddings is not None:
         print(f"   embeddings shape: {qa.chunk_embeddings.shape}")
 
-    print("💾 Сохраняем индекс...")
+    print("Сохраняем индекс...")
     PROCESSED_DIR.mkdir(parents=True, exist_ok=True)
-    print(f"📁 Папка для сохранения: {PROCESSED_DIR}")
-    print(f"📁 Права на запись: {os.access(PROCESSED_DIR, os.W_OK)}")
+    print(f"Папка для сохранения: {PROCESSED_DIR}")
+    print(f"Права на запись: {os.access(PROCESSED_DIR, os.W_OK)}")
 
     save_result = qa.save_index(INDEX_FILE)
 
     if save_result:
-        print(f"✅ Индекс сохранён: {INDEX_FILE}")
+        print(f"Индекс сохранён: {INDEX_FILE}")
         if INDEX_FILE.exists():
             size = INDEX_FILE.stat().st_size
-            print(f"   Размер файла: {size} bytes")
+            print(f"Размер файла: {size} bytes")
             if size < 1000000:
-                print(f"⚠️ ВНИМАНИЕ: размер индекса слишком мал ({size} bytes)")
+                print(f"ВНИМАНИЕ: размер индекса слишком мал ({size} bytes)")
                 return False
         else:
-            print("❌ Файл не найден после сохранения!")
+            print("Файл не найден после сохранения!")
             return False
     else:
-        print("❌ Ошибка сохранения индекса")
+        print("Ошибка сохранения индекса")
         return False
 
     print("=" * 50)
@@ -465,7 +456,6 @@ def get_llm_status(qa_system: QASystem) -> dict[str, str]:
 
 def init_qa_system() -> QASystem:
     """Инициализирует QA-систему с поддержкой Ollama."""
-    # Определяем, какой LLM использовать
     use_llm = os.getenv("USE_LLM", "true").lower() == "true"
     llm_provider = os.getenv("LLM_PROVIDER", "ollama").strip().lower()
     ollama_base_url = os.getenv("OLLAMA_BASE_URL", "http://127.0.0.1:11434").strip()
@@ -473,11 +463,10 @@ def init_qa_system() -> QASystem:
     gemini_api_key = os.getenv("GEMINI_API_KEY", "").strip()
     gemini_model = os.getenv("GEMINI_MODEL", "gemini-2.0-flash").strip()
 
-    # Флаг принудительной перестройки индекса
     auto_sync = os.getenv("AUTO_SYNC_DATASET", "false").lower() == "true"
     auto_rebuild = os.getenv("AUTO_REBUILD_INDEX", "false").lower() == "true"
 
-    print(f"🔧 Инициализация QASystem:")
+    print(f"Инициализация QASystem:")
     print(f"   use_llm: {use_llm}")
     print(f"   llm_provider: {llm_provider}")
     print(f"   ollama_base_url: {ollama_base_url}")
@@ -495,27 +484,25 @@ def init_qa_system() -> QASystem:
         gemini_model=gemini_model,
     )
 
-    # Загружаем индекс если есть
     if INDEX_FILE.exists():
-        print(f"📂 Индекс найден: {INDEX_FILE}")
+        print(f"Индекс найден: {INDEX_FILE}")
         try:
             qa.load_index(INDEX_FILE)
-            print(f"✅ Индекс загружен: {len(qa.chunks)} чанков")
+            print(f"Индекс загружен: {len(qa.chunks)} чанков")
             return qa
         except (OSError, ValueError, TypeError) as e:
-            print(f"⚠️ Ошибка загрузки индекса: {e}")
-            print("🔄 Будет выполнена перестройка...")
+            print(f"Ошибка загрузки индекса: {e}")
+            print("Будет выполнена перестройка...")
 
-    # Если индекс не загрузился
     if auto_sync:
-        print("📥 AUTO_SYNC_DATASET=true → синхронизация dataset")
+        print("AUTO_SYNC_DATASET=true → синхронизация dataset")
         sync_hf_dataset_to_raw(force=False)
 
     if auto_rebuild:
-        print("🔨 AUTO_REBUILD_INDEX=true → перестройка индекса")
+        print("AUTO_REBUILD_INDEX=true → перестройка индекса")
         force_rebuild_index(qa)
     else:
-        print("⏭️ Автоперестройка индекса отключена")
+        print("Автоперестройка индекса отключена")
 
     return qa
 
@@ -558,30 +545,28 @@ def auto_load_documents() -> bool:
 
     if qa_system.is_ready:
         chunks_count = len(qa_system.chunks) if hasattr(qa_system, 'chunks') else 0
-        st.sidebar.success(f"✅ База знаний готова\n📄 {chunks_count} фрагментов")
+        st.sidebar.success(f"База знаний готова\n{chunks_count} фрагментов")
         return True
 
     if not INDEX_FILE.exists():
-        st.sidebar.info("🔄 Индекс отсутствует. Выполняется перестройка...")
-        with st.spinner("📚 Индексация документов..."):
+        st.sidebar.info("Индекс отсутствует. Выполняется перестройка...")
+        with st.spinner("Индексация документов..."):
             if force_rebuild_index(qa_system):
-                st.success("✅ Индекс перестроен")
+                st.success("Индекс перестроен")
                 return True
             else:
-                st.error("❌ Не удалось перестроить индекс")
+                st.error("Не удалось перестроить индекс")
                 return False
 
     try:
         if qa_system.load_index(INDEX_FILE):
-            st.sidebar.success(f"✅ Индекс загружен\n📄 {len(qa_system.chunks)} фрагментов")
+            st.sidebar.success(f"Индекс загружен\n{len(qa_system.chunks)} фрагментов")
             return True
     except (OSError, ValueError, TypeError) as e:
-        st.sidebar.warning(f"⚠️ Ошибка загрузки индекса: {e}")
+        st.sidebar.warning(f"Ошибка загрузки индекса: {e}")
 
     return False
 
-
-# ========= ОСНОВНОЙ ИНТЕРФЕЙС =========
 
 def render_sidebar(
         qa_system: QASystem,
@@ -590,18 +575,17 @@ def render_sidebar(
 ) -> None:
     """Рендер боковой панели."""
     with st.sidebar:
-        st.header("📚 О системе")
+        st.header("О системе")
         st.markdown("""
-        - ✅ Семантический поиск по тексту
-        - ✅ Инженерные расчёты
-        - ✅ Извлечение нормативных параметров
-        - ✅ Поиск таблиц и формул
-        - ✅ Определения терминов
+        - Семантический поиск по тексту
+        - Инженерные расчёты
+        - Извлечение нормативных параметров
+        - Поиск таблиц и формул
+        - Определения терминов
         """)
         st.divider()
 
-        # ========= ДИАГНОСТИКА ИНДЕКСА =========
-        st.subheader("🔍 Диагностика индекса")
+        st.subheader("Диагностика индекса")
         st.write(f"INDEX_FILE: `{INDEX_FILE}`")
         st.write(f"Файл существует: `{INDEX_FILE.exists()}`")
         if INDEX_FILE.exists():
@@ -614,12 +598,11 @@ def render_sidebar(
         if qa_system.chunk_embeddings is not None:
             st.write(f"Эмбеддинги: `{qa_system.chunk_embeddings.shape}`")
         else:
-            st.write("Эмбеддинги: `Нет`")
+            st.write("Эмбеддинги: Нет")
 
         st.divider()
 
-        # ========= ДИАГНОСТИКА LLM =========
-        st.subheader("🤖 Статус LLM")
+        st.subheader("Статус LLM")
         llm_status = get_llm_status(qa_system)
         st.write(f"use_llm: `{llm_status['use_llm']}`")
         st.write(f"llm_provider: `{llm_status['llm_provider']}`")
@@ -635,68 +618,68 @@ def render_sidebar(
 
         col1, col2 = st.columns(2)
         with col1:
-            if st.button("🔄 Перезагрузить индекс", use_container_width=True):
+            if st.button("Перезагрузить индекс", use_container_width=True):
                 if INDEX_FILE.exists():
                     qa_system.load_index(INDEX_FILE)
-                    st.success(f"✅ Индекс перезагружен: {len(qa_system.chunks)} фрагментов")
+                    st.success(f"Индекс перезагружен: {len(qa_system.chunks)} фрагментов")
                     st.rerun()
                 else:
-                    st.warning("⚠️ Индекс не найден")
+                    st.warning("Индекс не найден")
 
         with col2:
-            if st.button("🗑️ Очистить индекс", use_container_width=True):
+            if st.button("Очистить индекс", use_container_width=True):
                 if INDEX_FILE.exists():
                     INDEX_FILE.unlink(missing_ok=True)
                     qa_system.is_ready = False
-                    st.success("✅ Индекс очищен")
+                    st.success("Индекс очищен")
                     st.rerun()
 
-        if st.button("📥 Синхронизировать dataset", use_container_width=True):
+        if st.button("Синхронизировать dataset", use_container_width=True):
             with st.spinner("Скачивание документов из Hugging Face..."):
                 if sync_hf_dataset_to_raw(force=True):
-                    st.success("✅ Dataset синхронизирован")
+                    st.success("Dataset синхронизирован")
                 else:
-                    st.error("❌ Не удалось синхронизировать dataset")
+                    st.error("Не удалось синхронизировать dataset")
                 st.rerun()
 
-        if st.button("🔨 Перестроить индекс (с эмбеддингами)", use_container_width=True):
-            with st.spinner("🔄 Перестройка индекса..."):
+        if st.button("Перестроить индекс (с эмбеддингами)", use_container_width=True):
+            with st.spinner("Перестройка индекса..."):
                 if force_rebuild_index(qa_system):
-                    st.success("✅ Индекс перестроен")
+                    st.success("Индекс перестроен")
                     st.rerun()
                 else:
-                    st.error("❌ Ошибка перестройки индекса")
+                    st.error("Ошибка перестройки индекса")
 
         if not qa_system.is_ready:
-            if st.button("📚 Индексировать документы", key="index_btn", use_container_width=True):
+            if st.button("Индексировать документы", key="index_btn", use_container_width=True):
                 with st.spinner("Индексация..."):
                     if force_rebuild_index(qa_system):
-                        st.success(f"✅ Проиндексировано {len(qa_system.chunks)} фрагментов")
+                        st.success(f"Проиндексировано {len(qa_system.chunks)} фрагментов")
                         st.rerun()
                     else:
-                        st.error("❌ Не найдено документов для индексации")
+                        st.error("Не найдено документов для индексации")
 
         st.divider()
 
-        st.subheader("📐 Доступные формулы")
+        st.subheader("Доступные формулы")
         available_formulas = formula_engine.get_available_formulas()
         for formula in available_formulas:
-            with st.expander(f"📖 {formula['name']}"):
+            with st.expander(f"{formula['name']}"):
                 st.markdown(formula.get("expression", ""))
                 st.caption(formula.get("description", ""))
                 if formula.get("legend"):
                     st.markdown("**Обозначения:**")
                     st.markdown(formula["legend"])
-                st.caption(f"📚 {formula.get('source', '')}")
+                st.caption(f"{formula.get('source', '')}")
 
         st.divider()
 
-        st.subheader("📊 Статистика базы")
+        st.subheader("Статистика базы")
         docs_count = (
-                len(list(RAW_DIR.glob("*.docx")))
-                + len(list(RAW_DIR.glob("*.pdf")))
-                + len(list(RAW_DIR.glob("*.rtf")))
-                + len(list(RAW_DIR.glob("*.doc")))
+            len(list(RAW_DIR.glob("*.docx")))
+            + len(list(RAW_DIR.glob("*.pdf")))
+            + len(list(RAW_DIR.glob("*.rtf")))
+            + len(list(RAW_DIR.glob("*.doc")))
         )
         chunks_count = len(qa_system.chunks) if qa_system.is_ready else 0
 
@@ -706,22 +689,22 @@ def render_sidebar(
 
         st.divider()
 
-        st.subheader("💾 Экспорт")
-        if st.button("📄 Экспорт истории (DOCX)", use_container_width=True):
+        st.subheader("Экспорт")
+        if st.button("Экспорт истории (DOCX)", use_container_width=True):
             docx_path = export_history_to_docx()
             if docx_path and docx_path.exists():
                 with open(docx_path, "rb") as f:
                     st.download_button(
-                        label="📥 Скачать DOCX",
+                        label="Скачать DOCX",
                         data=f.read(),
                         file_name=docx_path.name,
                         mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
                         use_container_width=True,
                     )
             else:
-                st.error("❌ Ошибка создания файла")
+                st.error("Ошибка создания файла")
 
-        if st.button("🗑️ Очистить историю", use_container_width=True):
+        if st.button("Очистить историю", use_container_width=True):
             st.session_state.messages = get_initial_message()
             if HISTORY_FILE.exists():
                 HISTORY_FILE.unlink()
@@ -733,7 +716,7 @@ def render_sidebar(
 
         if getattr(error_handler, "errors", None):
             st.divider()
-            st.subheader("⚠️ Ошибки")
+            st.subheader("Ошибки")
             with st.expander(f"Показать {len(error_handler.errors)} ошибок"):
                 for i, err in enumerate(error_handler.errors[-5:], start=1):
                     st.error(f"{i}. {err.get('type', 'Error')}: {err.get('message', '')[:100]}")
@@ -741,18 +724,18 @@ def render_sidebar(
 
 def render_sources(sources: list) -> None:
     """Рендерит источники."""
-    with st.expander("📚 Источники", expanded=False):
+    with st.expander("Источники", expanded=False):
         for src in sources[:5]:
             if isinstance(src, dict):
                 doc_name = src.get("doc_name") or src.get("docname") or src.get("source") or "Документ"
             else:
                 doc_name = str(src)
-            st.caption(f"📄 {doc_name}")
+            st.caption(f"{doc_name}")
 
 
 def render_tables(tables: list) -> None:
     """Рендерит таблицы."""
-    with st.expander("📊 Таблицы", expanded=False):
+    with st.expander("Таблицы", expanded=False):
         for table in tables[:3]:
             if isinstance(table, dict):
                 rows = table.get("rows", [])
@@ -767,7 +750,7 @@ def render_tables(tables: list) -> None:
 
 def render_formulas(formulas: list) -> None:
     """Рендерит формулы."""
-    with st.expander("📐 Формулы", expanded=False):
+    with st.expander("Формулы", expanded=False):
         for formula in formulas[:3]:
             if isinstance(formula, dict):
                 st.code(formula.get("raw", ""))
@@ -777,7 +760,7 @@ def render_formulas(formulas: list) -> None:
 
 def render_reasoning(steps: list) -> None:
     """Рендерит цепочку рассуждений."""
-    with st.expander("🧠 Цепочка рассуждений", expanded=False):
+    with st.expander("Цепочка рассуждений", expanded=False):
         for step in steps:
             st.caption(
                 f"Шаг {step['step']}: {step['description']} "
@@ -794,12 +777,11 @@ def main() -> None:
     agent_loop = st.session_state.agent_loop
     error_handler = st.session_state.error_handler
 
-    st.title("🏗️ Инженерный помощник проектировщика")
-    st.caption("📄 База знаний: ГОСТы, СП, технические регламенты и методические документы по строительству")
+    st.title("Инженерный помощник проектировщика")
+    st.caption("База знаний: ГОСТы, СП, технические регламенты и методические документы по строительству")
 
     render_sidebar(qa_system, formula_engine, error_handler)
 
-    # Отрисовка истории сообщений
     for i, msg in enumerate(st.session_state.messages):
         with st.chat_message(msg["role"]):
             st.markdown(msg["content"])
@@ -810,7 +792,7 @@ def main() -> None:
                 has_formulas = bool(msg.get("formulas"))
 
                 if has_sources or has_tables or has_formulas:
-                    with st.expander("📎 Источники и материалы", expanded=False):
+                    with st.expander("Источники и материалы", expanded=False):
                         if has_sources:
                             st.markdown("**Источники:**")
                             for src in msg.get("sources", []):
@@ -858,14 +840,11 @@ def main() -> None:
     formulas: list = []
 
     with st.chat_message("assistant"):
-        with st.spinner("🔍 Анализирую запрос..."):
+        with st.spinner("Анализирую запрос..."):
             try:
                 prompt_clean = prompt.strip()
                 prompt_lower = prompt_clean.lower()
 
-                # =========================================================
-                # ТРИГГЕРЫ — только в НАЧАЛЕ запроса
-                # =========================================================
                 calc_triggers = [
                     "рассчитай", "вычисли", "посчитай", "толщин", "температур",
                     "потери", "формул", "вентиляц", "расход", "гсоп", "градусо"
@@ -901,9 +880,6 @@ def main() -> None:
                 is_definition_query = any(prompt_lower.startswith(t) for t in definition_triggers)
                 is_table = any(w in prompt_lower for w in table_triggers)
 
-                # =========================================================
-                # 1. ОПРЕДЕЛЕНИЯ — ТОЛЬКО ПО ЯВНЫМ ТРИГГЕРАМ
-                # =========================================================
                 if is_definition_query:
                     clean_term = prompt_lower
                     for trigger in definition_triggers:
@@ -918,28 +894,25 @@ def main() -> None:
 
                     if quick_def:
                         response = (
-                            f"📖 **Определение:**\n\n"
+                            f"**Определение:**\n\n"
                             f"{quick_def.get('definition', '')}\n\n"
-                            f"📚 **Источник:** {quick_def.get('source', '')}"
+                            f"**Источник:** {quick_def.get('source', '')}"
                         )
                         if quick_def.get("example"):
-                            response += f"\n\n📌 **Пример:** {quick_def['example']}"
+                            response += f"\n\n**Пример:** {quick_def['example']}"
                     elif clean_term:
                         definition_result = qa_system.find_definition(clean_term)
                         if definition_result.get("found"):
                             response = (
-                                f"📖 **Определение термина «{clean_term}»:**\n\n"
+                                f"**Определение термина «{clean_term}»:**\n\n"
                                 f"{definition_result.get('definition', '')}\n\n"
-                                f"📚 **Источник:** {definition_result.get('source', 'Нормативная база')}"
+                                f"**Источник:** {definition_result.get('source', 'Нормативная база')}"
                             )
                         else:
-                            response = f"⚠️ В загруженных документах не найдено определение для термина «{clean_term}»."
+                            response = f"В загруженных документах не найдено определение для термина «{clean_term}»."
                     else:
-                        response = "⚠️ Уточните термин для определения."
+                        response = "Уточните термин для определения."
 
-                # =========================================================
-                # 2. РАСЧЁТЫ
-                # =========================================================
                 elif is_calc:
                     result = call_maybe_async(formula_engine.answer_calculation, prompt_clean)
                     response = result.get("answer", "Не удалось выполнить расчёт")
@@ -950,9 +923,6 @@ def main() -> None:
                     if not formulas and result.get("formula"):
                         formulas = [result["formula"]]
 
-                # =========================================================
-                # 3. ТАБЛИЦЫ
-                # =========================================================
                 elif is_table:
                     result = qa_system.answer(prompt_clean)
                     response = result.get("answer", "Таблица не найдена")
@@ -961,7 +931,7 @@ def main() -> None:
                     formulas = result.get("formulas", [])
 
                     if tables:
-                        response += "\n\n📊 **Найденные таблицы:**\n"
+                        response += "\n\n**Найденные таблицы:**\n"
                         for table in tables[:2]:
                             if isinstance(table, dict):
                                 response += f"\n**{table.get('title', 'Таблица')}**\n"
@@ -970,9 +940,6 @@ def main() -> None:
                                     content = content[:500] + "..."
                                 response += f"```\n{content}\n```\n"
 
-                # =========================================================
-                # 4. ВСЁ ОСТАЛЬНОЕ — AGENT LOOP
-                # =========================================================
                 else:
                     result = call_maybe_async(agent_loop.run, prompt_clean)
                     response = result.get("answer", "Не удалось получить ответ")
@@ -983,15 +950,12 @@ def main() -> None:
                     if result.get("needs_clarification"):
                         questions = result.get("questions", [])
                         if questions:
-                            response += "\n\n❓ **Уточните:**\n" + "\n".join([f"• {q}" for q in questions])
+                            response += "\n\n**Уточните:**\n" + "\n".join([f"• {q}" for q in questions])
 
             except Exception as e:
                 error_info = error_handler.handle(e, {"query": prompt})
-                response = error_info.get("user_message", f"❌ Ошибка: {e}")
+                response = error_info.get("user_message", f"Ошибка: {e}")
 
-        # =========================================================
-        # ОТОБРАЖЕНИЕ ОТВЕТА
-        # =========================================================
         st.markdown(response)
 
         has_sources = bool(sources)
@@ -999,7 +963,7 @@ def main() -> None:
         has_formulas = bool(formulas)
 
         if has_sources or has_tables or has_formulas:
-            with st.expander("📎 Источники и материалы", expanded=False):
+            with st.expander("Источники и материалы", expanded=False):
                 if has_sources:
                     st.markdown("**Источники:**")
                     for src in sources:
@@ -1037,7 +1001,6 @@ def main() -> None:
             response_id=current_response_id,
         )
 
-    # Сохраняем сообщение в историю
     st.session_state.messages.append({
         "role": "assistant",
         "content": response,
@@ -1047,6 +1010,7 @@ def main() -> None:
     })
 
     save_history()
+
 
 if __name__ == "__main__":
     main()

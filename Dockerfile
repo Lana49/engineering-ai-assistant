@@ -1,6 +1,6 @@
 # ============================================
 # Dockerfile для Engineering AI Assistant
-# Порт: 7860 (Hugging Face Docker Space)
+# Hugging Face Docker Space
 # ============================================
 
 FROM python:3.10-slim
@@ -21,14 +21,17 @@ ENV DEBIAN_FRONTEND=noninteractive \
     STREAMLIT_SERVER_HEADLESS=true \
     STREAMLIT_SERVER_ENABLE_CORS=false \
     STREAMLIT_SERVER_ENABLE_XSRF_PROTECTION=false \
-    HF_HUB_ENABLE_HF_TRANSFER=1 \
+    HF_HUB_ENABLE_HF_TRANSFER=0 \
     HF_HOME=/app/.cache/huggingface \
+    USE_LLM=false \
+    AUTO_SYNC_DATASET=false \
+    AUTO_REBUILD_INDEX=false \
     PATH="/root/.local/bin:${PATH}"
 
 WORKDIR /app
 
 # ============================================
-# УСТАНОВКА СИСТЕМНЫХ ЗАВИСИМОСТЕЙ
+# СИСТЕМНЫЕ ЗАВИСИМОСТИ
 # ============================================
 RUN apt-get update && apt-get install -y --no-install-recommends \
     bash \
@@ -57,7 +60,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # ============================================
 RUN curl -fsSL https://ollama.com/install.sh | sh
 
-# Создаём директории для данных
+# ============================================
+# СОЗДАНИЕ ДИРЕКТОРИЙ
+# ============================================
 RUN mkdir -p /app/data/models /app/data/raw /app/data/processed /app/.cache/huggingface && \
     chmod -R 777 /app/data /app/.cache
 
@@ -70,25 +75,30 @@ RUN python -m pip install --upgrade pip setuptools wheel && \
     python -m pip install --no-cache-dir -r requirements.txt
 
 # ============================================
-# КОПИРУЕМ ИСХОДНЫЙ КОД
+# ПРЕДВАРИТЕЛЬНАЯ ЗАГРУЗКА EMBEDDING МОДЕЛИ
+# ============================================
+RUN python -c "from sentence_transformers import SentenceTransformer; SentenceTransformer('sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2')" || true
+
+# ============================================
+# КОПИРОВАНИЕ КОДА
 # ============================================
 COPY . .
 
 RUN chmod +x /app/start.sh
 
 # ============================================
-# НАСТРОЙКА ТОМОВ
+# ТОМА ДЛЯ ДАННЫХ
 # ============================================
 VOLUME ["/app/data"]
 
 # ============================================
-# ОТКРЫВАЕМ ПОРТЫ
+# ПОРТЫ
 # ============================================
 EXPOSE 7860
 EXPOSE 11434
 
 # ============================================
-# HEALTHCHECK ДЛЯ HUGGING FACE SPACE
+# HEALTHCHECK
 # ============================================
 HEALTHCHECK --interval=30s --timeout=10s --start-period=90s --retries=5 \
   CMD curl --fail http://127.0.0.1:7860/_stcore/health || exit 1
