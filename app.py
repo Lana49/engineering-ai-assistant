@@ -250,17 +250,14 @@ def get_llm_status(qa_system: QASystem) -> dict[str, str]:
         "llm_available": str(getattr(qa_system, "llm_available", False)),
         "selected_provider": selected_provider,
         "ollama_alive": str(ollama_alive),
-        "ollama_model": str(getattr(qa_system, "ollama_model", "")),
-        "gemini_available": str(getattr(qa_system, "gemini_available", False)),
+        "ollama_model": str(getattr(qa_system, "ollama_model", ""))
     }
 
 def init_qa_system() -> QASystem:
-    use_llm = os.getenv("USE_LLM", "false").lower() == "true"
+    use_llm = os.getenv("USE_LLM", "true").lower() == "true"
     llm_provider = os.getenv("LLM_PROVIDER", "ollama").strip().lower()
     ollama_base_url = os.getenv("OLLAMA_BASE_URL", "http://127.0.0.1:11434").strip()
     ollama_model = os.getenv("OLLAMA_MODEL", "phi3:mini").strip()
-    gemini_api_key = os.getenv("GEMINI_API_KEY", "").strip()
-    gemini_model = os.getenv("GEMINI_MODEL", "gemini-2.0-flash").strip()
 
     auto_sync = os.getenv("AUTO_SYNC_DATASET", "false").lower() == "true"
     auto_rebuild = os.getenv("AUTO_REBUILD_INDEX", "false").lower() == "true"
@@ -278,9 +275,7 @@ def init_qa_system() -> QASystem:
         llm_provider=llm_provider if use_llm else "none",
         use_embeddings=True,
         ollama_base_url=ollama_base_url,
-        ollama_model=ollama_model,
-        gemini_api_key=gemini_api_key if use_llm and llm_provider == "gemini" else None,
-        gemini_model=gemini_model,
+        ollama_model=ollama_model
     )
 
     if INDEX_FILE.exists():
