@@ -167,7 +167,7 @@ class QASystem:
 
         try:
             print(f"📥 Загружаю embedding model: {self.embedding_model_name}")
-            self.embedding_model = SentenceTransformer(self.embedding_model_name)
+            self.embedding_model: SentenceTransformer | None = None
             print("✅ Embedding model загружена")
         except Exception as e:
             print(f"⚠️ Не удалось загрузить embedding model: {e}")
@@ -305,12 +305,7 @@ class QASystem:
 
             # ============ TF-IDF ============
             if TfidfVectorizer is not None:
-                self.vectorizer = TfidfVectorizer(
-                    lowercase=True,
-                    ngram_range=(1, 2),
-                    max_features=50000,
-                    token_pattern=r"(?u)\b[\w\-./]+\b",
-                )
+                self.vectorizer: TfidfVectorizer | None = None
                 if self.vectorizer is not None:
                     self.tfidf_matrix = self.vectorizer.fit_transform(texts)
                     self.last_index_diagnostics["tfidf_built"] = True

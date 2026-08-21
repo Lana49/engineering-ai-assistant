@@ -394,18 +394,34 @@ class TableExtractor:
         )
 
     @staticmethod
+    def _table_fingerprint(table: ExtractedTable) -> str:
+        """Создаёт уникальный отпечаток таблицы для дедупликации."""
+        def clean(value: Any) -> str:
+            return re.sub(r"\s+", " ", str(value).strip().lower())
+
+        headers = "|".join(clean(cell) for cell in table.headers)
+        rows = "\n".join(
+            "|".join(clean(cell) for cell in row)
+            for row in table.rows[:20]
+        )
+        return f"{clean(table.source)}::{headers}::{rows}"
+
+    @classmethod
     def _deduplicate_tables(
+        cls,
         tables: list[ExtractedTable],
     ) -> list[ExtractedTable]:
-        """Удаляет дубликаты таблиц."""
-        unique = []
-        seen: set[tuple[str, str]] = set()
+        """Удаляет дубликаты таблиц по fingerprint."""
+        unique: list[ExtractedTable] = []
+        seen: set[str] = set()
 
         for table in tables:
-            key = (table.source, table.raw_text[:200])
-            if key not in seen:
-                seen.add(key)
-                unique.append(table)
+            fingerprint = cls._table_fingerprint(table)
+            if fingerprint in seen:
+                continue
+
+            seen.add(fingerprint)
+            unique.append(table)
 
         return unique
 
@@ -422,7 +438,7 @@ def extract_tables_from_results(results: list[Any], min_rows: int = 2, limit: in
     """Извлекает таблицы из результатов поиска."""
     extractor = TableExtractor()
     all_tables: list[ExtractedTable] = []
-    seen: set[tuple[str, str]] = set()
+    seen: set[str] = set()
 
     for result in results[:limit]:
         if hasattr(result, "text"):
@@ -439,37 +455,114 @@ def extract_tables_from_results(results: list[Any], min_rows: int = 2, limit: in
 
         tables = extractor.extract(text, source=doc_name, min_rows=min_rows)
         for table in tables:
-            key = (table.source, table.raw_text[:200])
-            if key not in seen:
-                seen.add(key)
+            fingerprint = TableExtractor._table_fingerprint(table)
+            if fingerprint not in seen:
+                seen.add(fingerprint)
                 all_tables.append(table)
 
     return all_tables
 
 
-def find_city_in_tables(tables: list[ExtractedTable], city: str) -> dict[str, Any] | None:
-    """Ищет город в таблицах и возвращает информацию о найденной строке."""
+def find_city_in_tables(tables: list[ExtractedTable], city: str, city_aliases: dict[str, set[str]] = None) -> dict[str, Any] | None:
+    """
+    Ищет город в таблицах с учётом алиасов и словоформ.
+
+    Args:
+        tables: Список извлечённых таблиц
+        city: Название города (каноническое)
+        city_aliases: Словарь алиасов {каноническое_имя: {словоформы}}
+
+    Returns:
+        dict с информацией о найденной строке или None
+    """
+    if not tables or not city:
+        return None
+
     city_lower = city.lower().strip()
 
+    # Собираем все формы для поиска
+    city_forms = {city_lower}
+    if city_aliases and city_lower in city_aliases:
+        city_forms.update(city_aliases[city_lower])
+
+    # Дополнительные варианты для составных названий
+    if "-" in city_lower:
+        city_forms.add(city_lower.replace("-", " "))
+        city_forms.add(city_lower.replace("-", ""))
+
+    # Поиск по таблицам
     for table in tables:
         for idx, row in enumerate(table.rows):
             if isinstance(row, list):
-                for cell in row:
-                    if city_lower in str(cell).lower():
+                row_text = " ".join(str(c) for c in row)
+                row_lower = row_text.lower()
+
+                # Проверяем каждую форму
+                for form in city_forms:
+                    if form in row_lower:
                         return {
                             "table": table,
                             "row": row,
                             "index": idx,
-                            "row_text": " ".join(str(c) for c in row)
+                            "row_text": row_text,
+                            "matched_form": form,
+                            "confidence": 0.9,
                         }
+
+                # Проверка по отдельным ячейкам (выше точность)
+                for cell in row:
+                    cell_lower = str(cell).lower()
+                    for form in city_forms:
+                        if form in cell_lower:
+                            return {
+                                "table": table,
+                                "row": row,
+                                "index": idx,
+                                "row_text": row_text,
+                                "matched_form": form,
+                                "confidence": 1.0,
+                            }
+
             elif isinstance(row, str):
-                if city_lower in row.lower():
-                    return {
-                        "table": table,
-                        "row": row,
-                        "index": idx,
-                        "row_text": row
-                    }
+                row_lower = row.lower()
+                for form in city_forms:
+                    if form in row_lower:
+                        return {
+                            "table": table,
+                            "row": [row],
+                            "index": idx,
+                            "row_text": row,
+                            "matched_form": form,
+                            "confidence": 0.8,
+                        }
+
+    # Fallback: поиск по токенам (для "ростов-на-дону" и т.п.)
+    city_tokens = city_lower.replace("-", " ").split()
+    if len(city_tokens) > 1:
+        for table in tables:
+            for idx, row in enumerate(table.rows):
+                if isinstance(row, list):
+                    row_text = " ".join(str(c) for c in row).lower()
+                    if all(token in row_text for token in city_tokens):
+                        return {
+                            "table": table,
+                            "row": row,
+                            "index": idx,
+                            "row_text": " ".join(str(c) for c in row),
+                            "matched_form": " ".join(city_tokens),
+                            "confidence": 0.7,
+                        }
+                elif isinstance(row, str):
+                    row_lower = row.lower()
+                    if all(token in row_lower for token in city_tokens):
+                        return {
+                            "table": table,
+                            "row": [row],
+                            "index": idx,
+                            "row_text": row,
+                            "matched_form": " ".join(city_tokens),
+                            "confidence": 0.7,
+                        }
 
     return None
 

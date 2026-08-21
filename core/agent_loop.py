@@ -1,31 +1,34 @@
 # core/agent_loop.py
 """
-Многошаговый агент для инженерных запросов.
+Оркестратор инженерных запросов.
+
+Принцип маршрутизации:
+1. QueryParser извлекает intent, параметры, город, код документа.
+2. Полный числовой расчёт исполняется немедленно, без RAG.
+3. Поиск используется для нормативных вопросов, определений,
+   сравнений, свободного поиска и неполных city-зависимых расчётов.
 """
 
 from __future__ import annotations
 
-import asyncio
 import re
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any
 
 from core.prompts import get_quick_definition
+from core.query_parser import parse_query
 from core.retrieval_memory import RetrievalMemory
 from core.table_extractor import extract_tables, tables_to_dicts
 
-# Правильный импорт конфига
 try:
     from core.config import PROCESSED_DIR
 except ImportError:
-    # Fallback для случаев, когда config ещё не создан
     from pathlib import Path
     PROCESSED_DIR = Path("data/processed")
 
 
 class QueryType(Enum):
-    """Типы запросов."""
     CALCULATION = "calculation"
     DEFINITION = "definition"
     SEARCH = "search"
@@ -36,7 +39,6 @@ class QueryType(Enum):
 
 @dataclass(slots=True)
 class ReasoningStep:
-    """Шаг цепочки рассуждений."""
     step_id: int
     description: str
     result: Any = None
@@ -46,7 +48,6 @@ class ReasoningStep:
 
 @dataclass(slots=True)
 class ContextInfo:
-    """Контекстная информация по запросу."""
     query: str
     query_type: QueryType
     keywords: list[str]
@@ -57,1059 +58,1239 @@ class ContextInfo:
 
 
 class AgentLoop:
-    """
-    Многошаговый агент для инженерных запросов.
-    """
+    """Маршрутизирует запросы между вычислительным и retrieval-слоями."""
 
-    def __init__(self, qa_system, formula_engine):
+    REGULATORY_MARKERS = (
+        "должен",
+        "должна",
+        "должны",
+        "требуется",
+        "требуют",
+        "следует",
+        "необходимо",
+        "не допускается",
+        "допускается",
+        "не менее",
+        "не более",
+        "принимается",
+        "принимают",
+        "устанавливается",
+        "должно быть",
+        "как правило",
+        "в соответствии",
+    )
+
+    REGULATORY_QUERY_EXPANSIONS = {
+        "вентиляция": [
+            "системы вентиляции",
+            "воздухообмен",
+            "расход наружного воздуха",
+            "требования к вентиляции",
+        ],
+        "микроклимат": [
+            "параметры микроклимата",
+            "температура воздуха",
+            "относительная влажность",
+            "скорость движения воздуха",
+        ],
+        "отопление": [
+            "система отопления",
+            "теплоснабжение",
+            "отопительные приборы",
+            "требования к отоплению",
+        ],
+        "изоляция": [
+            "тепловая изоляция",
+            "теплоизоляционные конструкции",
+            "сопротивление теплопередаче",
+        ],
+        "тепловая защита": [
+            "сопротивление теплопередаче",
+            "ограждающие конструкции",
+            "энергоэффективность здания",
+        ],
+    }
+
+    def __init__(self, qa_system: Any, formula_engine: Any):
         self.qa_system = qa_system
         self.formula_engine = formula_engine
+
         self.messages: list[dict[str, Any]] = []
         self.reasoning_steps: list[ReasoningStep] = []
         self.context: ContextInfo | None = None
-        self.max_steps = 6
         self.last_error: str | None = None
-        self.memory = RetrievalMemory(PROCESSED_DIR / "retrieval_memory.json")
+
+        self.memory = RetrievalMemory(
+            PROCESSED_DIR / "retrieval_memory.json"
+        )
 
     async def run(self, user_content: str) -> dict[str, Any]:
-        """Запускает обработку запроса."""
+        """Главная точка входа."""
         self.messages.append({"role": "user", "content": user_content})
         self.reasoning_steps = []
         self.context = None
+        self.last_error = None
 
         try:
             step1 = self._analyze_query(user_content)
             self.reasoning_steps.append(step1)
-            if not step1.result:
-                return self._create_error_response("Не удалось проанализировать запрос.", 1)
 
-            query_type = step1.result.get("type", QueryType.GENERAL)
-            keywords = step1.result.get("keywords", [])
-            entities = step1.result.get("entities", {})
-            parameters = step1.result.get("parameters", {})
+            if step1.result is None:
+                return self._create_error_response(
+                    "Не удалось проанализировать запрос.",
+                    step_id=1,
+                )
 
-            step2 = self._search_chunks(user_content, query_type, entities, keywords)
+            query_type: QueryType = step1.result["type"]
+            keywords: list[str] = step1.result["keywords"]
+            entities: dict[str, Any] = step1.result["entities"]
+            parameters: dict[str, Any] = step1.result["parameters"]
+
+            # Fast-path: прямой расчёт не должен зависеть от RAG.
+            if (
+                query_type == QueryType.CALCULATION
+                and self.formula_engine.can_calculate_directly(
+                    user_content,
+                    parameters,
+                )
+            ):
+                step2 = await self._handle_direct_calculation(
+                    query=user_content,
+                    parameters=parameters,
+                    entities=entities,
+                )
+                self.reasoning_steps.append(step2)
+
+                response = self._finalize_response(
+                    result=step2.result,
+                    query_type=query_type,
+                    keywords=keywords,
+                    original_query=user_content,
+                )
+                response["steps"] = len(self.reasoning_steps)
+                return response
+
+            # Retrieval нужен только если direct calculation невозможен
+            # или вопрос по смыслу является нормативным/поисковым.
+            step2 = self._search_chunks(
+                query=user_content,
+                query_type=query_type,
+                entities=entities,
+                keywords=keywords,
+            )
             self.reasoning_steps.append(step2)
+
             chunks = step2.result.get("chunks", []) if step2.result else []
 
-            step3 = self._analyze_context(user_content, chunks, query_type, entities, parameters)
+            step3 = self._build_context(
+                query=user_content,
+                query_type=query_type,
+                keywords=keywords,
+                entities=entities,
+                parameters=parameters,
+                chunks=chunks,
+            )
             self.reasoning_steps.append(step3)
-            if not step3.result:
-                return self._create_error_response("Не удалось проанализировать найденный контекст.", 3)
 
-            context_info = step3.result
-            self.context = context_info
+            if step3.result is None:
+                return self._create_error_response(
+                    "Не удалось сформировать контекст запроса.",
+                    step_id=3,
+                )
 
-            if query_type == QueryType.CALCULATION:
-                step4 = await self._handle_calculation(context_info)
-            elif query_type == QueryType.DEFINITION:
-                step4 = self._handle_definition(context_info)
-            elif query_type == QueryType.COMPARISON:
-                step4 = self._handle_comparison(context_info)
-            elif query_type == QueryType.REGULATORY:
-                step4 = self._handle_regulatory(context_info)
-            else:
-                step4 = self._handle_search(context_info)
+            context = step3.result
+            self.context = context
 
+            step4 = await self._dispatch(context)
             self.reasoning_steps.append(step4)
-            if not step4.result:
-                return self._create_error_response("Не удалось сформировать промежуточный ответ.", 4)
 
-            step5 = self._check_completeness(step4.result, context_info)
-            self.reasoning_steps.append(step5)
+            if step4.result is None:
+                return self._create_error_response(
+                    "Не удалось сформировать ответ.",
+                    step_id=4,
+                )
 
-            step6 = self._generate_final_response(step4.result, step5.result, context_info)
-            self.reasoning_steps.append(step6)
+            response = self._finalize_response(
+                result=step4.result,
+                query_type=query_type,
+                keywords=keywords,
+                original_query=user_content,
+            )
+            response["steps"] = len(self.reasoning_steps)
 
-            final_response = self._format_response(step6.result, query_type)
+            return response
 
-            if step5.result and step5.result.get("needs_clarification", False):
-                final_response["needs_clarification"] = True
-                final_response["questions"] = step5.result.get("questions", [])
-
-            self.messages.append({"role": "assistant", "content": final_response.get("answer", "")})
-            final_response["steps"] = len(self.reasoning_steps)
-
-            if final_response.get("answer") and final_response.get("sources"):
-                source_names = []
-                for src in final_response.get("sources", []):
-                    if isinstance(src, dict):
-                        name = src.get("doc_name") or src.get("source") or ""
-                        if name:
-                            source_names.append(name)
-                    elif isinstance(src, str):
-                        source_names.append(src)
-
-                if source_names:
-                    self.memory.save_success(
-                        query=user_content,
-                        query_type=query_type.value,
-                        keywords=keywords,
-                        sources=source_names
-                    )
-
-            return final_response
-
-        except (ValueError, TypeError, KeyError, AttributeError) as e:
-            self.last_error = str(e)
+        except Exception as exc:
+            self.last_error = str(exc)
             return {
-                "answer": f"Ошибка при обработке запроса: {e}",
+                "answer": f"❌ Внутренняя ошибка: {exc}",
                 "sources": [],
                 "tables": [],
                 "formulas": [],
                 "confidence": 0.0,
+                "needs_clarification": True,
+                "questions": ["Повторите запрос или уточните исходные данные."],
                 "query_type": "error",
                 "steps": len(self.reasoning_steps) or 1,
-                "error": str(e)
+                "error": str(exc),
             }
 
-    # ============================================================
-    # 1. АНАЛИЗ ЗАПРОСА — ИСПРАВЛЕН
-    # ============================================================
     @staticmethod
     def _analyze_query(query: str) -> ReasoningStep:
-        """Анализирует запрос и определяет его тип."""
+        """Получает intent и сущности только через QueryParser."""
         step = ReasoningStep(
             step_id=1,
-            description="Анализ типа запроса и сущностей"
+            description="Анализ запроса и извлечение сущностей",
         )
 
         try:
-            query_lower = query.lower().strip()
+            parsed = parse_query(query)
 
-            calc_triggers = [
-                "рассчитай", "расчет", "вычисли", "посчитай", "формула",
-                "теплопотери", "кратность", "расход", "гсоп",
-                "r=", "q=", "площадь", "объем", "мощность"
-            ]
-
-            definition_prefixes = [
-                "что такое ",
-                "что значит ",
-                "что означает ",
-                "что это ",
-                "дай определение ",
-                "дайте определение ",
-                "определение ",
-                "определи ",
-                "термин ",
-                "понятие ",
-                "расшифруй ",
-                "расшифровка ",
-                "аббревиатура ",
-            ]
-
-            comp_triggers = [
-                "сравни", "разница", "отличие", "лучше", "хуже"
-            ]
-            reg_triggers = [
-                "требования", "норма", "нормы", "сп", "гост", "снип",
-                "пункт", "таблица", "раздел", "допускается", "следует"
-            ]
-
-            is_calc = any(w in query_lower for w in calc_triggers)
-            is_def = any(query_lower.startswith(prefix) for prefix in definition_prefixes)
-            is_comp = any(w in query_lower for w in comp_triggers)
-            is_reg = any(w in query_lower for w in reg_triggers)
-
-            if is_calc:
-                query_type = QueryType.CALCULATION
-            elif is_def:
-                query_type = QueryType.DEFINITION
-            elif is_comp:
-                query_type = QueryType.COMPARISON
-            elif is_reg:
-                query_type = QueryType.REGULATORY
-            else:
-                query_type = QueryType.SEARCH
-
-            # Исправлено: явное приведение к строке и исправленное регулярное выражение
-            query_str = str(query)
-            keywords = re.findall(r"[A-Za-zА-Яа-я0-9._-]{3,}", query_str)
-            keywords = [w.lower() for w in keywords if len(w) > 2]
-
-            numbers = re.findall(r"-?\d+(?:[.,]\d+)?", query_str)
-            parsed_numbers = []
-            for num in numbers:
-                try:
-                    parsed_numbers.append(float(num.replace(",", ".")))
-                except ValueError:
-                    continue
-
-            parameters: dict[str, Any] = {}
-            if parsed_numbers:
-                parameters["numeric_values"] = parsed_numbers
+            type_map = {
+                "calculation": QueryType.CALCULATION,
+                "definition": QueryType.DEFINITION,
+                "search": QueryType.SEARCH,
+                "comparison": QueryType.COMPARISON,
+                "regulatory": QueryType.REGULATORY,
+                "general": QueryType.GENERAL,
+            }
 
             entities: dict[str, Any] = {}
 
-            # Исправлено: убрано избыточное экранирование внутри [...]
-            document_codes = re.findall(
-                r"(СП\s?\d+\.\d+|ГОСТ\s?\d+(?:-\d+)?|СНиП\s?[\d.-]+)",
-                query_str,
-                flags=re.IGNORECASE
+            if getattr(parsed, "city", None):
+                entities["city"] = parsed.city
+
+            document_codes = list(
+                getattr(parsed, "document_codes", []) or []
             )
             if document_codes:
                 entities["document_codes"] = document_codes
                 entities["documents"] = document_codes
 
-            section_refs = re.findall(
-                r"(пункт\s?\d+(?:\.\d+)*|раздел\s?\d+(?:\.\d+)*)",
-                query_str,
-                flags=re.IGNORECASE
+            section_refs = list(
+                getattr(parsed, "section_refs", []) or []
             )
             if section_refs:
                 entities["section_refs"] = section_refs
 
+            keywords = list(getattr(parsed, "keywords", []) or [])
             domain_terms = [
-                w for w in keywords
-                if w not in {"что", "как", "для", "при", "это", "или", "если"}
+                word for word in keywords
+                if len(word) > 2
             ]
-            if domain_terms:
-                entities["domain_terms"] = domain_terms[:15]
+            entities["domain_terms"] = domain_terms[:12]
 
             step.result = {
-                "type": query_type,
+                "type": type_map.get(
+                    getattr(parsed, "intent", "search"),
+                    QueryType.SEARCH,
+                ),
                 "keywords": keywords,
                 "entities": entities,
-                "parameters": parameters,
+                "parameters": dict(
+                    getattr(parsed, "parameters", {}) or {}
+                ),
             }
             step.confidence = 0.9
 
-        except (ValueError, TypeError, AttributeError) as e:
+        except (
+            AttributeError,
+            TypeError,
+            ValueError,
+        ) as exc:
             step.result = None
             step.confidence = 0.0
-            step.description = f"Ошибка анализа запроса: {e}"
+            step.description = f"Ошибка анализа запроса: {exc}"
+
+        return step
+
+    async def _handle_direct_calculation(
+        self,
+        query: str,
+        parameters: dict[str, Any],
+        entities: dict[str, Any],
+    ) -> ReasoningStep:
+        """Выполняет числовой расчёт без retrieval."""
+        step = ReasoningStep(
+            step_id=2,
+            description="Прямой детерминированный расчёт без поиска",
+        )
+
+        result = await self.formula_engine.answer_calculation(
+            query=query,
+            parameters=parameters,
+            entities=entities,
+        )
+
+        step.result = self._normalize_calculation_result(result)
+        step.confidence = step.result["confidence"]
+
+        return step
+
+    async def _dispatch(
+        self,
+        context: ContextInfo,
+    ) -> ReasoningStep:
+        """Выбирает обработчик по intent."""
+        if context.query_type == QueryType.CALCULATION:
+            return await self._handle_calculation(context)
+
+        if context.query_type == QueryType.DEFINITION:
+            return self._handle_definition(context)
+
+        if context.query_type == QueryType.COMPARISON:
+            return self._handle_comparison(context)
+
+        if context.query_type == QueryType.REGULATORY:
+            return self._handle_regulatory(context)
+
+        return self._handle_search(context)
+
+    async def _handle_calculation(
+        self,
+        context: ContextInfo,
+    ) -> ReasoningStep:
+        """
+        Неполный или city-зависимый расчёт.
+
+        RAG уже выполнился только потому, что direct path оказался невозможен.
+        FormulaEngine теперь может использовать TableCalculator и найденные
+        климатические данные через qa_system.
+        """
+        step = ReasoningStep(
+            step_id=4,
+            description="Расчёт с проверкой табличных климатических данных",
+        )
+
+        try:
+            result = await self.formula_engine.answer_calculation(
+                query=context.query,
+                parameters=context.parameters,
+                entities=context.entities,
+            )
+
+            step.result = self._normalize_calculation_result(result)
+            step.confidence = step.result["confidence"]
+
+        except (
+            ArithmeticError,
+            AttributeError,
+            KeyError,
+            TypeError,
+            ValueError,
+        ) as exc:
+            step.result = {
+                "type": "calculation",
+                "answer": f"❌ Ошибка расчёта: {exc}",
+                "sources": [],
+                "tables": [],
+                "formulas": [],
+                "confidence": 0.0,
+                "needs_clarification": True,
+                "questions": ["Проверьте введённые параметры."],
+            }
+            step.confidence = 0.0
 
         return step
 
     @staticmethod
+    def _normalize_calculation_result(
+        result: dict[str, Any],
+    ) -> dict[str, Any]:
+        return {
+            "type": "calculation",
+            "answer": result.get("answer", "Расчёт не выполнен."),
+            "sources": result.get("sources", []),
+            "tables": result.get("tables", []),
+            "formulas": result.get("formulas", []),
+            "formula": result.get("formula"),
+            "parameters": result.get("params", {}),
+            "result": result.get("result"),
+            "reasoning": result.get("reasoning", ""),
+            "confidence": result.get("confidence", 0.0),
+            "needs_clarification": result.get(
+                "needs_clarification",
+                False,
+            ),
+            "questions": result.get("questions", []),
+        }
+
+    @staticmethod
     def _unique_keep_order(items: list[str]) -> list[str]:
-        """Сохраняет уникальные элементы в порядке появления."""
-        result = []
-        seen = set()
+        seen: set[str] = set()
+        result: list[str] = []
+
         for item in items:
-            if not item:
-                continue
-            key = item.strip().lower()
-            if key not in seen:
+            value = str(item).strip()
+            key = value.lower()
+
+            if value and key not in seen:
                 seen.add(key)
-                result.append(item.strip())
+                result.append(value)
+
         return result
 
-    def _expand_query(self, query: str, entities: dict[str, Any], keywords: list[str]) -> list[str]:
-        """Расширяет запрос вариантами для поиска."""
+    def _expand_query(
+        self,
+        query: str,
+        query_type: QueryType,
+        entities: dict[str, Any],
+        keywords: list[str],
+    ) -> list[str]:
+        """Строит варианты запроса для retrieval."""
         variants = [query]
 
-        doc_codes = entities.get("document_codes", []) or entities.get("documents", [])
-        section_refs = entities.get("section_refs", [])
-        domain_terms = entities.get("domain_terms", keywords[:6])
+        document_codes = list(
+            entities.get("document_codes")
+            or entities.get("documents")
+            or []
+        )
+        section_refs = list(entities.get("section_refs") or [])
+        domain_terms = list(
+            entities.get("domain_terms") or keywords[:8]
+        )
+        city = entities.get("city")
 
-        if doc_codes:
-            variants.append(" ".join(doc_codes[:2] + domain_terms[:4]).strip())
+        if document_codes:
+            variants.append(
+                " ".join(document_codes[:2] + domain_terms[:6]).strip()
+            )
 
         if section_refs:
-            variants.append(" ".join(section_refs[:2] + domain_terms[:4]).strip())
+            variants.append(
+                " ".join(section_refs[:2] + domain_terms[:6]).strip()
+            )
 
         if domain_terms:
-            variants.append(" ".join(domain_terms[:8]).strip())
+            variants.append(" ".join(domain_terms[:10]).strip())
 
-        boosts = self.memory.get_boosts(query, entities.get("query_type", "search"))
-        if boosts.get("terms"):
-            variants.append(" ".join((domain_terms[:5] + boosts["terms"][:3])).strip())
+        if city:
+            variants.extend([
+                f"{city} климат температура отопительный период",
+                f"{city} климатические параметры t от z от",
+            ])
 
-        return self._unique_keep_order([v for v in variants if v.strip()])
+        if query_type == QueryType.REGULATORY:
+            lower_query = query.lower()
+
+            for trigger, expansions in self.REGULATORY_QUERY_EXPANSIONS.items():
+                if trigger in lower_query:
+                    variants.extend(expansions)
+
+            variants.append(
+                " ".join(
+                    document_codes[:2]
+                    + domain_terms[:8]
+                    + ["требования", "следует", "не допускается"]
+                ).strip()
+            )
+
+        memory_boosts = self.memory.get_boosts(
+            query,
+            query_type.value,
+        )
+        memory_terms = memory_boosts.get("terms", [])
+
+        if memory_terms:
+            variants.append(
+                " ".join(domain_terms[:6] + memory_terms[:4]).strip()
+            )
+
+        return self._unique_keep_order(
+            [variant for variant in variants if variant.strip()]
+        )
 
     @staticmethod
     def _rerank_chunks(
         chunks: list[dict[str, Any]],
+        query_type: QueryType,
         entities: dict[str, Any],
         memory_boosts: dict[str, list[str]],
     ) -> list[dict[str, Any]]:
-        """Повторно ранжирует фрагменты с учётом бустингов."""
-        preferred_sources = [s.lower() for s in memory_boosts.get("sources", [])]
-        document_codes = [d.lower() for d in entities.get("document_codes", [])]
-        section_refs = [s.lower() for s in entities.get("section_refs", [])]
-        domain_terms = [t.lower() for t in entities.get("domain_terms", [])[:8]]
+        """Повторно ранжирует найденные фрагменты."""
+        preferred_sources = [
+            source.lower()
+            for source in memory_boosts.get("sources", [])
+        ]
+        document_codes = [
+            code.lower()
+            for code in entities.get("document_codes", [])
+        ]
+        section_refs = [
+            ref.lower()
+            for ref in entities.get("section_refs", [])
+        ]
+        domain_terms = [
+            term.lower()
+            for term in entities.get("domain_terms", [])[:12]
+        ]
+        city = str(entities.get("city", "")).lower().strip()
 
-        reranked = []
+        reranked: list[dict[str, Any]] = []
+
         for chunk in chunks:
+            doc_name = str(chunk.get("doc_name", ""))
+            text = str(chunk.get("text", ""))
+
+            lower_doc_name = doc_name.lower()
+            lower_text = text.lower()
+
             score = float(chunk.get("score", 0.0) or 0.0)
-            doc_name = str(chunk.get("doc_name", "")).lower()
-            text = str(chunk.get("text", "")).lower()
 
-            if any(src in doc_name for src in preferred_sources):
+            if any(source in lower_doc_name for source in preferred_sources):
                 score += 0.20
 
-            if any(code in doc_name or code in text for code in document_codes):
-                score += 0.35
+            if any(
+                code in lower_doc_name or code in lower_text
+                for code in document_codes
+            ):
+                score += 0.45
 
-            if any(ref in text for ref in section_refs):
-                score += 0.20
+            if any(ref in lower_text for ref in section_refs):
+                score += 0.30
 
-            term_hits = sum(1 for term in domain_terms if term in text)
-            score += min(0.25, term_hits * 0.03)
+            if city and city in lower_text:
+                score += 0.25
 
-            reranked.append({**chunk, "score": score})
+            term_hits = sum(
+                1 for term in domain_terms
+                if term and term in lower_text
+            )
+            score += min(0.35, term_hits * 0.04)
 
-        reranked.sort(key=lambda x: x.get("score", 0.0), reverse=True)
+            if query_type == QueryType.REGULATORY:
+                marker_hits = sum(
+                    1
+                    for marker in AgentLoop.REGULATORY_MARKERS
+                    if marker in lower_text
+                )
+                score += min(0.50, marker_hits * 0.08)
+
+            reranked.append({
+                **chunk,
+                "score": score,
+            })
+
+        reranked.sort(
+            key=lambda item: item.get("score", 0.0),
+            reverse=True,
+        )
         return reranked
 
-    def _search_chunks(self, query, query_type, entities=None, keywords=None):
-        """Расширенный поиск по индексу с памятью и повторным ранжированием."""
+    def _search_chunks(
+        self,
+        query: str,
+        query_type: QueryType,
+        entities: dict[str, Any] | None = None,
+        keywords: list[str] | None = None,
+    ) -> ReasoningStep:
+        """Ищет, дедуплицирует и ранжирует фрагменты индекса."""
         step = ReasoningStep(
             step_id=2,
-            description="Расширенный поиск по индексу с памятью и повторным ранжированием"
+            description="Поиск и ранжирование фрагментов документов",
         )
 
-        try:
-            entities = entities or {}
-            keywords = keywords or []
-            entities["query_type"] = query_type.value
+        entities = dict(entities or {})
+        keywords = list(keywords or [])
 
-            if not self.qa_system or not getattr(self.qa_system, "is_ready", False):
+        try:
+            if (
+                self.qa_system is None
+                or not getattr(self.qa_system, "is_ready", False)
+            ):
                 step.result = {
                     "chunks": [],
                     "count": 0,
-                    "query_type": query_type
+                    "expanded_queries": [],
                 }
                 step.confidence = 0.2
                 return step
 
-            memory_boosts = self.memory.get_boosts(query, query_type.value)
-            queries = self._expand_query(query, entities, keywords)
+            memory_boosts = self.memory.get_boosts(
+                query,
+                query_type.value,
+            )
 
-            if query_type == QueryType.CALCULATION:
-                top_k = 8
-            elif query_type == QueryType.REGULATORY:
-                top_k = 14
+            expanded_queries = self._expand_query(
+                query=query,
+                query_type=query_type,
+                entities=entities,
+                keywords=keywords,
+            )
+
+            if query_type == QueryType.REGULATORY:
+                top_k = 16
+            elif query_type == QueryType.CALCULATION:
+                top_k = 10
             else:
                 top_k = 12
 
-            all_chunks: list[dict[str, Any]] = []
-            seen = set()
+            collected: list[dict[str, Any]] = []
+            seen: set[tuple[str, str]] = set()
 
-            for q in queries[:4]:
-                found = self.qa_system.search(q, top_k)
-                for chunk in found:
-                    doc_name = chunk.get("doc_name", "")
-                    text = chunk.get("text", "")
-                    uniq = (doc_name, text[:250])
-                    if uniq not in seen:
-                        seen.add(uniq)
-                        all_chunks.append(chunk)
+            for search_query in expanded_queries[:6]:
+                found = self.qa_system.search(
+                    search_query,
+                    top_k=top_k,
+                )
 
-            reranked = self._rerank_chunks(all_chunks, entities, memory_boosts)
-            reranked = reranked[:top_k]
+                for chunk in found or []:
+                    doc_name = str(chunk.get("doc_name", ""))
+                    text = str(chunk.get("text", ""))
+                    fingerprint = (
+                        doc_name.lower().strip(),
+                        re.sub(r"\s+", " ", text[:350]).lower(),
+                    )
 
-            enriched_chunks = []
+                    if not text.strip() or fingerprint in seen:
+                        continue
+
+                    seen.add(fingerprint)
+                    collected.append(chunk)
+
+            reranked = self._rerank_chunks(
+                chunks=collected,
+                query_type=query_type,
+                entities=entities,
+                memory_boosts=memory_boosts,
+            )[:top_k]
+
+            enriched: list[dict[str, Any]] = []
+
             for chunk in reranked:
-                text = chunk.get("text", "")
-                tables = extract_tables(text, chunk.get("doc_name", ""))
+                text = str(chunk.get("text", ""))
+                doc_name = str(chunk.get("doc_name", ""))
+
+                tables = extract_tables(text, doc_name=doc_name)
                 formulas = self._extract_formulas(text)
 
-                enriched_chunks.append({
+                enriched.append({
                     **chunk,
                     "tables": tables_to_dicts(tables),
-                    "formulas": formulas
+                    "formulas": formulas,
                 })
 
             step.result = {
-                "chunks": enriched_chunks,
-                "count": len(enriched_chunks),
-                "query_type": query_type,
-                "expanded_queries": queries,
+                "chunks": enriched,
+                "count": len(enriched),
+                "expanded_queries": expanded_queries,
                 "memory_boosts": memory_boosts,
             }
-            step.confidence = 0.85 if enriched_chunks else 0.3
+            step.confidence = 0.85 if enriched else 0.3
 
-        except (AttributeError, TypeError, ValueError) as e:
-            step.result = None
+        except (
+            AttributeError,
+            KeyError,
+            TypeError,
+            ValueError,
+        ) as exc:
+            step.result = {
+                "chunks": [],
+                "count": 0,
+                "expanded_queries": [],
+                "error": str(exc),
+            }
             step.confidence = 0.0
-            step.description += f" (Ошибка: {e})"
+            step.description += f": {exc}"
 
         return step
 
     @staticmethod
     def _extract_formulas(text: str) -> list[dict[str, Any]]:
-        """Извлекает формулы из текста."""
-        formulas = []
-        pattern = r"([A-Za-zА-Яа-я][_\w]*\s*[=]\s*[^;.\n]+)"
+        """Извлекает короткие формулы из найденного текста."""
+        raw_formulas: list[str] = []
 
-        matches = re.findall(pattern, text)
-        for match in matches:
-            if len(match) > 3:
-                variables = re.findall(r"[A-Za-zА-Яа-я][_\w]*", match)
-                formulas.append({
-                    "raw": match.strip(),
-                    "variables": list(set(variables)),
-                    "has_operator": any(c in match for c in ["+", "-", "*", "/", "^", "="])
-                })
+        equation_pattern = (
+            r"(?<!\w)"
+            r"([A-Za-zА-Яа-яΔδλ][\w_внтотр]*\s*="
+            r"\s*[^\n.;]{3,180})"
+        )
+        raw_formulas.extend(re.findall(equation_pattern, text))
 
-        bracket_pattern = r"\(([^)]*[=+\-*/^][^)]*)\)"
-        bracket_matches = re.findall(bracket_pattern, text)
-        for match in bracket_matches:
-            raw = f"({match})"
-            if len(match) > 3 and raw not in [f["raw"] for f in formulas]:
-                formulas.append({
-                    "raw": raw,
-                    "variables": list(set(re.findall(r"[A-Za-zА-Яа-я][_\w]*", match))),
-                    "has_operator": True
-                })
+        result: list[dict[str, Any]] = []
+        seen: set[str] = set()
 
-        unique_formulas = []
-        seen = set()
-        for formula in formulas:
-            key = formula["raw"]
-            if key not in seen:
-                seen.add(key)
-                unique_formulas.append(formula)
+        for raw in raw_formulas:
+            normalized = re.sub(r"\s+", " ", raw).strip()
 
-        return unique_formulas
+            if normalized in seen:
+                continue
+
+            seen.add(normalized)
+
+            variables = re.findall(
+                r"[A-Za-zА-Яа-яΔδλ][\w_внтотр]*",
+                normalized,
+            )
+
+            result.append({
+                "raw": normalized,
+                "variables": sorted(set(variables)),
+            })
+
+        return result[:5]
 
     @staticmethod
-    def _analyze_context(
+    def _build_context(
         query: str,
-        chunks: list[dict[str, Any]],
         query_type: QueryType,
+        keywords: list[str],
         entities: dict[str, Any],
-        parameters: dict[str, Any]
+        parameters: dict[str, Any],
+        chunks: list[dict[str, Any]],
     ) -> ReasoningStep:
-        """Анализирует контекст и извлекает ключевую информацию."""
+        """
+        Создаёт контекст, не извлекая числа повторно.
+
+        Параметры остаются исключительно теми, которые вернул QueryParser.
+        """
         step = ReasoningStep(
             step_id=3,
-            description="Анализ контекста и извлечение ключевой информации"
+            description="Формирование контекста без повторного парсинга параметров",
         )
 
         try:
-            combined_text = "\n".join([c.get("text", "") for c in chunks[:3]])
+            high_score = [
+                chunk for chunk in chunks
+                if float(chunk.get("score", 0.0) or 0.0) >= 0.5
+            ]
 
-            extracted_params: dict[str, float] = {}
-            param_patterns = {
-                "temperature": r"(-?\d+[.,]?\d*)\s*°[СC]",
-                "thickness": r"(\d+[.,]?\d*)\s*мм",
-                "density": r"(\d+[.,]?\d*)\s*кг/м³",
-                "flow": r"(\d+[.,]?\d*)\s*м³/ч",
-                "power": r"(\d+[.,]?\d*)\s*кВт",
-                "resistance": r"(\d+[.,]?\d*)\s*м²·°С/Вт"
-            }
-
-            for param, pattern in param_patterns.items():
-                matches = re.findall(pattern, combined_text)
-                if matches:
-                    try:
-                        extracted_params[param] = float(matches[0].replace(",", "."))
-                    except ValueError:
-                        pass
-
-            numeric_params = parameters.get("numeric_values", [])
-            if numeric_params and isinstance(numeric_params, list):
-                for i, val in enumerate(numeric_params[:3]):
-                    if i == 0 and "temperature" not in extracted_params:
-                        extracted_params["temperature"] = float(val)
-                    elif i == 1 and "flow" not in extracted_params:
-                        extracted_params["flow"] = float(val)
-
-            relevance_score = 0.0
-            if chunks:
-                good_scores = [c for c in chunks if c.get("score", 0) > 0.5]
-                relevance_score = len(good_scores) / len(chunks) if chunks else 0.0
-
-            context_info = ContextInfo(
-                query=query,
-                query_type=query_type,
-                keywords=[w for w in query.split() if len(w) > 2],
-                entities=entities,
-                parameters=extracted_params,
-                chunks=chunks,
-                confidence=relevance_score if relevance_score > 0 else 0.5
+            confidence = (
+                len(high_score) / len(chunks)
+                if chunks
+                else 0.2
             )
 
-            step.result = context_info
-            step.confidence = context_info.confidence
+            context = ContextInfo(
+                query=query,
+                query_type=query_type,
+                keywords=keywords,
+                entities=entities,
+                parameters=parameters,
+                chunks=chunks,
+                confidence=max(0.2, confidence),
+            )
 
-        except (ValueError, TypeError, AttributeError) as e:
+            step.result = context
+            step.confidence = context.confidence
+
+        except (AttributeError, TypeError, ValueError) as exc:
             step.result = None
             step.confidence = 0.0
-            step.description += f" (Ошибка: {e})"
+            step.description += f": {exc}"
 
         return step
 
-    async def _handle_calculation(self, context: ContextInfo) -> ReasoningStep:
-        """Обрабатывает расчётный запрос."""
+    def _handle_definition(
+        self,
+        context: ContextInfo,
+    ) -> ReasoningStep:
         step = ReasoningStep(
             step_id=4,
-            description="Выполнение инженерного расчета"
+            description="Поиск определения термина",
         )
 
-        try:
-            query = context.query
-            params = context.parameters or {}
+        term = self._extract_definition_term(context.query)
 
-            if params:
-                param_str = ", ".join([f"{k}={v}" for k, v in params.items()])
-                calc_query = f"{query}. Данные: {param_str}"
-            else:
-                calc_query = query
-
-            raw_result = self.formula_engine.answer_calculation(calc_query)
-
-            if asyncio.iscoroutine(raw_result):
-                result = await raw_result
-            else:
-                result = raw_result
-
-            if context.chunks and not result.get("answer"):
-                for chunk in context.chunks:
-                    if chunk.get("formulas"):
-                        fallback_formula = chunk["formulas"][0]
-                        result = {
-                            "answer": f"Найдена формула: {fallback_formula.get('raw', '')}",
-                            "formula": fallback_formula,
-                            "params": params,
-                            "result": None,
-                            "reasoning": "Формула взята напрямую из найденного фрагмента документа.",
-                            "source": chunk.get("doc_name", "Документ"),
-                            "sources": [{"doc_name": chunk.get("doc_name", "Документ")}],
-                            "tables": [],
-                            "formulas": [fallback_formula]
-                        }
-                        break
-
-            calc_confidence = 0.9 if result.get("answer") else 0.3
-
+        if not term:
             step.result = {
-                "type": "calculation",
-                "answer": result.get("answer", "Расчет не удался"),
-                "formula": result.get("formula"),
-                "parameters": result.get("params", params),
-                "result": result.get("result"),
-                "reasoning": result.get("reasoning", ""),
-                "source": result.get("source", ""),
-                "sources": result.get("sources", []),
-                "tables": result.get("tables", []),
-                "formulas": result.get("formulas", []),
-                "confidence": result.get("confidence", calc_confidence)
-            }
-            step.confidence = step.result["confidence"]
-
-        except (ValueError, TypeError, ZeroDivisionError) as e:
-            step.result = {
-                "type": "calculation",
-                "answer": f"Ошибка расчета: {e}",
-                "formula": None,
-                "parameters": {},
-                "result": None,
-                "reasoning": f"Ошибка на этапе расчета: {e}",
-                "source": "",
+                "answer": "Уточните термин, для которого нужно дать определение.",
                 "sources": [],
                 "tables": [],
                 "formulas": [],
-                "confidence": 0.0
+                "confidence": 0.2,
+                "needs_clarification": True,
+                "questions": ["Какой термин нужно определить?"],
             }
-            step.confidence = 0.0
-            step.description += f" (Ошибка: {e})"
-
-        return step
-
-    def _handle_definition(self, context: ContextInfo) -> ReasoningStep:
-        """Обрабатывает запрос на определение термина."""
-        step = ReasoningStep(
-            step_id=4,
-            description="Поиск определения термина"
-        )
+            step.confidence = 0.2
+            return step
 
         try:
-            query = context.query.strip()
-            query_lower = query.lower().strip()
-
-            definition_prefixes = [
-                "что такое ",
-                "что значит ",
-                "что означает ",
-                "что это ",
-                "дай определение ",
-                "дайте определение ",
-                "определение ",
-                "определи ",
-                "термин ",
-                "понятие ",
-                "расшифруй ",
-                "расшифровка ",
-                "аббревиатура ",
-            ]
-
-            term = query_lower
-            for prefix in definition_prefixes:
-                if term.startswith(prefix):
-                    term = term[len(prefix):].strip(" ?!.,:;\"'«»()[]")
-                    break
-
-            if not term:
-                step.result = {
-                    "type": "definition",
-                    "answer": "Уточните термин для определения.",
-                    "sources": [],
-                    "tables": [],
-                    "formulas": [],
-                    "confidence": 0.2,
-                }
-                step.confidence = 0.2
-                return step
-
             quick = get_quick_definition(term)
+
             if quick:
-                definition = quick.get("definition", "")
                 source = quick.get("source", "")
-                example = quick.get("example", "")
-
-                full_answer = definition
-                if example:
-                    full_answer += f"\n\n📌 Пример: {example}"
-                if source:
-                    full_answer += f"\n\n📚 Источник: {source}"
-
                 step.result = {
-                    "type": "definition",
-                    "answer": full_answer,
-                    "sources": [source] if source else [],
+                    "answer": (
+                        f"### {term}\n\n"
+                        f"{quick.get('definition', '')}"
+                    ),
+                    "sources": (
+                        [{"doc_name": source}]
+                        if source
+                        else []
+                    ),
                     "tables": [],
                     "formulas": [],
                     "confidence": 0.95,
+                    "needs_clarification": False,
+                    "questions": [],
                 }
                 step.confidence = 0.95
                 return step
 
-            definition = self.qa_system.find_definition(term)
+            if self.qa_system and hasattr(self.qa_system, "find_definition"):
+                found = self.qa_system.find_definition(term)
 
-            if not definition.get("found") and context.chunks:
-                for chunk in context.chunks:
-                    chunk_text = chunk.get("text", "")
-                    if term in chunk_text.lower():
-                        sentences = re.split(r"(?<=[.!?])\s+", chunk_text)
-                        for sent in sentences:
-                            if term in sent.lower():
-                                definition = {
-                                    "found": True,
-                                    "definition": sent.strip(),
-                                    "source": chunk.get("doc_name", ""),
-                                }
-                                break
-                    if definition.get("found"):
-                        break
+                if found and found.get("found"):
+                    source = found.get("source", "")
+                    step.result = {
+                        "answer": (
+                            f"### {term}\n\n"
+                            f"{found.get('definition', '')}"
+                        ),
+                        "sources": (
+                            [{"doc_name": source}]
+                            if source
+                            else []
+                        ),
+                        "tables": [],
+                        "formulas": [],
+                        "confidence": 0.9,
+                        "needs_clarification": False,
+                        "questions": [],
+                    }
+                    step.confidence = 0.9
+                    return step
 
-            if definition.get("found"):
-                step.result = {
-                    "type": "definition",
-                    "term": term,
-                    "definition": definition.get("definition", ""),
-                    "source": definition.get("source", ""),
-                    "found": True,
-                    "answer": (
-                        f"📖 **Определение термина «{term}»:**\n\n"
-                        f"{definition.get('definition', '')}\n\n"
-                        f"📚 **Источник:** {definition.get('source', 'Нормативная база')}"
-                    ),
-                    "sources": [definition.get("source", "")] if definition.get("source") else [],
-                    "tables": [],
-                    "formulas": [],
-                    "confidence": 0.9,
-                }
-                step.confidence = 0.9
-            else:
-                step.result = {
-                    "type": "definition",
-                    "answer": f"⚠️ Определение для термина «{term}» не найдено.",
-                    "sources": [],
-                    "tables": [],
-                    "formulas": [],
-                    "confidence": 0.2,
-                }
-                step.confidence = 0.2
-
-        except (ValueError, TypeError, AttributeError) as e:
-            step.result = None
-            step.confidence = 0.0
-            step.description = f"Ошибка поиска определения: {e}"
-
-        return step
-
-    @staticmethod
-    def _handle_search(context: ContextInfo) -> ReasoningStep:
-        """Обрабатывает поисковый запрос."""
-        step = ReasoningStep(
-            step_id=4,
-            description="Формирование ответа по найденным данным"
-        )
-
-        try:
-            if not context.chunks:
-                step.result = {
-                    "type": "search",
-                    "answer": "Информация не найдена в базе документов.",
-                    "sources": [],
-                    "tables": [],
-                    "formulas": [],
-                    "confidence": 0.1
-                }
-                step.confidence = 0.1
-                return step
-
-            useful_chunks = []
-            for chunk in context.chunks:
-                text = chunk.get("text", "")
-                if text and len(text.strip()) > 30:
-                    useful_chunks.append(chunk)
-
-            if not useful_chunks:
-                useful_chunks = context.chunks[:2]
-
-            answer_parts = []
-            sources = []
-            tables = []
-            formulas = []
-
-            first = useful_chunks[0]
-            first_text = first.get("text", "").strip()
-            if first_text:
-                answer_parts.append(first_text[:1200])
-
-            for chunk in useful_chunks[:3]:
-                doc_name = chunk.get("doc_name", "")
-                if doc_name and doc_name not in sources:
-                    sources.append(doc_name)
-
-                for table in chunk.get("tables", []):
-                    if table not in tables:
-                        tables.append(table)
-
-                for formula in chunk.get("formulas", []):
-                    if formula not in formulas:
-                        formulas.append(formula)
-
-            answer = "\n\n".join(part for part in answer_parts if part).strip()
-            if not answer:
-                answer = "Найдены релевантные фрагменты, но текст ответа пуст."
-
-            if sources:
-                answer += "\n\nИсточники:\n" + "\n".join(f"• {src}" for src in sources[:3])
-
-            step.result = {
-                "type": "search",
-                "answer": answer,
-                "sources": sources,
-                "tables": tables[:5],
-                "formulas": formulas[:5],
-                "confidence": min(0.9, max(0.4, context.confidence))
-            }
+            step.result = self._search_answer(
+                context,
+                intro=f"Определение для «{term}»:",
+            )
             step.confidence = step.result["confidence"]
 
-        except (ValueError, TypeError, AttributeError) as e:
-            step.result = None
-            step.confidence = 0.0
-            step.description += f" (Ошибка: {e})"
-
-        return step
-
-    @staticmethod
-    def _handle_comparison(context: ContextInfo) -> ReasoningStep:
-        """Обрабатывает запрос на сравнение."""
-        step = ReasoningStep(
-            step_id=4,
-            description="Сравнение найденных данных"
-        )
-
-        try:
-            query = context.query.lower()
-            parts = re.split(r"\s+и\s+|\s+vs\s+|\s+против\s+", query)
-
-            if len(parts) > 1:
-                items = [p.strip() for p in parts if len(p.strip()) > 2]
-                comparison_results = []
-
-                for item in items:
-                    info = None
-                    source = "Документ"
-                    for chunk in context.chunks:
-                        chunk_text = chunk.get("text", "").lower()
-                        if item in chunk_text:
-                            info = chunk.get("text", "")[:200]
-                            source = chunk.get("doc_name", "Документ")
-                            break
-
-                    if info:
-                        comparison_results.append({
-                            "item": item,
-                            "info": info,
-                            "source": source
-                        })
-
-                answer_lines = [f"**Сравнение:** {', '.join(items)}", ""]
-                for row in comparison_results:
-                    answer_lines.append(f"**{row['item']}** — {row['info']}")
-                    answer_lines.append(f"Источник: {row['source']}")
-                    answer_lines.append("")
-
-                sources = [{"doc_name": r["source"]} for r in comparison_results if r.get("source")]
-
-                step.result = {
-                    "type": "comparison",
-                    "items": items,
-                    "results": comparison_results,
-                    "answer": "\n".join(answer_lines).strip(),
-                    "sources": sources,
-                    "tables": [],
-                    "formulas": [],
-                    "confidence": 0.8 if comparison_results else 0.3
-                }
-                step.confidence = 0.8 if comparison_results else 0.3
-            else:
-                step.result = {
-                    "type": "comparison",
-                    "items": [],
-                    "results": [],
-                    "answer": "Не удалось определить объекты для сравнения. Используйте формат: «Сравни X и Y».",
-                    "sources": [],
-                    "tables": [],
-                    "formulas": [],
-                    "confidence": 0.0
-                }
-                step.confidence = 0.0
-
-        except (ValueError, TypeError, AttributeError) as e:
-            step.result = None
-            step.confidence = 0.0
-            step.description += f" (Ошибка: {e})"
-
-        return step
-
-    @staticmethod
-    def _handle_regulatory(context: ContextInfo) -> ReasoningStep:
-        """Обрабатывает запрос на поиск нормативных требований."""
-        step = ReasoningStep(
-            step_id=4,
-            description="Поиск нормативных требований"
-        )
-
-        try:
-            requirements = []
-            for chunk in context.chunks:
-                text_lower = chunk.get("text", "").lower()
-
-                markers = [
-                    "должен", "обязан", "требуется", "не менее", "не более",
-                    "допустим", "предел", "норма", "стандарт"
-                ]
-
-                for marker in markers:
-                    if marker in text_lower:
-                        sentences = re.split(r"(?<=[.!?])\s+", chunk.get("text", ""))
-                        for sent in sentences:
-                            if marker in sent.lower():
-                                requirements.append({
-                                    "text": sent.strip(),
-                                    "marker": marker,
-                                    "source": chunk.get("doc_name", "Документ")
-                                })
-                                break
-
-            if not requirements and context.chunks:
-                for chunk in context.chunks[:2]:
-                    requirements.append({
-                        "text": chunk.get("text", "")[:300],
-                        "marker": "информация",
-                        "source": chunk.get("doc_name", "Документ")
-                    })
-
-            answer_lines = []
-            if requirements:
-                answer_lines.append("📌 **Найдены нормативные требования:**")
-                answer_lines.append("")
-                for req in requirements[:5]:
-                    answer_lines.append(f"- {req['text']}")
-                    answer_lines.append(f"  Источник: {req['source']}")
-            else:
-                answer_lines.append("Требования не найдены")
-
+        except (
+            AttributeError,
+            KeyError,
+            TypeError,
+            ValueError,
+        ) as exc:
             step.result = {
-                "type": "regulatory",
-                "requirements": requirements[:5],
-                "answer": "\n".join(answer_lines),
-                "sources": [{"doc_name": r["source"]} for r in requirements[:5]],
-                "tables": [],
-                "formulas": [],
-                "confidence": 0.8 if requirements else 0.2
-            }
-            step.confidence = 0.8 if requirements else 0.2
-
-        except (ValueError, TypeError, AttributeError) as e:
-            step.result = None
-            step.confidence = 0.0
-            step.description += f" (Ошибка: {e})"
-
-        return step
-
-    @staticmethod
-    def _check_completeness(result: dict[str, Any], context: ContextInfo) -> ReasoningStep:
-        """Проверяет полноту ответа."""
-        step = ReasoningStep(
-            step_id=5,
-            description="Проверка полноты ответа"
-        )
-
-        try:
-            answer = result.get("answer", "") or ""
-            needs_clarification = False
-            questions: list[str] = []
-
-            if context.query_type == QueryType.CALCULATION:
-                if not result.get("formula") and not result.get("formulas"):
-                    needs_clarification = True
-                    questions.append("Уточните формулу или тип расчёта.")
-                if not context.parameters:
-                    questions.append("Укажите исходные числовые данные для расчёта.")
-
-            if len(answer.strip()) < 20:
-                needs_clarification = True
-                if "Уточните" not in " ".join(questions):
-                    questions.append("Уточните запрос, чтобы найти более точный ответ.")
-
-            step.result = {
-                "is_complete": not needs_clarification,
-                "needs_clarification": needs_clarification,
-                "questions": questions,
-                "completeness_score": max(0.0, 1.0 - len(questions) * 0.2) if questions else 1.0
-            }
-            step.confidence = 0.85 if not needs_clarification else 0.5
-
-        except (ValueError, TypeError, AttributeError) as e:
-            step.result = {
-                "is_complete": False,
-                "needs_clarification": True,
-                "questions": [f"Ошибка проверки полноты: {e}"],
-                "completeness_score": 0.0
-            }
-            step.confidence = 0.0
-            step.description += f" (Ошибка: {e})"
-
-        return step
-
-    @staticmethod
-    def _generate_final_response(
-        result: dict[str, Any],
-        completeness: dict[str, Any],
-        context: ContextInfo
-    ) -> ReasoningStep:
-        """Формирует финальный ответ."""
-        step = ReasoningStep(
-            step_id=6,
-            description="Формирование финального ответа"
-        )
-
-        try:
-            answer = result.get("answer", "").strip()
-            sources = result.get("sources", [])
-            tables = result.get("tables", [])
-            formulas = result.get("formulas", [])
-            confidence = result.get("confidence", context.confidence)
-
-            if not answer:
-                answer = "Не удалось сформировать ответ."
-
-            step.result = {
-                "answer": answer,
-                "sources": sources,
-                "tables": tables,
-                "formulas": formulas,
-                "confidence": confidence,
-                "needs_clarification": completeness.get("needs_clarification", False),
-                "questions": completeness.get("questions", [])
-            }
-            step.confidence = confidence if isinstance(confidence, (int, float)) else 0.7
-
-        except (ValueError, TypeError, AttributeError) as e:
-            step.result = {
-                "answer": f"Ошибка финализации ответа: {e}",
+                "answer": f"❌ Ошибка поиска определения: {exc}",
                 "sources": [],
                 "tables": [],
                 "formulas": [],
                 "confidence": 0.0,
-                "needs_clarification": False,
-                "questions": []
+                "needs_clarification": True,
+                "questions": ["Уточните термин."],
             }
             step.confidence = 0.0
-            step.description += f" (Ошибка: {e})"
 
         return step
 
-    def _format_response(
+    @staticmethod
+    def _extract_definition_term(query: str) -> str:
+        value = query.strip().lower()
+
+        prefixes = (
+            "что такое ",
+            "что значит ",
+            "что означает ",
+            "что это ",
+            "дай определение ",
+            "дайте определение ",
+            "определение ",
+            "определи ",
+            "термин ",
+            "понятие ",
+            "расшифруй ",
+            "расшифровка ",
+            "аббревиатура ",
+        )
+
+        for prefix in prefixes:
+            if value.startswith(prefix):
+                value = value[len(prefix):]
+                break
+
+        return value.strip(" ?!.,:;\"'«»()[]")
+
+    def _handle_regulatory(
+        self,
+        context: ContextInfo,
+    ) -> ReasoningStep:
+        """Собирает нормы по широкому набору нормативных формулировок."""
+        step = ReasoningStep(
+            step_id=4,
+            description="Поиск нормативных требований",
+        )
+
+        candidates: list[tuple[float, dict[str, Any]]] = []
+
+        for chunk in context.chunks:
+            text = str(chunk.get("text", "")).strip()
+            lower_text = text.lower()
+
+            if not text:
+                continue
+
+            marker_hits = sum(
+                1
+                for marker in self.REGULATORY_MARKERS
+                if marker in lower_text
+            )
+
+            score = float(chunk.get("score", 0.0) or 0.0)
+            score += min(0.6, marker_hits * 0.1)
+
+            document_codes = context.entities.get(
+                "document_codes",
+                [],
+            )
+            if any(code.lower() in lower_text for code in document_codes):
+                score += 0.3
+
+            candidates.append((score, chunk))
+
+        candidates.sort(key=lambda item: item[0], reverse=True)
+
+        if not candidates:
+            step.result = {
+                "answer": (
+                    "⚠️ В текущем индексе не найдены релевантные нормативные "
+                    "фрагменты. Проверьте, что нужный СП или ГОСТ загружен и "
+                    "проиндексирован."
+                ),
+                "sources": [],
+                "tables": [],
+                "formulas": [],
+                "confidence": 0.15,
+                "needs_clarification": True,
+                "questions": [
+                    "Укажите номер документа, раздел или тему требования.",
+                ],
+            }
+            step.confidence = 0.15
+            return step
+
+        selected = [chunk for _, chunk in candidates[:4]]
+        step.result = self._build_evidence_answer(
+            selected,
+            title="Нормативные требования",
+            max_chars=850,
+        )
+        step.confidence = step.result["confidence"]
+
+        return step
+
+    def _handle_search(
+        self,
+        context: ContextInfo,
+    ) -> ReasoningStep:
+        step = ReasoningStep(
+            step_id=4,
+            description="Поиск информации в документах",
+        )
+
+        step.result = self._search_answer(context)
+        step.confidence = step.result["confidence"]
+
+        return step
+
+    def _search_answer(
+        self,
+        context: ContextInfo,
+        intro: str | None = None,
+    ) -> dict[str, Any]:
+        if not context.chunks:
+            return {
+                "answer": (
+                    "⚠️ В проиндексированных документах ничего не найдено. "
+                    "Проверьте наличие документа, тему запроса или формулировку."
+                ),
+                "sources": [],
+                "tables": [],
+                "formulas": [],
+                "confidence": 0.15,
+                "needs_clarification": True,
+                "questions": ["Уточните документ, раздел или ключевой термин."],
+            }
+
+        result = self._build_evidence_answer(
+            context.chunks[:4],
+            title=intro or "Найденная информация",
+            max_chars=750,
+        )
+
+        return result
+
+    @staticmethod
+    def _handle_comparison(
+        context: ContextInfo,
+    ) -> ReasoningStep:
+        step = ReasoningStep(
+            step_id=4,
+            description="Подготовка сравнения",
+        )
+
+        query = context.query.lower()
+        parts = re.split(r"\s+(?:и|vs|против)\s+", query)
+        items = [part.strip() for part in parts if len(part.strip()) > 2]
+
+        if len(items) < 2:
+            step.result = {
+                "answer": (
+                    "⚠️ Не удалось определить объекты сравнения. "
+                    "Напишите, например: «сравни минвату и пенополистирол»."
+                ),
+                "sources": [],
+                "tables": [],
+                "formulas": [],
+                "confidence": 0.2,
+                "needs_clarification": True,
+                "questions": ["Что именно нужно сравнить?"],
+            }
+            step.confidence = 0.2
+            return step
+
+        rows: list[str] = []
+        sources: list[dict[str, str]] = []
+
+        for item in items[:3]:
+            match = next(
+                (
+                    chunk for chunk in context.chunks
+                    if item in str(chunk.get("text", "")).lower()
+                ),
+                None,
+            )
+
+            if match is None:
+                rows.append(f"- **{item}**: данных в найденных фрагментах нет.")
+                continue
+
+            text = re.sub(
+                r"\s+",
+                " ",
+                str(match.get("text", "")).strip(),
+            )[:350]
+            source = str(match.get("doc_name", ""))
+
+            rows.append(f"- **{item}**: {text}")
+
+            if source:
+                sources.append({"doc_name": source})
+
+        step.result = {
+            "answer": "### Сравнение\n\n" + "\n\n".join(rows),
+            "sources": AgentLoop._unique_sources(sources),
+            "tables": [],
+            "formulas": [],
+            "confidence": 0.75,
+            "needs_clarification": False,
+            "questions": [],
+        }
+        step.confidence = 0.75
+
+        return step
+
+    @staticmethod
+    def _build_evidence_answer(
+        chunks: list[dict[str, Any]],
+        title: str,
+        max_chars: int,
+    ) -> dict[str, Any]:
+        parts: list[str] = []
+        sources: list[dict[str, str]] = []
+        tables: list[dict[str, Any]] = []
+        formulas: list[dict[str, Any]] = []
+
+        seen_text: set[str] = set()
+
+        for chunk in chunks:
+            text = re.sub(
+                r"\s+",
+                " ",
+                str(chunk.get("text", "")).strip(),
+            )
+
+            if not text:
+                continue
+
+            fingerprint = text[:250].lower()
+            if fingerprint in seen_text:
+                continue
+
+            seen_text.add(fingerprint)
+            parts.append(text[:max_chars])
+
+            doc_name = str(chunk.get("doc_name", "")).strip()
+            if doc_name:
+                sources.append({"doc_name": doc_name})
+
+            tables.extend(chunk.get("tables", [])[:1])
+            formulas.extend(chunk.get("formulas", [])[:2])
+
+        if not parts:
+            return {
+                "answer": "⚠️ Найденные фрагменты не содержат текста для ответа.",
+                "sources": [],
+                "tables": [],
+                "formulas": [],
+                "confidence": 0.15,
+                "needs_clarification": True,
+                "questions": ["Уточните запрос."],
+            }
+
+        return {
+            "answer": f"### {title}\n\n" + "\n\n".join(parts),
+            "sources": AgentLoop._unique_sources(sources),
+            "tables": AgentLoop._unique_tables(tables),
+            "formulas": AgentLoop._unique_formulas(formulas),
+            "confidence": min(0.9, 0.5 + len(parts) * 0.1),
+            "needs_clarification": False,
+            "questions": [],
+        }
+
+    @staticmethod
+    def _unique_sources(
+        sources: list[dict[str, str]],
+    ) -> list[dict[str, str]]:
+        seen: set[str] = set()
+        result: list[dict[str, str]] = []
+
+        for source in sources:
+            name = source.get("doc_name", "").strip()
+            key = name.lower()
+
+            if name and key not in seen:
+                seen.add(key)
+                result.append({"doc_name": name})
+
+        return result
+
+    @staticmethod
+    def _unique_tables(
+        tables: list[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        seen: set[str] = set()
+        result: list[dict[str, Any]] = []
+
+        for table in tables:
+            content = str(
+                table.get("raw_text")
+                or table.get("content")
+                or ""
+            ).strip()
+
+            fingerprint = re.sub(
+                r"\s+",
+                " ",
+                content[:300],
+            ).lower()
+
+            if not fingerprint or fingerprint in seen:
+                continue
+
+            seen.add(fingerprint)
+            result.append(table)
+
+        return result[:3]
+
+    @staticmethod
+    def _unique_formulas(
+        formulas: list[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        seen: set[str] = set()
+        result: list[dict[str, Any]] = []
+
+        for formula in formulas:
+            raw = str(formula.get("raw", "")).strip()
+            key = re.sub(r"\s+", " ", raw).lower()
+
+            if raw and key not in seen:
+                seen.add(key)
+                result.append(formula)
+
+        return result[:5]
+
+    def _finalize_response(
         self,
         result: dict[str, Any],
-        query_type: QueryType
+        query_type: QueryType,
+        keywords: list[str],
+        original_query: str,
     ) -> dict[str, Any]:
-        """Форматирует ответ."""
+        """Строит единый ответ и сохраняет удачный retrieval в память."""
         response = {
             "answer": result.get("answer", ""),
             "sources": result.get("sources", []),
             "tables": result.get("tables", []),
             "formulas": result.get("formulas", []),
+            "formula": result.get("formula"),
+            "params": result.get("parameters", result.get("params", {})),
+            "result": result.get("result"),
+            "reasoning": result.get("reasoning", ""),
             "confidence": result.get("confidence", 0.0),
+            "needs_clarification": result.get(
+                "needs_clarification",
+                False,
+            ),
+            "questions": result.get("questions", []),
             "query_type": query_type.value,
-            "reasoning_steps": [
-                {
-                    "step": step.step_id,
-                    "description": step.description,
-                    "confidence": step.confidence
-                }
-                for step in self.reasoning_steps
-            ]
         }
 
-        if result.get("needs_clarification"):
-            response["needs_clarification"] = True
-            response["questions"] = result.get("questions", [])
+        self._save_success_to_memory(
+            original_query=original_query,
+            query_type=query_type,
+            keywords=keywords,
+            response=response,
+        )
 
         return response
 
-    def _create_error_response(self, message: str, steps: int = 1) -> dict[str, Any]:
-        """Создаёт ответ с ошибкой."""
+    def _save_success_to_memory(
+        self,
+        original_query: str,
+        query_type: QueryType,
+        keywords: list[str],
+        response: dict[str, Any],
+    ) -> None:
+        """
+        В память отправляются только ответы с источниками и без
+        необходимости уточнения; иначе память будет усиливать ошибки.
+        """
+        if response.get("needs_clarification"):
+            return
+
+        if response.get("confidence", 0.0) < 0.65:
+            return
+
+        source_names: list[str] = []
+
+        for source in response.get("sources", []):
+            if isinstance(source, dict):
+                name = source.get("doc_name") or source.get("source")
+            else:
+                name = str(source)
+
+            if name:
+                source_names.append(str(name))
+
+        source_names = self._unique_keep_order(source_names)
+
+        if source_names:
+            self.memory.save_success(
+                query=original_query,
+                query_type=query_type.value,
+                keywords=keywords,
+                sources=source_names,
+            )
+
+    @staticmethod
+    def _create_error_response(
+        self,
+        message: str,
+        step_id: int,
+    ) -> dict[str, Any]:
         return {
-            "answer": f"Ошибка: {message}",
+            "answer": f"❌ {message}",
             "sources": [],
             "tables": [],
             "formulas": [],
             "confidence": 0.0,
+            "needs_clarification": True,
+            "questions": ["Уточните запрос."],
             "query_type": "error",
-            "steps": steps,
-            "reasoning_steps": [
-                {
-                    "step": step.step_id,
-                    "description": step.description,
-                    "confidence": step.confidence
-                }
-                for step in self.reasoning_steps
-            ]
-        }
-
-    def get_reasoning_chain(self) -> str:
-        """Возвращает цепочку рассуждений в текстовом виде."""
-        chain = "🔍 **Цепочка рассуждений:**\n\n"
-        for step in self.reasoning_steps:
-            confidence_stars = "⭐" * int(step.confidence * 5)
-            chain += f"**Шаг {step.step_id}:** {step.description}\n"
-            chain += f"   Уверенность: {step.confidence:.0%} {confidence_stars}\n\n"
-        return chain
-
-    def get_reasoning_json(self) -> dict[str, Any]:
-        """Возвращает цепочку рассуждений в JSON."""
-        return {
-            "steps": [
-                {
-                    "step_id": step.step_id,
-                    "description": step.description,
-                    "confidence": step.confidence,
-                    "result": str(step.result)[:200] if step.result else None
-                }
-                for step in self.reasoning_steps
-            ],
-            "total_steps": len(self.reasoning_steps)
+            "steps": step_id,
         }

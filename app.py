@@ -7,13 +7,17 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import os
 import time
 from datetime import datetime
 from pathlib import Path
+from typing import Any, Callable
 
 import streamlit as st
 from reportlab.lib.colors import HexColor
+# TA_CENTER больше не используется — заменён на "center" в ParagraphStyle
+# from reportlab.lib.enums import TA_CENTER  # ← УДАЛЁН
 
 try:
     from huggingface_hub import snapshot_download
@@ -30,6 +34,12 @@ from core.prompts import get_quick_definition
 from core.qa_engine import QASystem
 from core.table_calculator import patch_app_with_table_calculator
 
+# Настройка логирования
+logger = logging.getLogger(__name__)
+
+# Константа для MIME типа DOCX
+DOCX_MIME = "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+
 st.set_page_config(
     page_title="Инженерный чат-бот",
     page_icon="🏗️",
@@ -42,7 +52,41 @@ INDEX_FILE = PROCESSED_DIR / "faiss_index.pkl"
 SUPPORTED_SUFFIXES = {".pdf", ".docx", ".doc", ".rtf"}
 
 
-def run_async_safely(async_func, *args, **kwargs):
+# ============================================================
+# КЭШИРОВАНИЕ РЕСУРСОВ
+# ============================================================
+
+@st.cache_resource(show_spinner=False)
+def get_cached_qa_system() -> QASystem:
+    """Кэширует QASystem между перезапусками Streamlit."""
+    return init_qa_system()
+
+
+@st.cache_resource(show_spinner=False)
+def get_cached_formula_engine(qa_system: QASystem) -> FormulaEngine:
+    """Кэширует FormulaEngine."""
+    return FormulaEngine(qa_system)
+
+
+@st.cache_resource(show_spinner=False)
+def get_cached_agent_loop(qa_system: QASystem, formula_engine: FormulaEngine) -> AgentLoop:
+    """Кэширует AgentLoop."""
+    return AgentLoop(qa_system, formula_engine)
+
+
+# ============================================================
+# ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ
+# ============================================================
+
+def safe_call(callback: Callable[..., Any] | None, *args: Any, **kwargs: Any) -> Any | None:
+    """Безопасно вызывает callback, если он существует."""
+    if callback is not None and callable(callback):
+        return callback(*args, **kwargs)
+    return None
+
+
+def run_async_safely(async_func: Callable[..., Any], *args: Any, **kwargs: Any) -> Any:
+    """Запускает асинхронную функцию в новом event loop."""
     loop = None
     try:
         loop = asyncio.new_event_loop()
@@ -54,9 +98,10 @@ def run_async_safely(async_func, *args, **kwargs):
         asyncio.set_event_loop(None)
 
 
-def call_maybe_async(func, *args, **kwargs):
+def call_maybe_async(func: Callable[..., Any] | None, *args: Any, **kwargs: Any) -> Any | None:
+    """Вызывает синхронную или асинхронную функцию."""
     if func is None:
-        raise ValueError("Передана пустая функция (None) в call_maybe_async")
+        return None
     if not callable(func):
         raise TypeError(f"Объект {type(func).__name__} не является вызываемым")
     result = func(*args, **kwargs)
@@ -83,12 +128,14 @@ def get_initial_message() -> list[dict[str, str]]:
 
 
 def save_history() -> None:
+    """Сохраняет историю чата в файл."""
     HISTORY_FILE.parent.mkdir(parents=True, exist_ok=True)
     with open(HISTORY_FILE, "w", encoding="utf-8") as f:
         json.dump(st.session_state.messages, f, ensure_ascii=False, indent=2)
 
 
 def get_docs_from_raw() -> list[Path]:
+    """Возвращает список поддерживаемых документов в RAW_DIR."""
     if not RAW_DIR.exists():
         return []
     return [
@@ -97,13 +144,14 @@ def get_docs_from_raw() -> list[Path]:
     ]
 
 
-def inspect_raw_directory() -> dict:
+def inspect_raw_directory() -> dict[str, Any]:
+    """Анализирует содержимое RAW_DIR."""
     RAW_DIR.mkdir(parents=True, exist_ok=True)
 
     all_files = [p for p in RAW_DIR.rglob("*") if p.is_file()]
     supported = [p for p in all_files if p.suffix.lower() in SUPPORTED_SUFFIXES]
 
-    extensions = {}
+    extensions: dict[str, int] = {}
     for path in all_files:
         ext = path.suffix.lower() or "[без расширения]"
         extensions[ext] = extensions.get(ext, 0) + 1
@@ -118,6 +166,7 @@ def inspect_raw_directory() -> dict:
 
 
 def sync_hf_dataset_to_raw(force: bool = False) -> bool:
+    """Синхронизирует датасет с Hugging Face."""
     dataset_repo_id = (HF_DATASET_REPO_ID or "").strip()
     if not dataset_repo_id:
         print("❌ HF_DATASET_REPO_ID не задан")
@@ -165,6 +214,7 @@ def sync_hf_dataset_to_raw(force: bool = False) -> bool:
 
 
 def force_rebuild_index(qa: QASystem) -> bool:
+    """Принудительно перестраивает индекс."""
     print("=" * 50)
     print("🔨 ПРИНУДИТЕЛЬНАЯ ПЕРЕСТРОЙКА ИНДЕКСА")
     print("=" * 50)
@@ -187,7 +237,7 @@ def force_rebuild_index(qa: QASystem) -> bool:
         print("❌ Парсинг не вернул ни одного документа")
         return False
 
-    print(f"📄 Распарсено документов: {len(parsed_docs)}")
+    print(f"📄 Обработано документов: {len(parsed_docs)}")
 
     total_chunks = sum(len(doc.get("chunks", [])) for doc in parsed_docs)
     print(f"🧩 Всего чанков: {total_chunks}")
@@ -229,7 +279,8 @@ def get_llm_status(qa_system: QASystem) -> dict[str, str]:
     ollama_alive = False
     check_ollama = getattr(qa_system, "is_ollama_alive", None)
 
-    if callable(check_ollama):
+    # Исправлено: безопасный вызов через safe_call
+    if check_ollama is not None and callable(check_ollama):
         try:
             ollama_alive = bool(check_ollama())
         except (ConnectionError, OSError, RuntimeError, ValueError):
@@ -238,7 +289,7 @@ def get_llm_status(qa_system: QASystem) -> dict[str, str]:
     selected_provider = "unknown"
     get_provider = getattr(qa_system, "get_selected_provider", None)
 
-    if callable(get_provider):
+    if get_provider is not None and callable(get_provider):
         try:
             selected_provider = str(get_provider())
         except (AttributeError, RuntimeError, ValueError):
@@ -253,7 +304,9 @@ def get_llm_status(qa_system: QASystem) -> dict[str, str]:
         "ollama_model": str(getattr(qa_system, "ollama_model", ""))
     }
 
+
 def init_qa_system() -> QASystem:
+    """Инициализирует QASystem."""
     use_llm = os.getenv("USE_LLM", "true").lower() == "true"
     llm_provider = os.getenv("LLM_PROVIDER", "ollama").strip().lower()
     ollama_base_url = os.getenv("OLLAMA_BASE_URL", "http://127.0.0.1:11434").strip()
@@ -292,23 +345,25 @@ def init_qa_system() -> QASystem:
         sync_hf_dataset_to_raw(force=False)
 
     if auto_rebuild:
-        print("🔨 AUTO_REBUILD_INDEX=true → перестройка индекса")
+        print("🔨 AUTO_REBUILD_INDEX=true → автоматическая пересборка индекса")
         force_rebuild_index(qa)
     else:
-        print("⏭️ Автоперестройка индекса отключена")
+        print("⏭️ Автоматическая пересборка индекса отключена")
 
     return qa
 
 
 def init_session_state() -> None:
+    """Инициализирует состояние сессии Streamlit."""
     if "qa_system" not in st.session_state:
         with st.spinner("Загрузка системы..."):
-            st.session_state.qa_system = init_qa_system()
-            st.session_state.formula_engine = FormulaEngine(st.session_state.qa_system)
-            st.session_state.agent_loop = AgentLoop(
-                st.session_state.qa_system,
-                st.session_state.formula_engine,
-            )
+            qa_system = get_cached_qa_system()
+            formula_engine = get_cached_formula_engine(qa_system)
+            agent_loop = get_cached_agent_loop(qa_system, formula_engine)
+
+            st.session_state.qa_system = qa_system
+            st.session_state.formula_engine = formula_engine
+            st.session_state.agent_loop = agent_loop
             patch_app_with_table_calculator()
 
     if "error_handler" not in st.session_state:
@@ -332,18 +387,19 @@ def init_session_state() -> None:
 
 
 def auto_load_documents() -> bool:
+    """Автоматически загружает документы в sidebar."""
     qa_system = st.session_state.qa_system
 
     if getattr(qa_system, "is_ready", False):
         count = len(getattr(qa_system, "chunks", []))
-        st.sidebar.success(f"✅ База знаний готова\n📄 {count} фрагментов")
+        st.sidebar.success(f"✅ База знаний готова\n📄 {count} чанков")
         return True
 
     if INDEX_FILE.exists():
         try:
             if qa_system.load_index(INDEX_FILE):
                 count = len(getattr(qa_system, "chunks", []))
-                st.sidebar.success(f"✅ Индекс загружен\n📄 {count} фрагментов")
+                st.sidebar.success(f"✅ Индекс загружен\n📄 {count} чанков")
                 return True
         except Exception as e:
             st.sidebar.warning(f"⚠️ Ошибка загрузки индекса: {e}")
@@ -356,7 +412,8 @@ def auto_load_documents() -> bool:
     return False
 
 
-def export_history_to_docx():
+def export_history_to_docx() -> Path | None:
+    """Экспортирует историю чата в DOCX."""
     try:
         from docx import Document
         doc = Document()
@@ -378,19 +435,29 @@ def export_history_to_docx():
         return None
 
 
-def export_to_docx(answer: str, sources: list, tables: list = None, formulas: list = None, filename: str = None):
+def export_to_docx(
+    answer: str,
+    sources: list,
+    tables: list | None = None,
+    formulas: list | None = None,
+    filename: str | None = None
+) -> Path | None:
+    """Экспортирует ответ в DOCX."""
     if filename is None:
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         filename = f"engineering_report_{timestamp}.docx"
+
     try:
         from docx import Document
         from docx.enum.text import WD_ALIGN_PARAGRAPH
+
         doc = Document()
         title = doc.add_heading("Инженерный отчёт", 0)
         title.alignment = WD_ALIGN_PARAGRAPH.CENTER
         doc.add_paragraph(f"Дата: {datetime.now().strftime('%d.%m.%Y %H:%M')}")
         doc.add_heading("Ответ", level=1)
         doc.add_paragraph(answer)
+
         if tables:
             doc.add_heading("Таблицы", level=1)
             for table in tables[:2]:
@@ -398,11 +465,13 @@ def export_to_docx(answer: str, sources: list, tables: list = None, formulas: li
                     doc.add_paragraph(table.get("title", "Таблица"))
                     if table.get("content"):
                         doc.add_paragraph(table.get("content", ""))
+
         if formulas:
             doc.add_heading("Формулы", level=1)
             for formula in formulas[:3]:
                 if isinstance(formula, dict):
                     doc.add_paragraph(formula.get("raw", ""))
+
         if sources:
             doc.add_heading("Источники", level=1)
             for src in sources:
@@ -410,21 +479,45 @@ def export_to_docx(answer: str, sources: list, tables: list = None, formulas: li
                     doc.add_paragraph(src.get("doc_name", "Документ"), style="List Bullet")
                 else:
                     doc.add_paragraph(str(src), style="List Bullet")
+
         output_path = PROCESSED_DIR / filename
         output_path.parent.mkdir(parents=True, exist_ok=True)
         doc.save(str(output_path))
         return output_path
-    except Exception as e:
-        st.error(f"❌ Ошибка: {e}")
+
+    except ImportError:
+        st.error("❌ python-docx не установлен")
+        return None
+
+    except OSError as exc:
+        logger.exception("Ошибка файловой системы при экспорте DOCX")
+        st.error(f"❌ Ошибка сохранения: {exc}")
+        return None
+
+    except (TypeError, ValueError, KeyError) as exc:
+        logger.exception("Некорректные данные для экспорта DOCX")
+        st.error(f"❌ Ошибка формирования документа: {exc}")
+        return None
+
+    except (AttributeError, RuntimeError) as exc:
+        logger.exception("Непредвиденная ошибка при экспорте DOCX")
+        st.error(f"❌ Ошибка: {exc}")
         return None
 
 
-def export_to_pdf(answer: str, sources: list, tables: list = None, formulas: list = None, filename: str = None):
+def export_to_pdf(
+    answer: str,
+    sources: list,
+    tables: list | None = None,
+    formulas: list | None = None,
+    filename: str | None = None
+) -> Path | None:
+    """Экспортирует ответ в PDF."""
     if filename is None:
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         filename = f"engineering_report_{timestamp}.pdf"
+
     try:
-        from reportlab.lib.enums import TA_CENTER
         from reportlab.lib.pagesizes import A4
         from reportlab.lib.styles import ParagraphStyle, getSampleStyleSheet
         from reportlab.lib.units import inch
@@ -435,12 +528,14 @@ def export_to_pdf(answer: str, sources: list, tables: list = None, formulas: lis
 
         doc = SimpleDocTemplate(str(output_path), pagesize=A4)
         styles = getSampleStyleSheet()
+
+        # Исправлено: alignment="center" (нижний регистр для type checker)
         title_style = ParagraphStyle(
             "TitleStyle",
             parent=styles["Title"],
             fontSize=24,
             textColor=HexColor("#1a5276"),
-            alignment=TA_CENTER,
+            alignment="center",
             spaceAfter=20,
         )
         heading_style = ParagraphStyle(
@@ -480,14 +575,35 @@ def export_to_pdf(answer: str, sources: list, tables: list = None, formulas: lis
 
         doc.build(story)
         return output_path
+
     except ImportError:
         return export_to_docx(answer, sources, tables, formulas, filename.replace(".pdf", ".docx"))
-    except Exception as e:
-        st.error(f"❌ Ошибка: {e}")
+
+    except OSError as exc:
+        logger.exception("Ошибка файловой системы при экспорте PDF")
+        st.error(f"❌ Ошибка сохранения PDF: {exc}")
+        return None
+
+    except (TypeError, ValueError, KeyError) as exc:
+        logger.exception("Некорректные данные для экспорта PDF")
+        st.error(f"❌ Ошибка формирования PDF: {exc}")
+        return None
+
+    except (AttributeError, RuntimeError) as exc:
+        logger.exception("Непредвиденная ошибка при экспорте PDF")
+        st.error(f"❌ Ошибка: {exc}")
         return None
 
 
-def render_export_buttons(answer: str, sources: list, tables: list, formulas: list, key_suffix: str = "current", response_id: int | None = None):
+def render_export_buttons(
+    answer: str,
+    sources: list,
+    tables: list,
+    formulas: list,
+    key_suffix: str = "current",
+    response_id: int | None = None
+) -> None:
+    """Рендерит кнопки экспорта."""
     if response_id is None:
         response_id = st.session_state.get("current_response_id", 0)
 
@@ -497,28 +613,28 @@ def render_export_buttons(answer: str, sources: list, tables: list, formulas: li
     with col1:
         if st.button("📄 Экспорт DOCX", key=f"export_docx_{unique_id}"):
             docx_path = export_to_docx(answer, sources, tables, formulas)
-            if docx_path and docx_path.exists():
-                with open(docx_path, "rb") as f:
-                    st.download_button(
-                        label="📥 Скачать DOCX",
-                        data=f.read(),
-                        file_name=docx_path.name,
-                        mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-                        key=f"download_docx_{unique_id}",
-                    )
+            if docx_path is not None and docx_path.exists():
+                docx_data = docx_path.read_bytes()
+                st.download_button(
+                    label="📥 Скачать DOCX",
+                    data=docx_data,
+                    file_name=docx_path.name,
+                    mime=DOCX_MIME,
+                    key=f"download_docx_{unique_id}",
+                )
 
     with col2:
         if st.button("📄 Экспорт PDF", key=f"export_pdf_{unique_id}"):
             pdf_path = export_to_pdf(answer, sources, tables, formulas)
-            if pdf_path and pdf_path.exists():
-                with open(pdf_path, "rb") as f:
-                    st.download_button(
-                        label="📥 Скачать PDF",
-                        data=f.read(),
-                        file_name=pdf_path.name,
-                        mime="application/pdf",
-                        key=f"download_pdf_{unique_id}",
-                    )
+            if pdf_path is not None and pdf_path.exists():
+                pdf_data = pdf_path.read_bytes()
+                st.download_button(
+                    label="📥 Скачать PDF",
+                    data=pdf_data,
+                    file_name=pdf_path.name,
+                    mime="application/pdf",
+                    key=f"download_pdf_{unique_id}",
+                )
 
     with col3:
         if st.button("📋 Копировать", key=f"copy_{unique_id}"):
@@ -526,7 +642,12 @@ def render_export_buttons(answer: str, sources: list, tables: list, formulas: li
             st.success("✅ Текст скопирован!")
 
 
-def render_sidebar(qa_system: QASystem, formula_engine: FormulaEngine, error_handler: ErrorHandler) -> None:
+def render_sidebar(
+    qa_system: QASystem,
+    formula_engine: FormulaEngine,
+    error_handler: ErrorHandler
+) -> None:
+    """Рендерит боковую панель."""
     with st.sidebar:
         st.header("📚 О системе")
         st.markdown("""
@@ -561,6 +682,24 @@ def render_sidebar(qa_system: QASystem, formula_engine: FormulaEngine, error_han
                     st.code(str(path.relative_to(RAW_DIR)))
                 except Exception:
                     st.code(str(path))
+
+        st.divider()
+
+        st.subheader("⚙️ Статус движка")
+        if formula_engine is not None:
+            snapshot = formula_engine.debug_snapshot() if hasattr(formula_engine, "debug_snapshot") else {}
+            st.write(f"Формул: {snapshot.get('formula_count', 0)}")
+            st.write(f"Городов: {snapshot.get('cities_count', 0)}")
+            st.write(f"Материалов: {snapshot.get('materials_count', 0)}")
+
+            if hasattr(formula_engine, "validate_formula_contracts"):
+                errors = formula_engine.validate_formula_contracts()
+                if errors:
+                    st.warning(f"⚠️ {len(errors)} проблем в формулах")
+                    with st.expander("Детали"):
+                        st.code("\n".join(errors))
+                else:
+                    st.success("✅ Контракты формул в порядке")
 
         st.divider()
 
@@ -625,15 +764,15 @@ def render_sidebar(qa_system: QASystem, formula_engine: FormulaEngine, error_han
         st.subheader("💾 Экспорт")
         if st.button("📄 Экспорт истории (DOCX)", use_container_width=True):
             docx_path = export_history_to_docx()
-            if docx_path and docx_path.exists():
-                with open(docx_path, "rb") as f:
-                    st.download_button(
-                        label="📥 Скачать DOCX",
-                        data=f.read(),
-                        file_name=docx_path.name,
-                        mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-                        use_container_width=True,
-                    )
+            if docx_path is not None and docx_path.exists():
+                docx_data = docx_path.read_bytes()
+                st.download_button(
+                    label="📥 Скачать DOCX",
+                    data=docx_data,
+                    file_name=docx_path.name,
+                    mime=DOCX_MIME,
+                    use_container_width=True,
+                )
             else:
                 st.error("❌ Ошибка создания файла")
 
@@ -652,6 +791,7 @@ def render_sidebar(qa_system: QASystem, formula_engine: FormulaEngine, error_han
 
 
 def main() -> None:
+    """Главная функция приложения."""
     init_session_state()
 
     qa_system = st.session_state.qa_system
