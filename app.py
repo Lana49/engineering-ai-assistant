@@ -1,24 +1,25 @@
-# -*- coding: utf-8 -*-
-"""
-Инженерный чат-бот для работы с документацией.
-"""
 
 from __future__ import annotations
 
 import asyncio
 import json
-import logging
+
 import os
 import time
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable
-
+import logging
+import sys
 import streamlit as st
 from reportlab.lib.colors import HexColor
-# TA_CENTER больше не используется — заменён на "center" в ParagraphStyle
-# from reportlab.lib.enums import TA_CENTER  # ← УДАЛЁН
 
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)-8s | %(name)s | %(message)s",
+    handlers=[logging.StreamHandler(sys.stdout)],
+)
+logger = logging.getLogger(__name__)
 try:
     from huggingface_hub import snapshot_download
 except ImportError:
@@ -52,10 +53,7 @@ INDEX_FILE = PROCESSED_DIR / "faiss_index.pkl"
 SUPPORTED_SUFFIXES = {".pdf", ".docx", ".doc", ".rtf"}
 
 
-# ============================================================
 # КЭШИРОВАНИЕ РЕСУРСОВ
-# ============================================================
-
 @st.cache_resource(show_spinner=False)
 def get_cached_qa_system() -> QASystem:
     """Кэширует QASystem между перезапусками Streamlit."""
@@ -74,9 +72,7 @@ def get_cached_agent_loop(qa_system: QASystem, formula_engine: FormulaEngine) ->
     return AgentLoop(qa_system, formula_engine)
 
 
-# ============================================================
 # ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ
-# ============================================================
 
 def safe_call(callback: Callable[..., Any] | None, *args: Any, **kwargs: Any) -> Any | None:
     """Безопасно вызывает callback, если он существует."""
@@ -754,6 +750,11 @@ def render_sidebar(
             if INDEX_FILE.exists():
                 INDEX_FILE.unlink(missing_ok=True)
                 qa_system.is_ready = False
+                qa_system.documents = []
+                qa_system.chunks = []
+                qa_system.chunk_embeddings = None
+                qa_system.vectorizer = None
+                qa_system.tfidf_matrix = None
                 st.success("✅ Индекс очищен")
                 st.rerun()
             else:

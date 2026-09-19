@@ -15,12 +15,11 @@ import re
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any
-
-from core.prompts import get_quick_definition
+import logging
 from core.query_parser import parse_query
 from core.retrieval_memory import RetrievalMemory
 from core.table_extractor import extract_tables, tables_to_dicts
-
+logger = logging.getLogger(__name__)
 try:
     from core.config import PROCESSED_DIR
 except ImportError:
@@ -222,6 +221,7 @@ class AgentLoop:
 
         except Exception as exc:
             self.last_error = str(exc)
+            logger.exception("Непойманная ошибка AgentLoop.run для запроса %r", user_content[:200])
             return {
                 "answer": f"❌ Внутренняя ошибка: {exc}",
                 "sources": [],
@@ -298,6 +298,7 @@ class AgentLoop:
             TypeError,
             ValueError,
         ) as exc:
+            logger.warning("Не удалось разобрать запрос %r: %s", query[:200], exc)
             step.result = None
             step.confidence = 0.0
             step.description = f"Ошибка анализа запроса: {exc}"
@@ -379,6 +380,7 @@ class AgentLoop:
             TypeError,
             ValueError,
         ) as exc:
+            logger.exception("Ошибка grounded-ответа")
             step.result = {
                 "type": "calculation",
                 "answer": f"❌ Ошибка расчёта: {exc}",
@@ -793,6 +795,7 @@ class AgentLoop:
         term = self._extract_definition_term(context.query)
 
         if not term:
+            step = ReasoningStep(step_id=4, description="Уточнение термина")
             step.result = {
                 "answer": "Уточните термин, для которого нужно дать определение.",
                 "sources": [],
@@ -800,83 +803,12 @@ class AgentLoop:
                 "formulas": [],
                 "confidence": 0.2,
                 "needs_clarification": True,
-                "questions": ["Какой термин нужно определить?"],
+                "questions": ["Какой термин нужно определить?"], "grounded": True,
             }
             step.confidence = 0.2
             return step
+            return self._handle_grounded(context, f"Определение термина «{term}» по базе")
 
-        try:
-            quick = get_quick_definition(term)
-
-            if quick:
-                source = quick.get("source", "")
-                step.result = {
-                    "answer": (
-                        f"### {term}\n\n"
-                        f"{quick.get('definition', '')}"
-                    ),
-                    "sources": (
-                        [{"doc_name": source}]
-                        if source
-                        else []
-                    ),
-                    "tables": [],
-                    "formulas": [],
-                    "confidence": 0.95,
-                    "needs_clarification": False,
-                    "questions": [],
-                }
-                step.confidence = 0.95
-                return step
-
-            if self.qa_system and hasattr(self.qa_system, "find_definition"):
-                found = self.qa_system.find_definition(term)
-
-                if found and found.get("found"):
-                    source = found.get("source", "")
-                    step.result = {
-                        "answer": (
-                            f"### {term}\n\n"
-                            f"{found.get('definition', '')}"
-                        ),
-                        "sources": (
-                            [{"doc_name": source}]
-                            if source
-                            else []
-                        ),
-                        "tables": [],
-                        "formulas": [],
-                        "confidence": 0.9,
-                        "needs_clarification": False,
-                        "questions": [],
-                    }
-                    step.confidence = 0.9
-                    return step
-
-            step.result = self._search_answer(
-                context,
-                intro=f"Определение для «{term}»:",
-            )
-            step.confidence = step.result["confidence"]
-
-        except (
-            AttributeError,
-            KeyError,
-            TypeError,
-            ValueError,
-        ) as exc:
-            step.result = {
-                "answer": f"❌ Ошибка поиска определения: {exc}",
-                "sources": [],
-                "tables": [],
-                "formulas": [],
-                "confidence": 0.0,
-                "needs_clarification": True,
-                "questions": ["Уточните термин."],
-            }
-            step.confidence = 0.0
-
-        return step
 
     @staticmethod
     def _extract_definition_term(query: str) -> str:
@@ -963,15 +895,19 @@ class AgentLoop:
             step.confidence = 0.15
             return step
 
-        selected = [chunk for _, chunk in candidates[:4]]
-        step.result = self._build_evidence_answer(
-            selected,
-            title="Нормативные требования",
-            max_chars=850,
+        selected_context = ContextInfo(
+            query=context.query,
+            query_type=context.query_type,
+            keywords=context.keywords,
+            entities=context.entities,
+            parameters=context.parameters,
+            chunks=[chunk for _, chunk in candidates[:4]],
+            confidence=context.confidence,
         )
-        step.confidence = step.result["confidence"]
-
-        return step
+        return self._handle_grounded(
+            selected_context,
+            "Ответ по найденным нормативным фрагментам",
+        )
 
     def _handle_search(
         self,
@@ -982,10 +918,7 @@ class AgentLoop:
             description="Поиск информации в документах",
         )
 
-        step.result = self._search_answer(context)
-        step.confidence = step.result["confidence"]
-
-        return step
+        return self._handle_grounded(context, "Ответ по найденным документам")
 
     def _search_answer(
         self,
@@ -1118,8 +1051,8 @@ class AgentLoop:
             if doc_name:
                 sources.append({"doc_name": doc_name})
 
-            tables.extend(chunk.get("tables", [])[:1])
-            formulas.extend(chunk.get("formulas", [])[:2])
+            tables.extend(chunk.get("tables", []))
+            formulas.extend(chunk.get("formulas", []))
 
         if not parts:
             return {
@@ -1150,7 +1083,7 @@ class AgentLoop:
         result: list[dict[str, str]] = []
 
         for source in sources:
-            name = source.get("doc_name", "").strip()
+            name = str(source.get("doc_name") or "").strip()
             key = name.lower()
 
             if name and key not in seen:
@@ -1185,7 +1118,7 @@ class AgentLoop:
             seen.add(fingerprint)
             result.append(table)
 
-        return result[:3]
+        return result[:10]
 
     @staticmethod
     def _unique_formulas(
@@ -1221,6 +1154,9 @@ class AgentLoop:
             "params": result.get("parameters", result.get("params", {})),
             "result": result.get("result"),
             "reasoning": result.get("reasoning", ""),
+            "provider": result.get("provider", "none"),
+            "used_llm": bool(result.get("used_llm", False)),
+            "grounded": bool(result.get("grounded", False)),
             "confidence": result.get("confidence", 0.0),
             "needs_clarification": result.get(
                 "needs_clarification",
@@ -1279,7 +1215,6 @@ class AgentLoop:
 
     @staticmethod
     def _create_error_response(
-        self,
         message: str,
         step_id: int,
     ) -> dict[str, Any]:
@@ -1294,3 +1229,39 @@ class AgentLoop:
             "query_type": "error",
             "steps": step_id,
         }
+if  __name__ == "__main__":
+    import asyncio
+    from pathlib import Path
+    from tempfile import TemporaryDirectory
+
+    class _TestQA:
+        is_ready = True
+
+        def search(self, query: str, top_k: int = 5) -> list[dict[str, Any]]:
+            return [{
+                "doc_name": "Тестовый СП",
+                "chunk_id": 3,
+                "text": "Вентиляция должна обеспечивать требуемый воздухообмен.",
+                "score": 0.9,
+                "metadata": {"page": 7},
+            }]
+
+        def answer_from_results(self, question: str, results: list[dict[str, Any]]) -> dict[str, Any]:
+            assert results and results[0]["doc_name"] == "Тестовый СП"
+            return {
+                "answer": "### Краткий ответ\n\nТребование найдено. [Источник 1]",
+                "sources": [{"reference_id": 1, "doc_name": "Тестовый СП", "page": 7}],
+                "tables": [], "formulas": [], "confidence": 0.9,
+                "needs_clarification": False, "questions": [], "grounded": True,
+            }
+
+    class _TestFormula:
+        def can_calculate_directly(self, query: str, parameters: dict[str, Any]) -> bool:
+            return False
+
+    with TemporaryDirectory() as directory:
+        loop = AgentLoop(_TestQA(), _TestFormula())
+        loop.memory = RetrievalMemory(Path(directory) / "memory.json")
+        response = asyncio.run(loop.run("Какие требования к вентиляции?"))
+        assert response["sources"][0]["doc_name"] == "Тестовый СП"
+        assert response["query_type"] == "regulatory"

@@ -10,7 +10,7 @@
 """
 
 from __future__ import annotations
-
+import logging
 import re
 import shutil
 import subprocess
@@ -20,7 +20,7 @@ from pathlib import Path
 from typing import Any, List, Tuple, Optional
 
 SUPPORTED_EXTENSIONS = {".pdf", ".docx", ".doc", ".rtf"}
-
+logger = logging.getLogger(__name__)
 IS_MACOS = sys.platform == "darwin"
 IS_LINUX = sys.platform.startswith("linux")
 
@@ -53,7 +53,7 @@ def read_pdf_pymupdf(file_path: str | Path) -> Tuple[str, Optional[str]]:
         import pymupdf
     except ImportError:
         try:
-            import fitz as pymupdf  # type: ignore
+            import pymupdf
         except ImportError:
             return "", "PyMuPDF не установлен"
 
@@ -63,7 +63,7 @@ def read_pdf_pymupdf(file_path: str | Path) -> Tuple[str, Optional[str]]:
 
     try:
         parts: List[str] = []
-        with pymupdf.open(str(path)) as doc:  # type: ignore
+        with pymupdf.open(str(path)) as doc:
             for page_num, page in enumerate(doc, start=1):
                 try:
                     page_text = page.get_text("text") or ""
@@ -79,9 +79,8 @@ def read_pdf_pymupdf(file_path: str | Path) -> Tuple[str, Optional[str]]:
     except (OSError, ValueError, TypeError, RuntimeError) as exc:
         return "", f"PyMuPDF ошибка: {exc}"
 
-
 def read_pdf_pdfplumber(file_path: str | Path) -> Tuple[str, Optional[str]]:
-    """Читает PDF через pdfplumber как fallback."""
+    """Читает PDF через pdfplumber как fallback, включая таблицы."""
     try:
         import pdfplumber
     except ImportError:
@@ -96,15 +95,37 @@ def read_pdf_pdfplumber(file_path: str | Path) -> Tuple[str, Optional[str]]:
         with pdfplumber.open(str(path)) as pdf:
             for page_num, page in enumerate(pdf.pages, start=1):
                 try:
+                    # 1. Обычный текст
                     text = page.extract_text() or ""
                     if text.strip():
                         parts.append(text.strip())
+
+                    # 2. Таблицы — главное улучшение
+                    tables = page.extract_tables() or []
+                    for table in tables:
+                        if not table:
+                            continue
+                        table_lines: List[str] = []
+                        for row in table:
+                            cells = [
+                                (str(cell) if cell is not None else "").strip().replace("\n", " ")
+                                for cell in row
+                            ]
+                            if any(cells):
+                                # маркер и pipe-разделитель, чтобы TableExtractor увидел таблицу
+                                table_lines.append("| " + " | ".join(cells) + " |")
+                        if table_lines:
+                            parts.append("")
+                            parts.append("[ТАБЛИЦА pdfplumber]")
+                            parts.append("| " + " | ".join(["---"] * len(table[0])) + " |")
+                            parts.extend(table_lines)
+                            parts.append("")
                 except (AttributeError, ValueError, TypeError) as exc:
                     safe_print(f"⚠️ pdfplumber: ошибка страницы {page_num} в {path.name}: {exc}")
 
         text = "\n\n".join(parts).strip()
         if text:
-            return text, "pdfplumber"
+            return text, "pdfplumber+tables"
         return "", "текст не извлечён (возможно, сканированный PDF)"
     except (OSError, ValueError, TypeError, RuntimeError) as exc:
         return "", f"pdfplumber ошибка: {exc}"
@@ -120,7 +141,7 @@ def read_pdf_ocr(file_path: str | Path) -> Tuple[str, Optional[str]]:
         import pymupdf
     except ImportError:
         try:
-            import fitz as pymupdf  # type: ignore
+            import pymupdf
         except ImportError:
             return "", "PyMuPDF не установлен (нужен для OCR)"
 
@@ -608,6 +629,7 @@ class DocumentParser:
             text, source = read_file(path)
             text = self.normalize_text(text)
         except (OSError, UnicodeDecodeError, ValueError, TypeError) as exc:
+            logger.exception("Ошибка парсинга файла %s", path)
             safe_print(f"⚠️ Ошибка парсинга {path.name}: {exc}")
             return {
                 "doc_name": path.name,
@@ -625,6 +647,7 @@ class DocumentParser:
 
         if not text:
             reason = source or "неизвестная причина"
+            logger.warning("Текст не извлечён из %s: %s", path, reason)
             safe_print(f"⚠️ Не удалось извлечь текст из {path.name}: {reason}")
             return {
                 "doc_name": path.name,
@@ -702,6 +725,7 @@ class DocumentParser:
                 else:
                     failed.append(path.name)
             except (OSError, UnicodeDecodeError, ValueError, TypeError) as exc:
+                logger.exception("Критическая ошибка парсинга %s", path)
                 safe_print(f"⚠️ Критическая ошибка на файле {path.name}: {exc}")
                 failed.append(path.name)
 

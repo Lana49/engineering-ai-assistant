@@ -5,12 +5,12 @@
 """
 
 from __future__ import annotations
-
+import logging
 import re
 from dataclasses import dataclass, field
 from typing import Any
 
-
+logger = logging.getLogger(__name__)
 @dataclass
 class ExtractedTable:
     """Структура извлечённой таблицы."""
@@ -94,37 +94,51 @@ class TableExtractor:
         table_lines = []
         table_title = ""
 
+        def flush() -> None:
+            nonlocal table_lines, table_title, in_table
+            if table_lines:
+                if all(line.count("|") >= 2 for line in table_lines):
+                    table = self._build_table_from_pipe_lines(
+                        table_lines, source, confidence=0.95
+                    )
+                    table.title = table_title or table.title
+                else:
+                    table = self._build_table_from_lines(
+                        table_lines, table_title or "Таблица", source, confidence=0.95
+                    )
+                if table.is_valid(min_rows=1):
+                    tables.append(table)
+            table_lines = []
+            table_title = ""
+            in_table = False
+
         for i, line in enumerate(lines):
             if "[ТАБЛИЦА" in line:
+                stripped = line.strip()
+                if stripped.upper().startswith("[ТАБЛИЦА"):
+                    if in_table:
+                        flush()
                 in_table = True
                 table_lines = []
 
-                if i > 0 and len(lines[i - 1].strip()) < 100:
+                marker_title = re.sub(r"^\[ТАБЛИЦА\s*:?\s*", "", stripped, flags=re.I)
+                marker_title = marker_title.rstrip("]").split("|", 1)[0].strip()
+                if marker_title:
+                    table_title = marker_title
+                elif i > 0 and len(lines[i - 1].strip()) < 100:
                     table_title = lines[i - 1].strip()
                 else:
                     table_title = f"Таблица {len(tables) + 1}"
                 continue
 
             if in_table:
-                if line.strip() == "":
-                    if table_lines:
-                        table = self._build_table_from_lines(
-                            table_lines, table_title, source, confidence=0.95
-                        )
-                        if table.is_valid():
-                            tables.append(table)
-                        table_lines = []
-                        table_title = ""
-                    in_table = False
+                if not stripped or stripped.startswith("[СТРАНИЦА") or stripped.startswith("[ИСТОЧНИК"):
+                    flush()
                 else:
-                    table_lines.append(line.strip())
+                    table_lines.append(stripped)
 
         if in_table and table_lines:
-            table = self._build_table_from_lines(
-                table_lines, table_title, source, confidence=0.95
-            )
-            if table.is_valid():
-                tables.append(table)
+            flush()
 
         return tables
 
@@ -148,7 +162,7 @@ class TableExtractor:
                         table = self._build_table_from_pipe_lines(
                             table_lines, source, confidence=0.85
                         )
-                        if table.is_valid():
+                        if table.is_valid(min_rows=1):
                             tables.append(table)
                         table_lines = []
                     in_table = False
@@ -157,7 +171,7 @@ class TableExtractor:
                     table = self._build_table_from_pipe_lines(
                         table_lines, source, confidence=0.85
                     )
-                    if table.is_valid():
+                    if table.is_valid(min_rows=1):
                         tables.append(table)
                     table_lines = []
                 in_table = False
@@ -166,7 +180,7 @@ class TableExtractor:
             table = self._build_table_from_pipe_lines(
                 table_lines, source, confidence=0.85
             )
-            if table.is_valid():
+            if table.is_valid(min_rows=1):
                 tables.append(table)
 
         return tables
@@ -426,7 +440,7 @@ class TableExtractor:
         return unique
 
 
-# ========= УДОБНЫЕ ФУНКЦИИ ДЛЯ ИМПОРТА =========
+# ФУНКЦИИ ДЛЯ ИМПОРТА
 
 def extract_tables(text: str, doc_name: str = "", min_rows: int = 2) -> list[ExtractedTable]:
     """Быстрый импорт: извлекает таблицы из текста."""
@@ -499,7 +513,7 @@ def find_city_in_tables(tables: list[ExtractedTable], city: str, city_aliases: d
 
                 # Проверяем каждую форму
                 for form in city_forms:
-                    if form in row_lower:
+                    if re.search(rf"(?<![а-яa-z]){re.escape(form)}(?![а-яa-z])", row_lower):
                         return {
                             "table": table,
                             "row": row,
@@ -513,7 +527,7 @@ def find_city_in_tables(tables: list[ExtractedTable], city: str, city_aliases: d
                 for cell in row:
                     cell_lower = str(cell).lower()
                     for form in city_forms:
-                        if form in cell_lower:
+                        if re.search(rf"(?<![а-яa-z]){re.escape(form)}(?![а-яa-z])", cell_lower):
                             return {
                                 "table": table,
                                 "row": row,
@@ -526,7 +540,7 @@ def find_city_in_tables(tables: list[ExtractedTable], city: str, city_aliases: d
             elif isinstance(row, str):
                 row_lower = row.lower()
                 for form in city_forms:
-                    if form in row_lower:
+                    if re.search(rf"(?<![а-яa-z]){re.escape(form)}(?![а-яa-z])", row_lower):
                         return {
                             "table": table,
                             "row": [row],

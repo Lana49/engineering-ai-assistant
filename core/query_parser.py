@@ -6,11 +6,11 @@
 """
 
 from __future__ import annotations
-
+import logging
 import re
 from dataclasses import dataclass, field
 
-
+logger = logging.getLogger(__name__)
 NUMBER = r"[-+]?\d+(?:[.,]\d+)?"
 
 
@@ -30,93 +30,83 @@ class ParsedQuery:
 # Алиасы параметров (каноническое имя → варианты написания)
 PARAM_ALIASES: dict[str, tuple[str, ...]] = {
     "L": (
-        "l",
         "расход воздуха",
         "расход воздушный",
         "воздухообмен",
         "подача воздуха",
+        "l_возд",
     ),
     "t_v": (
-        "tv",
-        "tв",
-        "t_v",
-        "t в",
+        "tv", "tв", "t_v", "t в",
         "температура внутри",
         "внутренняя температура",
         "температура внутреннего воздуха",
     ),
     "t_n": (
-        "tn",
-        "tн",
-        "t_n",
-        "t н",
+        "tn", "tн", "t_n", "t н",
         "температура наружного воздуха",
         "наружная температура",
         "температура снаружи",
     ),
     "t_ot": (
-        "tot",
-        "tот",
-        "t_ot",
-        "t от",
+        "tot", "tот", "t_ot", "t от",
         "средняя температура отопительного периода",
         "температура отопительного периода",
     ),
-    "z_ot": (
-        "zot",
-        "zот",
-        "z_ot",
-        "z от",
+"z_ot": (
+        "zot", "zот", "z_ot", "z от",
         "продолжительность отопительного периода",
         "длительность отопительного периода",
     ),
     "A": (
-        "a",
         "площадь",
         "площадь ограждения",
         "площадь стены",
+        "площадь конструкции",
     ),
     "R": (
-        "r",
         "сопротивление теплопередаче",
         "термическое сопротивление",
         "сопротивление",
+        "r_0",
+        "r0",
     ),
     "delta_t": (
-        "deltat",
-        "delta t",
-        "дельта t",
+        "delta t", "дельта t",
         "разность температур",
         "перепад температур",
     ),
     "delta": (
-        "delta",
         "дельта",
         "толщина слоя",
         "толщина утеплителя",
         "толщина",
     ),
-    "lambda_value": (
-        "lambda",
-        "λ",
-        "лямбда",
+"lambda_value": (
+        "lambda", "λ", "лямбда",
         "теплопроводность",
         "коэффициент теплопроводности",
     ),
     "R_tr": (
-        "rtr",
-        "r_tr",
-        "r тр",
+        "rtr", "r_tr", "r тр",
         "требуемое сопротивление",
         "нормируемое сопротивление",
     ),
     "Q": (
-        "q",
         "тепловая мощность",
         "тепловая нагрузка",
         "тепловой поток",
         "теплопотери",
+        "q_тепл",
     ),
+}
+
+# Строгие односимвольные алиасы — только в формате "x=число"
+STRICT_SINGLE_CHAR_ALIASES: dict[str, str] = {
+    "l": "L",
+    "a": "A",
+    "r": "R",
+    "q": "Q",
 }
 
 # Города для климатических данных
@@ -167,93 +157,153 @@ def _alias_pattern(alias: str) -> str:
     escaped = re.escape(alias)
     return rf"(?<![a-zа-я0-9_]){escaped}(?![a-zа-я0-9_])"
 
+def _value_near_alias(text: str, alias: str) -> float | None:
+    """Ищет число рядом с алиасом в любом порядке и с любым разделителем."""
+    ap = _alias_pattern(alias)
 
-def _value_after_alias(text: str, alias: str) -> float | None:
-    """Ищет число после алиаса: L = 500"""
-    pattern = rf"{_alias_pattern(alias)}\s*(?:=|:|равно|составляет|-->|-)\s*({NUMBER})"
+    # Приоритет 1: alias = число / alias: число / alias -> число
+    patterns = [
+        rf"{ap}\s*[=:]\s*({NUMBER})",
+        rf"{ap}\s*[-—–]\s*({NUMBER})",
+        rf"{ap}\s+({NUMBER})",
+        rf"({NUMBER})\s*(?:м3/ч|м³/ч|м2|м²|м|вт|Вт|квт|кВт|°c|°с|сут|мм)?\s*{ap}",
+    ]
+
+    for pattern in patterns:
+        match = re.search(pattern, text, flags=re.IGNORECASE)
+        if match:
+            try:
+                return float(match.group(1).replace(",", "."))
+            except ValueError:
+                continue
+
+    return None
+
+
+def _value_strict_single_char(text: str, char: str) -> float | None:
+    """Строгий поиск для однобуквенных параметров: только 'x=число'."""
+    pattern = rf"(?<![a-zа-я0-9_]){re.escape(char)}\s*=\s*({NUMBER})(?![a-zа-я0-9_])"
     match = re.search(pattern, text, flags=re.IGNORECASE)
-    if not match:
-        return None
-    try:
-        return float(match.group(1).replace(",", "."))
-    except ValueError:
-        return None
-
-
-def _value_before_alias(text: str, alias: str) -> float | None:
-    """Ищет число перед алиасом: L 500 или расход 500"""
-    pattern = rf"({NUMBER})\s*(?:м3/ч|м2|м|вт|квт|сут)?\s*{_alias_pattern(alias)}"
-    match = re.search(pattern, text, flags=re.IGNORECASE)
-    if not match:
-        return None
-    try:
-        return float(match.group(1).replace(",", "."))
-    except ValueError:
-        return None
-
+    if match:
+        try:
+            return float(match.group(1).replace(",", "."))
+        except ValueError:
+            return None
+    return None
 
 def extract_variables(text: str) -> dict[str, float]:
-    """
-    Извлекает именованные инженерные параметры.
-
-    Приоритет: явная запись `имя = число`, затем вариант `число имя`.
-    Не назначает безымянные числа параметрам.
-    """
     if not text:
         return {}
 
     normalized = normalize_engineering_text(text)
     values: dict[str, float] = {}
 
-    for canonical_name, aliases in PARAM_ALIASES.items():
-        for alias in aliases:
-            value = _value_after_alias(normalized, alias)
-            if value is None:
-                value = _value_before_alias(normalized, alias)
+    # Сначала строгие однобуквенные (a=, r=, l=, q=)
+    for char, canonical in STRICT_SINGLE_CHAR_ALIASES.items():
+        if canonical in values:
+            continue
+        v = _value_strict_single_char(normalized, char)
+        if v is not None:
+            values[canonical] = v
 
+    # Затем обычные алиасы
+    for canonical_name, aliases in PARAM_ALIASES.items():
+        if canonical_name in values:
+            continue
+
+        for alias in aliases:
+            value = _value_near_alias(normalized, alias)
             if value is not None:
                 values[canonical_name] = value
                 break
 
     return values
 
+# core/query_parser.py
+
+CITY_FORMS: dict[str, list[str]] = {
+    "москва": ["москва", "москвы", "москве", "москву", "москвой"],
+    "санкт-петербург": ["санкт-петербург", "санкт петербург", "спб", "питер", "ленинград"],
+    "новосибирск": ["новосибирск", "нск", "новосиб"],
+    "екатеринбург": ["екатеринбург", "екб", "екат"],
+    "нижний новгород": ["нижний новгород", "нн"],
+    "ростов-на-дону": ["ростов-на-дону", "ростов на дону", "ростов"],
+    "казань": ["казань", "казани"],
+    "самара": ["самара", "самары"],
+    "уфа": ["уфа", "уфы"],
+    "красноярск": ["красноярск", "крас"],
+    "пермь": ["пермь", "перми"],
+    "воронеж": ["воронеж", "воронежа"],
+    "волгоград": ["волгоград", "волгограда"],
+    "краснодар": ["краснодар", "краснодара"],
+    "тюмень": ["тюмень", "тюмени"],
+    "челябинск": ["челябинск", "челябы"],
+    "омск": ["омск", "омска"],
+}
+
 
 def extract_city(text: str) -> str | None:
-    """Извлекает город из текста с учётом словоформ."""
     if not text:
         return None
 
     normalized = normalize_engineering_text(text)
 
-    # Словоформы для городов
-    city_forms = {
-        "москва": ["москва", "москвы", "москве", "москву", "москвой"],
-        "санкт-петербург": ["санкт-петербург", "санкт петербург", "спб", "питер"],
-        "новосибирск": ["новосибирск", "нск"],
-        "екатеринбург": ["екатеринбург", "екб"],
-        "нижний новгород": ["нижний новгород", "нн", "нижний"],
-    }
-
-    # Точное совпадение
-    for city in sorted(KNOWN_CITIES, key=len, reverse=True):
-        if city in normalized:
-            return city
-
-    # По словоформам
-    for city, forms in city_forms.items():
+    # 1. Точное совпадение по формам (приоритет — самые длинные)
+    for canonical, forms in sorted(
+        CITY_FORMS.items(),
+        key=lambda kv: max(len(f) for f in kv[1]),
+        reverse=True,
+    ):
         for form in forms:
-            if f" {form} " in f" {normalized} ":
-                return city
+            if re.search(rf"\b{re.escape(form)}\b", normalized):
+                return canonical
 
-    # По токенам (для составных названий)
-    tokens = normalized.split()
-    for token in tokens:
-        for city in KNOWN_CITIES:
-            if token in city or city in token:
-                return city
+    # 2. Контекстный шаблон "для/в/по <Слово с большой буквы>"
+    match = re.search(
+        r"\b(?:для|в|по|город[ае]?|г\.)\s+([А-ЯЁ][а-яё\- ]{2,40})\b",
+        text,
+    )
+    if match:
+        candidate = match.group(1).strip().lower()
+        # отсекаем заведомо неподходящие слова
+        stop = {"помещения", "здания", "расчета", "проекта", "стены", "квартиры"}
+        if candidate and candidate not in stop:
+            return candidate
 
     return None
+STOPWORDS: frozenset[str] = frozenset({
+    "что", "как", "какие", "какой", "какая", "какое", "каков",
+    "для", "или", "это", "при", "по", "на", "из", "в", "и", "а",
+    "но", "не", "то", "ли", "же", "бы", "мы", "вы", "они", "он",
+    "она", "оно", "его", "ее", "их", "наш", "ваш", "свой", "все",
+    "весь", "вся", "всё", "где", "когда", "почему", "зачем", "чем",
+    "кто", "так", "там", "тут", "здесь", "есть", "было", "быть",
+    "будет", "может", "можно", "нужно", "надо", "дай", "дайте",
+    "покажи", "скажи", "расскажи", "нужен", "нужна", "нужны",
+    "рассчитай", "посчитай", "вычисли", "найди", "найдите",
+    "подскажи", "подскажите", "объясни", "объясните",
+})
 
+
+def extract_keywords(text: str) -> list[str]:
+    if not text:
+        return []
+
+    words = re.findall(r"[A-Za-zА-Яа-я0-9._/-]{3,}", text)
+    result: list[str] = []
+    seen: set[str] = set()
+
+    for w in words:
+        key = w.lower()
+        if (
+            key not in seen
+            and key not in STOPWORDS
+            and len(key) > 2
+        ):
+            seen.add(key)
+            result.append(key)
+
+    return result[:12]
 
 def extract_document_codes(text: str) -> list[str]:
     """Извлекает коды документов (СП, ГОСТ, СНиП)."""

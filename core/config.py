@@ -5,10 +5,10 @@
 """
 
 from __future__ import annotations
-
+import logging
 import os
 from pathlib import Path
-
+logger = logging.getLogger(__name__)
 try:
     from dotenv import load_dotenv
     load_dotenv()
@@ -57,3 +57,6 @@ print(f"📁 Папка документов: {RAW_DIR}")
 print(f"📁 Папка индексов: {PROCESSED_DIR}")
 print(f"📦 Dataset: {HF_DATASET_REPO_ID}")
 print(f"🚀 Режим Space: {'ON' if IS_HF_SPACE else 'OFF'}")
+if __name__ == "__main__":
+    assert BASE_DIR.name == "PythonProject1-ready" or BASE_DIR.exists()
+    assert TOP_K > 0 and CHUNK_SIZE >= 300

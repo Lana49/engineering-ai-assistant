@@ -4,13 +4,13 @@ Retrieval Memory — память успешных поисковых запро
 """
 
 from __future__ import annotations
-
+import logging
 import json
 from dataclasses import asdict, dataclass, field
 from datetime import datetime
 from pathlib import Path
-
-
+from core.query_parser import STOPWORDS
+logger = logging.getLogger(__name__)
 @dataclass(slots=True)
 class RetrievalRecord:
     """Запись об успешном поисковом запросе."""
@@ -41,24 +41,37 @@ class RetrievalMemory:
 
         try:
             data = json.loads(self.memory_path.read_text(encoding="utf-8"))
+            if not isinstance(data, list):
+                raise TypeError("файл памяти должен содержать список")
             self.records = [RetrievalRecord(**item) for item in data if isinstance(item, dict)]
-        except (json.JSONDecodeError, KeyError, TypeError, OSError):
+        except (json.JSONDecodeError, KeyError, TypeError, OSError) as exc:
+            logger.warning("Не удалось загрузить retrieval memory %s: %s", self.memory_path, exc)
             self.records = []
 
     def save(self) -> None:
         """Сохраняет записи в файл."""
-        self.memory_path.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            self.memory_path.parent.mkdir(parents=True, exist_ok=True)
         payload = [asdict(record) for record in self.records]
-        self.memory_path.write_text(
+        temporary_path = self.memory_path.with_suffix(self.memory_path.suffix + ".tmp")
+        temporary_path.write_text(
             json.dumps(payload, ensure_ascii=False, indent=2),
             encoding="utf-8",
         )
+        temporary_path.replace(self.memory_path)
+
+    except OSError:
+    # Память — только бустинг ранжирования. Её сбой не должен отменять
+    # уже найденный ответ или расчёт.
+    logger.exception("Не удалось сохранить retrieval memory %s", self.memory_path)
 
     @staticmethod
     def normalize_query(query: str) -> str:
-        """Нормализует запрос для использования как ключа."""
         cleaned = "".join(ch.lower() if ch.isalnum() or ch.isspace() else " " for ch in query)
-        tokens = [token for token in cleaned.split() if len(token) > 2]
+        tokens = [
+            token for token in cleaned.split()
+            if len(token) > 2 and token not in STOPWORDS
+        ]
         return " ".join(tokens[:8])
 
     def save_success(

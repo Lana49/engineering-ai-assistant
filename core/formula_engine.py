@@ -16,14 +16,14 @@ core/formula_engine.py
 """
 
 from __future__ import annotations
-
+import logging
 import json
 import re
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, Callable
 
-
+logger = logging.getLogger(__name__)
 try:
     from core.query_parser import extract_city, extract_variables
 except ImportError:
@@ -372,7 +372,8 @@ class FormulaEngine:
             KeyError,
             TypeError,
             ValueError,
-        ):
+        ) as exc:
+            logger.warning("Не удалось загрузить кэш FormulaEngine: %s", exc)
             self.materials = {}
             self.cities = {}
             self._material_cache = {}
@@ -395,7 +396,7 @@ class FormulaEngine:
                 encoding="utf-8",
             )
         except OSError:
-            pass
+            logger.exception("Не удалось сохранить кэш FormulaEngine")
 
     def _build_city_aliases(self) -> dict[str, str]:
         aliases = dict(self.CITY_ALIASES_COMMON)
@@ -699,6 +700,7 @@ class FormulaEngine:
             result["reasoning"] = "\n".join(self.reasoning_steps)
             return self._format_result(result, meta)
         except (ArithmeticError, KeyError, TypeError, ValueError) as exc:
+            logger.exception("Ошибка выполнения формулы %s", formula_key)
             return self._error(f"Ошибка расчёта: {exc}")
 
     async def _try_table_calculation(
@@ -758,6 +760,7 @@ class FormulaEngine:
             return result
 
         except (AttributeError, KeyError, TypeError, ValueError) as exc:
+            logger.warning("Табличный метод расчёта недоступен: %s", exc)
             self.reasoning_steps.append(f"Табличный метод недоступен: {exc}")
             return None
 
@@ -855,7 +858,7 @@ class FormulaEngine:
             try:
                 self.on_material_not_found(canonical)
             except (KeyError, TypeError, ValueError, AttributeError, OSError, json.JSONDecodeError):
-                pass
+                logger.exception("Callback поиска материала завершился ошибкой")
 
         return None
 
@@ -873,7 +876,7 @@ class FormulaEngine:
             try:
                 self.on_city_not_found(canonical)
             except Exception:
-                pass
+                logger.exception("Callback поиска города завершился ошибкой")
 
         return None
 
@@ -1358,3 +1361,12 @@ class FormulaEngine:
                 })
 
         return result[:10]
+if __name__ == "__main__":
+    import asyncio
+
+    engine = FormulaEngine()
+    result = asyncio.run(engine.answer_calculation(
+        "Рассчитай вентиляцию: L=100 м3/ч, tв=20 °C, tн=-25 °C"
+    ))
+    assert result["needs_clarification"] is False
+    assert round(float(result["result"]), 1) == 1507.5

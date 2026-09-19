@@ -14,7 +14,7 @@ import re
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Optional
-
+import logging
 import numpy as np
 import requests
 
@@ -43,7 +43,7 @@ except ImportError:
     genai = None
     GENAI_AVAILABLE = False
 
-
+logger = logging.getLogger(__name__)
 @dataclass(slots=True)
 class SearchResult:
     """Результат поиска."""
@@ -80,8 +80,6 @@ class QASystem:
         min_score: float = 0.15,
         ollama_base_url: str = "http://localhost:11434",
         ollama_model: str = "llama3.1:8b",
-        gemini_api_key: Optional[str] = None,
-        gemini_model: str = "gemini-2.0-flash",
         embedding_model_name: str = "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2",
         use_embeddings: bool = True,
         semantic_weight: float = 0.7,
@@ -95,19 +93,6 @@ class QASystem:
 
         self.ollama_base_url = ollama_base_url.rstrip("/")
         self.ollama_model = model_name if model_name and self.llm_provider in {"ollama", "mixed"} else ollama_model
-
-        self.gemini_api_key = (gemini_api_key or os.getenv("GEMINI_API_KEY", "")).strip()
-        self.gemini_model = model_name if model_name and self.llm_provider == "gemini" else gemini_model
-        self.gemini_available = bool(self.gemini_api_key) and GENAI_AVAILABLE
-        self.genai_client: Any = None
-
-        if self.gemini_available and genai is not None:
-            try:
-                self.genai_client = genai.Client(api_key=self.gemini_api_key)  # type: ignore
-                print(f"✅ Gemini клиент инициализирован (модель: {self.gemini_model})")
-            except Exception as e:
-                print(f"⚠️ Ошибка инициализации Gemini: {e}")
-                self.gemini_available = False
 
         self.embedding_model_name = embedding_model_name
         self.use_embeddings = use_embeddings
@@ -167,10 +152,10 @@ class QASystem:
 
         try:
             print(f"📥 Загружаю embedding model: {self.embedding_model_name}")
-            self.embedding_model: SentenceTransformer | None = None
+            self.embedding_model = SentenceTransformer(self.embedding_model_name)
             print("✅ Embedding model загружена")
         except Exception as e:
-            print(f"⚠️ Не удалось загрузить embedding model: {e}")
+            logger.exception("Не удалось загрузить embedding model %s", self.embedding_model_name)
             self.embedding_model = None
 
     def is_ollama_alive(self) -> bool:
@@ -197,15 +182,9 @@ class QASystem:
                 f"Ollama {'доступен' if self.llm_available else 'недоступен'} "
                 f"(base_url={self.ollama_base_url}, model={self.ollama_model})"
             )
-        elif self.llm_provider == "gemini":
-            self.llm_available = self.gemini_available
-            print(
-                f"{'✅' if self.llm_available else '⚠️'} "
-                f"Gemini {'доступен' if self.llm_available else 'недоступен'} "
-                f"(model={self.gemini_model})"
-            )
+
         elif self.llm_provider == "mixed":
-            self.llm_available = self.is_ollama_alive() or self.gemini_available
+            self.llm_available = self.is_ollama_alive()
             print(
                 f"{'✅' if self.llm_available else '⚠️'} Mixed LLM provider, "
                 f"available={self.llm_available}"
@@ -223,16 +202,6 @@ class QASystem:
 
         if self.llm_provider == "ollama":
             return "ollama" if self.is_ollama_alive() else "none"
-
-        if self.llm_provider == "gemini":
-            return "gemini" if self.gemini_available else "none"
-
-        if self.llm_provider == "mixed":
-            if self.is_ollama_alive():
-                return "ollama"
-            if self.gemini_available:
-                return "gemini"
-            return "none"
 
         return "none"
 
@@ -303,21 +272,17 @@ class QASystem:
 
             texts = [c["text"] for c in self.chunks]
 
-            # ============ TF-IDF ============
+            # TF-IDF
             if TfidfVectorizer is not None:
-                self.vectorizer: TfidfVectorizer | None = None
-                if self.vectorizer is not None:
-                    self.tfidf_matrix = self.vectorizer.fit_transform(texts)
-                    self.last_index_diagnostics["tfidf_built"] = True
-                    print(f"✅ TF-IDF построен: shape={self.tfidf_matrix.shape}")
-                else:
-                    self.tfidf_matrix = None
+                self.vectorizer = TfidfVectorizer(max_features=50000,ngram_range=(1, 2),min_df=1,sublinear_tf=True,)
+                self.tfidf_matrix = self.vectorizer.fit_transform(texts)
+                self.last_index_diagnostics["tfidf_built"] = True
+                print(f"✅ TF-IDF построен: shape={self.tfidf_matrix.shape}")
             else:
                 self.vectorizer = None
                 self.tfidf_matrix = None
-                print("⚠️ TF-IDF пропущен: scikit-learn недоступен")
 
-            # ============ ЭМБЕДДИНГИ С БАТЧАМИ ============
+            # ЭМБЕДДИНГИ С БАТЧАМИ
             if self.embedding_model is not None and texts:
                 total_texts = len(texts)
                 batch_size = self.embedding_batch_size
@@ -438,7 +403,6 @@ class QASystem:
                 "vectorizer": self.vectorizer,
                 "tfidf_matrix": self.tfidf_matrix,
                 "ollama_model": self.ollama_model,
-                "gemini_model": self.gemini_model,
                 "llm_provider": self.llm_provider,
                 "diagnostics": self.last_index_diagnostics,
             }
@@ -520,7 +484,6 @@ class QASystem:
             self.vectorizer = data.get("vectorizer")
             self.tfidf_matrix = data.get("tfidf_matrix")
             self.ollama_model = data.get("ollama_model", self.ollama_model)
-            self.gemini_model = data.get("gemini_model", self.gemini_model)
             self.llm_provider = data.get("llm_provider", self.llm_provider)
             self.last_index_diagnostics = data.get("diagnostics", {})
 
@@ -553,6 +516,8 @@ class QASystem:
             "has_embeddings": self.chunk_embeddings is not None,
             "embeddings_shape": str(self.chunk_embeddings.shape) if self.chunk_embeddings is not None else None,
             "has_tfidf": self.tfidf_matrix is not None,
+            "selected_provider": self.get_selected_provider(),
+            "last_llm_error": self.last_llm_error,
             "last_index_diagnostics": self.last_index_diagnostics,
             "last_save_diagnostics": self.last_save_diagnostics,
             "last_load_diagnostics": self.last_load_diagnostics,
@@ -585,7 +550,11 @@ class QASystem:
                 print(f"⚠️ Ошибка lexical search: {e}")
 
         # Семантический поиск (эмбеддинги)
-        if self.embedding_model is not None and self.chunk_embeddings is not None:
+        if (
+                self.embedding_model is not None
+                and self.chunk_embeddings is not None
+                and len(self.chunk_embeddings) == len(self.chunks)
+        ):
             try:
                 q_emb = self.embedding_model.encode(
                     [query],
@@ -655,12 +624,10 @@ class QASystem:
 
             if provider == "ollama":
                 llm_answer = self._ask_ollama(prompt)
-            elif provider == "gemini":
-                llm_answer = self._ask_gemini(prompt)
 
-            if llm_answer:
+            if llm_answer and self._has_valid_citations(llm_answer, len(selected_results)):
                 return {
-                    "answer": llm_answer,
+                    "answer": self._ensure_structured_answer(llm_answer),
                     "sources": self._build_sources(results),
                     "tables": tables_to_dicts(extract_tables_from_results(results)),
                     "formulas": self._extract_formulas_from_results(results),
@@ -669,7 +636,12 @@ class QASystem:
                     "context": context,
                 }
 
-        fallback_answer = self._generate_extract_answer(results)
+            if llm_answer:
+                logger.warning(
+                    "Ответ %s отклонён: в нём нет корректных ссылок на контекст",
+                    provider,
+                )
+        fallback_answer = self._generate_extract_answer(selected_results, question=question)
         return {
             "answer": fallback_answer,
             "sources": self._build_sources(results),
@@ -712,19 +684,22 @@ class QASystem:
 
     @staticmethod
     def _build_sources(results: list[SearchResult]) -> list[dict[str, Any]]:
-        """Собирает источники."""
-        seen = set()
-        sources = []
-        for item in results:
-            if item.doc_name not in seen:
-                seen.add(item.doc_name)
-                sources.append({
-                    "doc_name": item.doc_name,
-                    "chunk_id": item.chunk_id,
-                    "score": item.score,
-                    "filepath": item.filepath,
-                })
-        return sources[:5]
+        """Собирает источники с теми же номерами, что и в контексте LLM."""
+        sources: list[dict[str, Any]] = []
+        for reference_id, item in enumerate(results, start=1):
+            metadata = dict(item.metadata or {})
+            source = {
+                "reference_id": reference_id,
+                "doc_name": item.doc_name,
+                "chunk_id": item.chunk_id,
+                "score": item.score,
+                "filepath": item.filepath,
+            }
+            for key in ("page", "page_numbers", "sheet", "table_title", "location"):
+                if metadata.get(key) not in (None, "", []):
+                    source[key] = metadata[key]
+            sources.append(source)
+        return sources
 
     @staticmethod
     def _extract_formulas_from_results(results: list[SearchResult]) -> list[dict[str, Any]]:
@@ -745,18 +720,24 @@ class QASystem:
 
     @staticmethod
     def _best_sentence_for_term(text: str, term: str) -> str:
-        """Находит лучшее предложение с термином."""
         sentences = re.split(r"(?<=[.!?])\s+", text)
         term_lower = term.lower()
 
         best = ""
-        best_score = 0
+        best_score = -1.0
         for sentence in sentences:
-            if term_lower in sentence.lower():
-                score = 100 - len(sentence)
-                if score > best_score:
-                    best_score = score
-                    best = sentence.strip()
+            lower = sentence.lower()
+            if term_lower not in lower:
+                continue
+
+            # чем короче — тем лучше; чем раньше — тем лучше
+            length_penalty = 1.0 / (1 + len(sentence) / 200.0)
+            position_bonus = 1.0 if lower.find(term_lower) < 100 else 0.7
+            score = length_penalty * position_bonus
+
+            if score > best_score:
+                best_score = score
+                best = sentence.strip()
 
         return best
 
@@ -777,24 +758,8 @@ class QASystem:
             data = response.json()
             return (data.get("response") or "").strip() or None
         except Exception as e:
-            print(f"⚠️ Ошибка Ollama: {e}")
-            return None
-
-    def _ask_gemini(self, prompt: str) -> Optional[str]:
-        """Запрос к Gemini через google.genai SDK."""
-        if not self.gemini_available or self.genai_client is None:
-            return None
-
-        try:
-            response = self.genai_client.models.generate_content(
-                model=self.gemini_model,
-                contents=[prompt],
-            )
-            if hasattr(response, 'text') and response.text:
-                return response.text.strip()
-            return None
-        except Exception as e:
-            print(f"⚠️ Ошибка Gemini: {e}")
+            self.last_llm_error = f"Ollama: {type(e).__name__}: {e}"
+            logger.exception("Ошибка запроса к Ollama")
             return None
 
     @staticmethod
@@ -816,17 +781,118 @@ class QASystem:
 """.strip()
 
     @staticmethod
-    def _generate_extract_answer(results: list[SearchResult]) -> str:
-        """Fallback-ответ без LLM."""
-        if not results:
+    def _has_valid_citations(answer: str, source_count: int) -> bool:
+        """Проверяет, что LLM ссылается только на переданные фрагменты."""
+        references = [
+            int(value)
+            for value in re.findall(r"\[Источник\s+(\d+)\]", answer, flags=re.IGNORECASE)
+        ]
+        return bool(references) and all(1 <= value <= source_count for value in references)
+
+    @staticmethod
+    def _ensure_structured_answer(answer: str) -> str:
+        """Добавляет заголовок, если модель не оформила краткий ответ."""
+        if re.search(r"^#{1,3}\s*кратк", answer, flags=re.IGNORECASE | re.MULTILINE):
+            return answer.strip()
+        return "### Краткий ответ\n\n" + answer.strip()
+
+    @staticmethod
+    def _query_terms(question: str) -> set[str]:
+        stopwords = {
+            "какой", "какая", "какие", "как", "что", "это", "для", "про",
+            "нужно", "нужен", "нужна", "пожалуйста", "покажи", "найди",
+            "расскажи", "документ", "документа", "базе", "знаний",
+        }
+        return {
+            token.lower()
+            for token in re.findall(r"[A-Za-zА-Яа-яЁё0-9_]{3,}", question or "")
+            if token.lower() not in stopwords
+        }
+
+    @classmethod
+    def _select_evidence_excerpt(cls, text: str, question: str) -> str:
+        """Выбирает короткое дословное доказательство вместо сырого чанка."""
+        clean = re.sub(r"[ \t]+", " ", text or "").strip()
+        if not clean:
+            return ""
+        terms = cls._query_terms(question)
+        candidates = re.split(r"(?<=[.!?])\s+|\n+", clean)
+        scored: list[tuple[int, int, str]] = []
+        for position, candidate in enumerate(candidates):
+            candidate = candidate.strip()
+            if len(candidate) < 15:
+                continue
+            lower = candidate.lower()
+            hits = sum(1 for term in terms if term in lower)
+            scored.append((hits, -position, candidate))
+
+        if scored:
+            scored.sort(reverse=True)
+            excerpt = scored[0][2]
+        else:
+            excerpt = clean
+
+        if len(excerpt) > 420:
+            excerpt = excerpt[:420].rsplit(" ", 1)[0].rstrip() + "…"
+        return excerpt
+
+    @classmethod
+    def _generate_extract_answer(
+            cls,
+            results: list[SearchResult],
+            question: str = "",
+    ) -> str:
+        """Строит структурированный extractive-ответ, когда LLM недоступна."""
+
+        parts: list[str] = [
+            "### Краткий ответ","Генеративная модель недоступна; ниже приведены только "
+                "дословные релевантные фрагменты из подключённой базы."
+            )
+        ]
+        excerpts: list[str] = []
+        for index, result in enumerate(results[:3], start=1):
+            excerpt = cls._select_evidence_excerpt(result.text, question)
+        if excerpt:
+            excerpts.append(f"{excerpt} [Источник {index}]")
+
+        if excerpts:
+            parts.extend(excerpts[:2])
+        # 1. Сначала таблицы — они самые информативные
+        try:
+            tables = extract_tables_from_results(results, limit=3)
+        except (AttributeError, TypeError, ValueError, KeyError) as exc:
+            logger.exception("extract_tables_from_results failed")
+            tables = []
+
+        if tables:
+            parts.append("📊 **Найденные таблицы:**")
+            for table in tables[:3]:
+                parts.append(f"\n**{table.title or 'Таблица'}** (источник: {table.source})")
+
+                if table.headers or table.rows:
+                    header = " | ".join(str(h) for h in table.headers) if table.headers else ""
+                    if header:
+                        parts.append(header)
+                        parts.append("-" * min(len(header), 80))
+                    for row in table.rows[:15]:
+                        parts.append(" | ".join(str(c) for c in row))
+                else:
+                    # fallback: сырой текст таблицы
+                    parts.append(table.raw_text[:800])
+            parts.append("")
+
+        # 2. Потом текстовые фрагменты — коротко
+        text_fragments = []
+        for r in results[:3]:
+            text = r.text.strip()
+            if text and len(text) > 20:
+                text_fragments.append(text[:600])
+
+        if text_fragments:
+            parts.append("📄 **Текстовые фрагменты:**")
+            parts.append("\n\n".join(text_fragments))
+
+        if not parts:
             return "Не удалось найти информацию в документах."
 
-        top = results[0]
-        fragments = [r.text.strip() for r in results[:3] if r.text.strip()]
-        merged = "\n\n".join(fragments)
-        merged = re.sub(r"\n{3,}", "\n\n", merged).strip()
-
-        if len(merged) > 1800:
-            merged = merged[:1800].rsplit(" ", 1)[0] + "..."
-
-        return f"Найдена релевантная информация в документе «{top.doc_name}».\n\n{merged}"
+        return f"### Ответ\n\n" + "\n".join(parts)

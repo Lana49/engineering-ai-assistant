@@ -5,7 +5,7 @@
 """
 
 from __future__ import annotations
-
+import logging
 import json
 import re
 import traceback
@@ -13,7 +13,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable, Awaitable
 
-
+logger = logging.getLogger(__name__)
 class ErrorHandler:
     """
     Обработчик ошибок с понятными сообщениями.
@@ -60,12 +60,11 @@ class ErrorHandler:
             f"{error_info.get('type', 'Unknown')}: {error_info.get('message', '')}"
         )
 
-        print(message)
-
-        if self.log_level == "debug":
-            trace = str(error_info.get("traceback", "") or "")
-            if trace.strip():
-                print(trace)
+        trace = str(error_info.get("traceback", "") or "")
+        if self.log_level == "debug" and trace.strip() and trace.strip() != "NoneType: None":
+            logger.error("%s\n%s", message, trace)
+        else:
+            logger.error("%s", message)
 
         if self.log_file:
             try:
@@ -80,7 +79,7 @@ class ErrorHandler:
                             file.write(trace + "\n")
                     file.write("-" * 80 + "\n")
             except OSError:
-                pass
+                logger.exception("Не удалось записать лог ошибок в %s", self.log_file)
 
     def _format_error(self, error_info: dict[str, Any]) -> dict[str, Any]:
         """
@@ -194,7 +193,7 @@ class ErrorHandler:
                 json.dump(error_info, file, ensure_ascii=False)
                 file.write("\n" + "-" * 80 + "\n")
         except OSError as exc:
-            print(f"⚠️ Не удалось записать лог: {exc}")
+            logger.warning("Не удалось записать лог %s: %s", file_path, exc)
 
     def get_user_friendly_message(self, error: Exception) -> str:
         """Быстрый метод для получения понятного сообщения об ошибке."""
@@ -237,3 +236,9 @@ async def safe_execute_async(
         return result, None
     except Exception as exc:
         return None, exc
+
+if __name__ == "__main__":
+    handler = ErrorHandler(log_level="debug")
+    info = handler.handle(ValueError("проверка журнала"), {"stage": "self-test"})
+    assert info["is_error"] is True
+    assert handler.get_error_summary()["total"] == 1

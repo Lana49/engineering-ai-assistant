@@ -4,10 +4,11 @@
 """
 
 from __future__ import annotations
-
+import logging
 import re
+import os
 from typing import Any
-
+logger = logging.getLogger(__name__)
 # ВСТРОЕННЫЕ КЛИМАТИЧЕСКИЕ ДАННЫЕ (FALLBACK)
 CLIMATE_DATA = {
     "москва": {"t_ot": -3.1, "z_ot": 214, "t_n": -25},
@@ -44,184 +45,165 @@ class TableCalculator:
             results = self.qa_system.search(query, top_k=top_k)
             return extract_tables_from_results(results)
         except (AttributeError, KeyError, TypeError, ValueError):
+            logger.exception("TableCalculator: ошибка поиска таблиц")
             return []
 
-    def calculate_gsop_from_table(self, city: str, t_v: float = 20.0) -> dict[str, Any]:
-        """Рассчитывает ГСОП по встроенным данным (fallback)."""
-        city_lower = city.lower().strip()
+    CLIMATE_HEADER_ALIASES: dict[str, tuple[str, ...]] = {
+        "t_ot": (
+            "tот", "t_от", "средняя температура отопительного периода",
+            "температура отопительного периода", "средняя температура",
+        ),
+        "z_ot": (
+            "zот", "z_от", "продолжительность отопительного периода",
+            "продолжительность периода", "продолжительность",
+        ),
+        "t_n": (
+            "tн", "t_н", "расчетная температура наружного воздуха",
+            "температура наружного воздуха", "температура наиболее холодной пятидневки",
+        ),
+    }
 
-        # Сначала пробуем найти в таблицах
+    def _normalized(value: Any) -> str:
+        return re.sub(r"\s+", " ", str(value or "").lower().replace("ё", "е")).strip()
+
+    def _parse_number(value: Any) -> float | None:
+        """Извлекает одно числовое значение из ячейки без угадывания столбца."""
+        match = re.search(r"[-+]?\d+(?:[.,]\d+)?", str(value or ""))
+        if not match:
+            return None
         try:
-            tables = self._search_tables(
-                f"{city} климатические параметры температура отопительный период",
-                top_k=10
-            )
-            if tables:
-                from core.table_extractor import find_city_in_tables
-                found = find_city_in_tables(tables, city_lower)
-                if found:
-                    row_text = found.get("row_text", "")
-                    numbers = re.findall(r"-?\d+[.,]?\d*", row_text)
-                    if len(numbers) >= 2:
-                        try:
-                            t_ot = float(numbers[0].replace(",", "."))
-                            z_ot = int(float(numbers[1].replace(",", ".")))
-                            gsop = (t_v - t_ot) * z_ot
-                            return {
-                                "answer": (
-                                    f"🌍 **ГСОП для {city.capitalize()} = {gsop:.0f} °C·сут**\n\n"
-                                    f"📊 Из таблицы: t_от={t_ot:.1f}°C, z_от={z_ot} сут\n"
-                                    f"({t_v:.1f} - {t_ot:.1f}) × {z_ot} = {gsop:.0f}"
-                                ),
-                                "result": gsop,
-                                "sources": [{"doc_name": found.get("table", {}).source}],
-                                "confidence": 0.9,
-                            }
-                        except (ValueError, IndexError):
-                            pass
-        except (AttributeError, KeyError, TypeError, ValueError):
-            pass
+            return float(match.group(0).replace(",", "."))
+        except ValueError:
+            return None
 
-        # Fallback на встроенные данные
-        data = CLIMATE_DATA.get(city_lower)
-        if not data:
-            for known_city in CLIMATE_DATA:
-                if known_city in city_lower:
-                    data = CLIMATE_DATA[known_city]
-                    break
+    def _matches_city(candidate: str, known_city: str) -> bool:
+        """Сравнивает названия городов по словам, не путая Томск с Омском."""
+        candidate = _normalized(candidate).replace("-", " ")
+        known_city = _normalized(known_city).replace("-", " ")
+        return bool(re.search(rf"(?<![а-яa-z]){re.escape(known_city)}(?![а-яa-z])", candidate))
+    def calculate_gsop_from_table(self, city: str, t_v: float = 20.0) -> dict[str, Any]:
+        """Рассчитывает ГСОП по явно подписанным данным климатической таблицы."""
+        table_values = self._climate_values_from_tables(city, ("t_ot", "z_ot"))
+        source: dict[str, Any] | None = None
+        if table_values:
+            data, source = table_values
+        elif self._allow_builtin_fallback():
+            data = self._builtin_climate(city)
+            if data:
+                source = {"doc_name": "Контрольный встроенный набор (требуется сверка со СП 131.13330)"}
+        else:
+            data = None
 
         if not data:
-            return {
-                "answer": f"❌ Климатические данные для города **{city}** не найдены.\n\nДоступные города: {', '.join(list(CLIMATE_DATA.keys())[:5])}...",
-                "sources": [],
-                "tables": [],
-                "confidence": 0.0,
-                "needs_clarification": True,
-                "questions": [f"Укажите город из списка."],
-                "query_type": "calculation",
-            }
-
+            return self._missing_climate_response(city, ("t_ot", "z_ot"))
         t_ot = data["t_ot"]
-        z_ot = data["z_ot"]
+        z_ot = int(data["z_ot"])
         gsop = (t_v - t_ot) * z_ot
-
+        source_name = str((source or {}).get("doc_name") or "Таблица климатических данных")
+        source_line = f"📚 Источник: {source_name}"
         return {
             "answer": (
-                f"🌍 **ГСОП для {city.capitalize()} = {gsop:.0f} °C·сут**\n\n"
+                f"### ГСОП для {city.capitalize()}\n\n"
                 f"📊 Исходные данные:\n"
                 f"- t_в = {t_v:.1f} °C\n"
                 f"- t_от = {t_ot:.1f} °C\n"
                 f"- z_от = {z_ot} сут\n\n"
-                f"🔢 Расчёт: ({t_v:.1f} - {t_ot:.1f}) × {z_ot} = {gsop:.0f}\n\n"
-                f"📚 Источник: СП 131.13330 (встроенные данные)"
+                f"🔢 Расчёт: ({t_v:.1f} - {t_ot:.1f}) × {z_ot} = **{gsop:.0f} °C·сут**\n\n"
+                f"{source_line}"
             ),
             "result": gsop,
-            "sources": [{"doc_name": "СП 131.13330"}],
+            "sources": [source or {"doc_name": source_name}],
             "tables": [],
             "formulas": [{"raw": "(t_в - t_от) × z_от", "name": "ГСОП", "source": "СП 131.13330"}],
-            "confidence": 0.95,
+            "confidence": 0.9 if table_values else 0.55,
             "needs_clarification": False,
             "questions": [],
             "query_type": "calculation",
         }
 
-    @staticmethod
-    def calculate_ventilation_from_table(self, city: str, air_flow: float) -> dict[str, Any]:
+
+    def calculate_ventilation_from_table(self, city: str, air_flow: float, t_v: float = 20.0) -> dict[str, Any]:
         """Рассчитывает расход теплоты на вентиляцию."""
-        city_lower = city.lower().strip()
-        data = CLIMATE_DATA.get(city_lower)
+        table_values = self._climate_values_from_tables(city, ("t_n",))
+        source: dict[str, Any] | None = None
+        if table_values:
+            data, source = table_values
+        elif self._allow_builtin_fallback():
+            data = self._builtin_climate(city)
+            if data:
+                source = {"doc_name": "Контрольный встроенный набор (требуется сверка со СП 131.13330)"}
+        else:
+            data = None
 
         if not data:
-            for known_city in CLIMATE_DATA:
-                if known_city in city_lower:
-                    data = CLIMATE_DATA[known_city]
-                    break
-
-        if not data:
-            return {
-                "answer": f"❌ Климатические данные для {city} не найдены.",
-                "sources": [],
-                "tables": [],
-                "confidence": 0.0,
-                "needs_clarification": True,
-                "questions": ["Уточните город."],
-                "query_type": "calculation",
-            }
+            return self._missing_climate_response(city, ("t_n",))
 
         t_n = data["t_n"]
-        t_v = 20.0
         q_vent = 0.335 * air_flow * (t_v - t_n)
+        source_name = str((source or {}).get("doc_name") or "Таблица климатических данных")
 
         return {
             "answer": (
-                f"💨 **Расход теплоты на вентиляцию для {city.capitalize()} = {q_vent:.0f} Вт**\n\n"
+                f"### Расход теплоты на вентиляцию для {city.capitalize()}\n\n"
                 f"📊 Исходные данные:\n"
                 f"- L = {air_flow:.0f} м³/ч\n"
                 f"- t_в = {t_v:.1f} °C\n"
                 f"- t_н = {t_n:.1f} °C (из климатических данных)\n\n"
-                f"🔢 Расчёт: 0.335 × {air_flow:.0f} × ({t_v:.1f} - {t_n:.1f}) = {q_vent:.0f} Вт\n\n"
-                f"📚 Источник: СП 60.13330 + СП 131.13330"
+                f"🔢 Расчёт: 0.335 × {air_flow:.0f} × ({t_v:.1f} - {t_n:.1f}) = **{q_vent:.0f} Вт**\n\n"
+                f"📚 Источники: СП 60.13330; {source_name}"
             ),
             "result": q_vent,
-            "sources": [{"doc_name": "СП 60.13330 / СП 131.13330"}],
+            "sources": [{"doc_name": "СП 60.13330"}, source or {"doc_name": source_name}],
             "tables": [],
             "formulas": [
                 {"raw": "Q_в = 0.335 × L × (t_в - t_н)", "name": "Расход теплоты на вентиляцию",
                  "source": "СП 60.13330"}
             ],
-            "confidence": 0.9,
+            "confidence": 0.9 if table_values else 0.55,
             "needs_clarification": False,
             "questions": [],
             "query_type": "calculation",
         }
 
-    @staticmethod
-    def calculate_heat_loss_from_table(self, city: str, area: float, resistance: float) -> dict[str, Any]:
+    def calculate_heat_loss_from_table(self, city: str, area: float, resistance: float, t_v: float = 20.0) -> dict[str, Any]:
         """Рассчитывает теплопотери через ограждение."""
-        city_lower = city.lower().strip()
-        data = CLIMATE_DATA.get(city_lower)
-
+        table_values = self._climate_values_from_tables(city, ("t_n",))
+        source: dict[str, Any] | None = None
+        if table_values:
+            data, source = table_values
+        elif self._allow_builtin_fallback():
+            data = self._builtin_climate(city)
+            if data:
+                source = {"doc_name": "Контрольный встроенный набор (требуется сверка со СП 131.13330)"}
+        else:
+            data = None
         if not data:
-            for known_city in CLIMATE_DATA:
-                if known_city in city_lower:
-                    data = CLIMATE_DATA[known_city]
-                    break
-
-        if not data:
-            return {
-                "answer": f"❌ Климатические данные для {city} не найдены.",
-                "sources": [],
-                "tables": [],
-                "confidence": 0.0,
-                "needs_clarification": True,
-                "questions": ["Уточните город."],
-                "query_type": "calculation",
-            }
+            return self._missing_climate_response(city, ("t_n",))
 
         t_n = data["t_n"]
-        t_v = 20.0
         delta_t = t_v - t_n
         q_loss = (area * delta_t) / resistance
+        source_name = str((source or {}).get("doc_name") or "Таблица климатических данных")
 
         return {
             "answer": (
-                f"🔥 **Теплопотери для {city.capitalize()} = {q_loss:.0f} Вт**\n\n"
+                f"### Теплопотери для {city.capitalize()}\n\n"
                 f"📊 Исходные данные:\n"
                 f"- A = {area:.1f} м²\n"
                 f"- R = {resistance:.3f} м²·°C/Вт\n"
                 f"- t_в = {t_v:.1f} °C\n"
                 f"- t_н = {t_n:.1f} °C (из климатических данных)\n"
                 f"- Δt = {delta_t:.1f} °C\n\n"
-                f"🔢 Расчёт: ({area:.1f} × {delta_t:.1f}) / {resistance:.3f} = {q_loss:.0f} Вт\n\n"
-                f"📚 Источник: СП 50.13330 + СП 131.13330"
+                f"🔢 Расчёт: ({area:.1f} × {delta_t:.1f}) / {resistance:.3f} = **{q_loss:.0f} Вт**\n\n"
+                f"📚 Источники: СП 50.13330; {source_name}"
             ),
             "result": q_loss,
-            "sources": [{"doc_name": "СП 50.13330 / СП 131.13330"}],
+            "sources": [{"doc_name": "СП 50.13330"}, source or {"doc_name": source_name}],
             "tables": [],
             "formulas": [
                 {"raw": "Q = (A × Δt) / R", "name": "Теплопотери через ограждение", "source": "СП 50.13330"}
             ],
-            "confidence": 0.9,
+            "confidence": 0.9 if table_values else 0.55,
             "needs_clarification": False,
             "questions": [],
             "query_type": "calculation",
@@ -231,3 +213,99 @@ class TableCalculator:
 def patch_app_with_table_calculator():
     """Заглушка для совместимости."""
     pass
+  @staticmethod
+    def _column_index(headers: list[Any], parameter: str) -> int | None:
+        """Находит нужный климатический столбец по заголовку таблицы."""
+        aliases = CLIMATE_HEADER_ALIASES.get(parameter, ())
+        for index, header in enumerate(headers or []):
+            normalized_header = _normalized(header).replace("_", "")
+            if any(alias.replace("_", "") in normalized_header for alias in aliases):
+                return index
+        return None
+
+    def _climate_values_from_tables(
+        self,
+        city: str,
+        required: tuple[str, ...],
+    ) -> tuple[dict[str, float], dict[str, Any]] | None:
+        """Берёт климатические параметры строго из подписанных столбцов.
+
+        Прежняя версия брала первые два числа из строки. В нормативных
+        таблицах это мог быть номер строки или координата, поэтому расчёт
+        становился неверным. Здесь значение принимается только если найден
+        и город, и заголовок соответствующего столбца.
+        """
+        tables = self._search_tables(
+            f"{city} климатические параметры температура отопительный период",
+            top_k=10,
+        )
+        if not tables:
+            return None
+
+        try:
+            from core.table_extractor import find_city_in_tables
+        except ImportError:
+            return None
+
+        for table in tables:
+            found = find_city_in_tables([table], city)
+            if not found:
+                continue
+
+            row = list(found.get("row") or [])
+            values: dict[str, float] = {}
+            for parameter in required:
+                column = self._column_index(list(table.headers or []), parameter)
+                if column is None or column >= len(row):
+                    break
+                value = _parse_number(row[column])
+                if value is None:
+                    break
+                values[parameter] = value
+
+            if len(values) == len(required):
+                source = {
+                    "doc_name": table.source or "Таблица климатических данных",
+                    "table_title": table.title,
+                    "metadata": dict(table.metadata or {}),
+                }
+                return values, source
+
+        return None
+
+    @staticmethod
+    def _builtin_climate(city: str) -> dict[str, float] | None:
+        """Возвращает fallback только при точном совпадении города."""
+        city_normalized = _normalized(city).replace("-", " ")
+        for known_city, data in CLIMATE_DATA.items():
+            if _matches_city(city_normalized, known_city):
+                return dict(data)
+        return None
+
+    @staticmethod
+    def _allow_builtin_fallback() -> bool:
+        """Fallback выключен по умолчанию: ответы должны опираться на базу."""
+        return os.getenv("ALLOW_BUILTIN_CLIMATE_FALLBACK", "false").lower() == "true"
+
+    @staticmethod
+    def _missing_climate_response(city: str, required: tuple[str, ...]) -> dict[str, Any]:
+        labels = {
+            "t_ot": "t_от — среднюю температуру отопительного периода",
+            "z_ot": "z_от — продолжительность отопительного периода",
+            "t_n": "t_н — расчётную температуру наружного воздуха",
+        }
+        missing = ", ".join(labels.get(value, value) for value in required)
+        return {
+            "answer": (
+                f"⚠️ В подключённой базе не найдены климатические данные для города «{city}».\n\n"
+                f"Для расчёта нужны: {missing}. Загрузите таблицу СП 131.13330 "
+                "или передайте эти параметры явно."
+            ),
+            "sources": [],
+            "tables": [],
+            "formulas": [],
+            "confidence": 0.0,
+            "needs_clarification": True,
+            "questions": ["Укажите недостающие климатические параметры или загрузите источник."],
+            "query_type": "calculation",
+        }
