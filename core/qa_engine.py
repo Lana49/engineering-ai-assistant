@@ -11,7 +11,9 @@ import math
 import os
 import pickle
 import re
-from dataclasses import dataclass, field
+import tempfile
+from collections.abc import Mapping
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, Optional
 import logging
@@ -19,6 +21,7 @@ import numpy as np
 import requests
 
 from core.table_extractor import extract_tables_from_results, tables_to_dicts
+from core.prompts import get_system_prompt
 
 try:
     from dotenv import load_dotenv
@@ -36,14 +39,12 @@ try:
 except ImportError:
     SentenceTransformer = None
 
-try:
-    import google.genai as genai
-    GENAI_AVAILABLE = True
-except ImportError:
-    genai = None
-    GENAI_AVAILABLE = False
-
 logger = logging.getLogger(__name__)
+DOCUMENT_REFERENCE_RE = re.compile(
+    r"(?<!\w)(СП|СНиП|ГОСТ(?:\s+Р)?)\s*(\d+(?:[.-]\d+)*)", re.IGNORECASE,
+)
+
+
 @dataclass(slots=True)
 class SearchResult:
     """Результат поиска."""
@@ -55,6 +56,33 @@ class SearchResult:
     lexical_score: float = 0.0
     filepath: str = ""
     metadata: dict[str, Any] = field(default_factory=dict)
+
+    def to_dict(self) -> dict[str, Any]:
+        """Словарь для совместимого обмена данными с оркестратором."""
+        return {
+            "doc_name": self.doc_name, "chunk_id": self.chunk_id,
+            "text": self.text, "score": self.score,
+            "semantic_score": self.semantic_score, "lexical_score": self.lexical_score,
+            "filepath": self.filepath, "metadata": dict(self.metadata),
+        }
+
+    @classmethod
+    def from_value(cls, value: SearchResult | Mapping[str, Any]) -> SearchResult:
+        """Принимает публичный SearchResult или его словарное представление."""
+        if isinstance(value, cls):
+            return value
+        if not isinstance(value, Mapping):
+            raise TypeError("Результат поиска должен быть SearchResult или словарём")
+        return cls(
+            doc_name=str(value.get("doc_name", "")),
+            chunk_id=int(value.get("chunk_id", 0) or 0),
+            text=str(value.get("text", "") or ""),
+            score=float(value.get("score", 0) or 0),
+            semantic_score=float(value.get("semantic_score", 0) or 0),
+            lexical_score=float(value.get("lexical_score", 0) or 0),
+            filepath=str(value.get("filepath", "")),
+            metadata=dict(value.get("metadata", {}) or {}),
+        )
 
 
 @dataclass(slots=True)
@@ -88,8 +116,8 @@ class QASystem:
     ):
         self.use_llm = use_llm
         self.llm_provider = (llm_provider or "ollama").strip().lower()
-        self.top_k = top_k
-        self.min_score = min_score
+        self.top_k = max(1, int(top_k))
+        self.min_score = max(0.0, min(1.0, float(min_score)))
 
         self.ollama_base_url = ollama_base_url.rstrip("/")
         self.ollama_model = model_name if model_name and self.llm_provider in {"ollama", "mixed"} else ollama_model
@@ -103,13 +131,14 @@ class QASystem:
         self.documents: list[dict[str, Any]] = []
         self.chunks: list[dict[str, Any]] = []
 
-        self.embedding_model: Optional[SentenceTransformer] = None  # Исправлено
-        self.chunk_embeddings: Any = None  # Исправлено
-        self.vectorizer: Optional[TfidfVectorizer] = None
+        self.embedding_model: Any = None
+        self.chunk_embeddings: Any = None
+        self.vectorizer: Any = None
         self.tfidf_matrix: Any = None
 
         self.is_ready = False
         self.llm_available = False
+        self.last_llm_error = ""
 
         self.last_index_diagnostics: dict[str, Any] = {}
         self.last_save_diagnostics: dict[str, Any] = {}
@@ -154,7 +183,7 @@ class QASystem:
             print(f"📥 Загружаю embedding model: {self.embedding_model_name}")
             self.embedding_model = SentenceTransformer(self.embedding_model_name)
             print("✅ Embedding model загружена")
-        except Exception as e:
+        except Exception:
             logger.exception("Не удалось загрузить embedding model %s", self.embedding_model_name)
             self.embedding_model = None
 
@@ -166,7 +195,24 @@ class QASystem:
             return False
 
     def is_ollama_available(self) -> bool:
-        return self.is_ollama_alive()
+        """Проверяет не только сервер, но и наличие настроенной модели."""
+        try:
+            response = requests.get(f"{self.ollama_base_url}/api/tags", timeout=2)
+            response.raise_for_status()
+            data = response.json()
+            names = {
+                str(item.get("name") or item.get("model") or "")
+                for item in data.get("models", []) if isinstance(item, dict)
+            }
+            wanted = self.ollama_model if ":" in self.ollama_model else self.ollama_model + ":latest"
+            available = self.ollama_model in names or wanted in names
+            self.last_llm_error = "" if available else f"В Ollama не установлена модель {self.ollama_model}"
+            self.llm_available = available
+            return available
+        except (requests.RequestException, ValueError, TypeError, AttributeError) as exc:
+            self.last_llm_error = f"Ollama недоступна: {type(exc).__name__}: {exc}"
+            self.llm_available = False
+            return False
 
     def _validate_llm_config(self) -> None:
         self.llm_available = False
@@ -176,7 +222,7 @@ class QASystem:
             return
 
         if self.llm_provider == "ollama":
-            self.llm_available = self.is_ollama_alive()
+            self.llm_available = self.is_ollama_available()
             print(
                 f"{'✅' if self.llm_available else '⚠️'} "
                 f"Ollama {'доступен' if self.llm_available else 'недоступен'} "
@@ -184,7 +230,7 @@ class QASystem:
             )
 
         elif self.llm_provider == "mixed":
-            self.llm_available = self.is_ollama_alive()
+            self.llm_available = self.is_ollama_available()
             print(
                 f"{'✅' if self.llm_available else '⚠️'} Mixed LLM provider, "
                 f"available={self.llm_available}"
@@ -200,14 +246,22 @@ class QASystem:
         if not self.use_llm:
             return "none"
 
-        if self.llm_provider == "ollama":
-            return "ollama" if self.is_ollama_alive() else "none"
+        if self.llm_provider in {"ollama", "mixed"}:
+            return "ollama" if self.is_ollama_available() else "none"
 
         return "none"
+
+    def get_selected_provider(self) -> str:
+        """Возвращает фактически доступный провайдер (Ollama либо none)."""
+        return self._select_provider()
 
     def build_index(self, parsed_docs: list[dict[str, Any]]) -> bool:
         """Строит индекс по документам с подробной диагностикой батчей."""
         self._reset_index_diagnostics()
+        self.is_ready = False
+        self.vectorizer = None
+        self.tfidf_matrix = None
+        self.chunk_embeddings = None
 
         try:
             self.documents = parsed_docs or []
@@ -274,8 +328,14 @@ class QASystem:
 
             # TF-IDF
             if TfidfVectorizer is not None:
-                self.vectorizer = TfidfVectorizer(max_features=50000,ngram_range=(1, 2),min_df=1,sublinear_tf=True,)
-                self.tfidf_matrix = self.vectorizer.fit_transform(texts)
+                # Символьные n-граммы находят русские формы «вентиляция»/
+                # «вентиляции» без дополнительной морфологической библиотеки.
+                vectorizer = TfidfVectorizer(
+                    max_features=50000, analyzer="char_wb", ngram_range=(3, 5),
+                    min_df=1, sublinear_tf=True,
+                )
+                self.tfidf_matrix = vectorizer.fit_transform(texts)
+                self.vectorizer = vectorizer
                 self.last_index_diagnostics["tfidf_built"] = True
                 print(f"✅ TF-IDF построен: shape={self.tfidf_matrix.shape}")
             else:
@@ -310,18 +370,28 @@ class QASystem:
                         f"items={len(batch_texts)} range=[{start}:{end}]"
                     )
 
-                    batch_embeddings = self.embedding_model.encode(
-                        batch_texts,
-                        normalize_embeddings=True,
-                        show_progress_bar=False,
-                    )
-                    all_embeddings.append(np.asarray(batch_embeddings, dtype=np.float32))  # type: ignore
+                    try:
+                        batch_embeddings = np.asarray(self.embedding_model.encode(
+                            batch_texts,
+                            normalize_embeddings=True,
+                            show_progress_bar=False,
+                        ), dtype=np.float32)
+                        if batch_embeddings.ndim != 2 or len(batch_embeddings) != len(batch_texts):
+                            raise ValueError("Модель вернула неверную размерность эмбеддингов")
+                        if not np.isfinite(batch_embeddings).all():
+                            raise ValueError("Модель вернула NaN/inf в эмбеддингах")
+                        all_embeddings.append(batch_embeddings)
+                    except Exception as exc:
+                        logger.exception("Ошибка эмбеддингов; сохраняется лексический поиск")
+                        self.last_index_diagnostics["embedding_error"] = str(exc)
+                        all_embeddings.clear()
+                        break
 
                 # Объединяем все батчи
                 self.chunk_embeddings = np.vstack(all_embeddings) if all_embeddings else None  # type: ignore
 
                 print(
-                    f"✅ ЭМБЕДДИНГИ ПОСТРОЕНЫ: "
+                    f"{'✅ ЭМБЕДДИНГИ ПОСТРОЕНЫ' if self.chunk_embeddings is not None else '⚠️ ЭМБЕДДИНГИ НЕДОСТУПНЫ'}: "
                     f"shape={None if self.chunk_embeddings is None else self.chunk_embeddings.shape}"
                 )
 
@@ -332,8 +402,11 @@ class QASystem:
                 elif self.embedding_model is None:
                     print("⚠️ Эмбеддинги не построены: embedding model не загружена")
 
-            self.is_ready = True
-            self.last_index_diagnostics["success"] = True
+            self.is_ready = self.tfidf_matrix is not None or self.chunk_embeddings is not None
+            self.last_index_diagnostics["success"] = self.is_ready
+            if not self.is_ready:
+                self.last_index_diagnostics["error"] = "no_search_index"
+                return False
             print("✅ Индекс успешно построен")
             return True
 
@@ -381,6 +454,7 @@ class QASystem:
             "error": "",
         }
 
+        temporary_path: Path | None = None
         try:
             index_path = Path(index_path)
             index_path.parent.mkdir(parents=True, exist_ok=True)
@@ -416,8 +490,18 @@ class QASystem:
                 print(f"   embeddings_shape={self.chunk_embeddings.shape}")
             print(f"   tfidf_present={self.tfidf_matrix is not None}")
 
-            with open(index_path, "wb") as f:
+            # Только полностью записанный файл заменяет рабочий индекс.
+            # Временный файл находится на том же диске для атомарного replace.
+            with tempfile.NamedTemporaryFile(
+                mode="wb", dir=index_path.parent, prefix=f".{index_path.name}.",
+                suffix=".tmp", delete=False,
+            ) as f:
+                temporary_path = Path(f.name)
                 pickle.dump(data, f, protocol=pickle.HIGHEST_PROTOCOL)
+                f.flush()
+                os.fsync(f.fileno())
+            temporary_path.replace(index_path)
+            temporary_path = None
 
             file_exists = index_path.exists()
             file_size = index_path.stat().st_size if file_exists else 0
@@ -439,10 +523,14 @@ class QASystem:
 
         except Exception as e:
             self.last_save_diagnostics["error"] = str(e)
-            print(f"❌ Ошибка сохранения индекса: {e}")
-            import traceback
-            traceback.print_exc()
+            logger.exception("Ошибка сохранения индекса %s", index_path)
             return False
+        finally:
+            if temporary_path is not None:
+                try:
+                    temporary_path.unlink(missing_ok=True)
+                except OSError:
+                    logger.warning("Не удалось удалить временный файл индекса %s", temporary_path, exc_info=True)
 
     def load_index(self, index_path: str | Path) -> bool:
         """Загружает индекс с диска."""
@@ -472,19 +560,38 @@ class QASystem:
             with open(index_path, "rb") as f:
                 data = pickle.load(f)
 
-            self.documents = data.get("documents", [])
-            self.chunks = data.get("chunks", [])
-            self.top_k = data.get("top_k", self.top_k)
-            self.min_score = data.get("min_score", self.min_score)
-            self.embedding_model_name = data.get("embedding_model_name", self.embedding_model_name)
-            self.use_embeddings = data.get("use_embeddings", self.use_embeddings)
-            self.semantic_weight = data.get("semantic_weight", self.semantic_weight)
-            self.lexical_weight = data.get("lexical_weight", self.lexical_weight)
-            self.chunk_embeddings = data.get("chunk_embeddings")
-            self.vectorizer = data.get("vectorizer")
-            self.tfidf_matrix = data.get("tfidf_matrix")
-            self.ollama_model = data.get("ollama_model", self.ollama_model)
-            self.llm_provider = data.get("llm_provider", self.llm_provider)
+            if not isinstance(data, dict):
+                raise ValueError("Неверный формат файла индекса")
+            documents = data.get("documents", [])
+            chunks = data.get("chunks", [])
+            if not isinstance(documents, list) or not isinstance(chunks, list):
+                raise ValueError("documents/chunks должны быть списками")
+            if not chunks or any(not isinstance(chunk, dict) for chunk in chunks):
+                raise ValueError("В индексе отсутствуют корректные фрагменты")
+            vectorizer = data.get("vectorizer")
+            tfidf_matrix = data.get("tfidf_matrix")
+            if vectorizer is None or not callable(getattr(vectorizer, "transform", None)):
+                tfidf_matrix = None
+            if tfidf_matrix is not None and tfidf_matrix.shape[0] != len(chunks):
+                raise ValueError("Число строк TF-IDF не совпадает с числом фрагментов")
+            embeddings = data.get("chunk_embeddings")
+            stored_model = data.get("embedding_model_name")
+            if embeddings is not None:
+                embeddings = np.asarray(embeddings, dtype=np.float32)
+                if (
+                    not self.use_embeddings or stored_model != self.embedding_model_name
+                    or embeddings.ndim != 2 or len(embeddings) != len(chunks)
+                    or not np.isfinite(embeddings).all()
+                ):
+                    logger.warning("Эмбеддинги индекса несовместимы с текущими настройками; используется TF-IDF")
+                    embeddings = None
+            if tfidf_matrix is None and (embeddings is None or self.embedding_model is None):
+                raise ValueError("В индексе нет доступных поисковых данных; перестройте индекс")
+            # Настройки текущего запуска и уже загруженную модель нельзя
+            # заменять настройками из старого pickle.
+            self.documents, self.chunks = documents, chunks
+            self.vectorizer, self.tfidf_matrix = vectorizer, tfidf_matrix
+            self.chunk_embeddings = embeddings
             self.last_index_diagnostics = data.get("diagnostics", {})
 
             self.is_ready = bool(self.chunks)
@@ -502,9 +609,7 @@ class QASystem:
 
         except Exception as e:
             self.last_load_diagnostics["error"] = str(e)
-            print(f"❌ Ошибка загрузки индекса: {e}")
-            import traceback
-            traceback.print_exc()
+            logger.exception("Ошибка загрузки индекса %s", index_path)
             return False
 
     def get_diagnostics(self) -> dict[str, Any]:
@@ -536,48 +641,109 @@ class QASystem:
         if not query:
             return []
 
-        top_k = top_k or self.top_k
+        document_refs = self._document_references(query)
+        allowed = np.ones(len(self.chunks), dtype=bool)
+        if document_refs:
+            allowed = np.asarray([
+                self._matches_requested_document(chunk.get("doc_name", ""), document_refs)
+                for chunk in self.chunks
+            ])
+            if not allowed.any():
+                return []
+        # Номер СП обозначает фильтр документа, а не тему ответа. Иначе
+        # библиография с этим номером вытесняет содержательный нужный пункт.
+        content_query = DOCUMENT_REFERENCE_RE.sub(" ", query)
+        content_query = re.sub(r"\b(?:по|согласно)\s*$", " ", content_query, flags=re.IGNORECASE).strip()
+        lexical_query = content_query or query
+
+        top_k = self.top_k if top_k is None else max(0, int(top_k))
+        if top_k == 0:
+            return []
         lexical_scores = np.zeros(len(self.chunks), dtype=np.float32)  # type: ignore
         semantic_scores = np.zeros(len(self.chunks), dtype=np.float32)  # type: ignore
+        lexical_available = False
+        semantic_available = False
 
         # Лексический поиск (TF-IDF)
         if self.vectorizer is not None and self.tfidf_matrix is not None:
             try:
-                query_vec = self.vectorizer.transform([query])
+                query_vec = self.vectorizer.transform([lexical_query])
                 sim = (self.tfidf_matrix @ query_vec.T).toarray().ravel()
                 lexical_scores = sim.astype(np.float32)  # type: ignore
-            except Exception as e:
-                print(f"⚠️ Ошибка lexical search: {e}")
+                lexical_available = bool(query_vec.nnz)
+            except Exception:
+                logger.exception("Ошибка лексического поиска")
 
         # Семантический поиск (эмбеддинги)
         if (
-                self.embedding_model is not None
+                self.use_embeddings
+                and self.embedding_model is not None
                 and self.chunk_embeddings is not None
                 and len(self.chunk_embeddings) == len(self.chunks)
         ):
             try:
                 q_emb = self.embedding_model.encode(
-                    [query],
+                    [lexical_query],
                     normalize_embeddings=True,
                     show_progress_bar=False,
                 )
                 q_emb = np.asarray(q_emb, dtype=np.float32)[0]  # type: ignore
                 semantic_scores = self.chunk_embeddings @ q_emb  # type: ignore
-            except Exception as e:
-                print(f"⚠️ Ошибка semantic search: {e}")
+                if not np.isfinite(semantic_scores).all():
+                    raise ValueError("Некорректные оценки семантического поиска")
+                semantic_available = True
+            except Exception:
+                logger.exception("Ошибка семантического поиска; используется TF-IDF")
 
         # Гибридная комбинация
-        if self.chunk_embeddings is not None:
-            scores = self.semantic_weight * semantic_scores + self.lexical_weight * lexical_scores
-        else:
+        if semantic_available and lexical_available:
+            semantic_weight = max(0.0, self.semantic_weight)
+            lexical_weight = max(0.0, self.lexical_weight)
+            total_weight = semantic_weight + lexical_weight
+            scores = (
+                (semantic_weight * semantic_scores + lexical_weight * lexical_scores) / total_weight
+                if total_weight else (semantic_scores + lexical_scores) / 2
+            )
+        elif semantic_available:
+            scores = semantic_scores
+        elif lexical_available:
             scores = lexical_scores
+        else:
+            return []
+
+        clause_refs = self._requested_clauses(query)
+        definition_term = self._definition_term(query)
+        normative_query = not definition_term and self._requires_exact_evidence(query)
+        if clause_refs:
+            clause_matches = np.asarray([
+                any(self._has_clause_start(chunk.get("text", ""), clause) for clause in clause_refs)
+                for chunk in self.chunks
+            ])
+            allowed &= clause_matches
+            if not allowed.any():
+                return []
+        for index, chunk in enumerate(self.chunks):
+            if not allowed[index]:
+                scores[index] = -np.inf
+                continue
+            text = chunk.get("text", "")
+            # Точный номер пункта и заголовок определения — сильные
+            # детерминированные признаки, независимые от модели эмбеддингов.
+            if clause_refs and any(self._has_clause_start(text, clause) for clause in clause_refs):
+                scores[index] = max(scores[index], 0.85 + min(max(float(scores[index]), 0), 1) * 0.1)
+            if definition_term and self._has_definition(text, definition_term):
+                scores[index] = max(scores[index], 0.8 + min(max(float(scores[index]), 0), 1) * 0.1)
+            if normative_query and not clause_refs:
+                evidence = self._normative_excerpt(text, query)
+                if evidence and self._topic_support_score(evidence, query) >= 0.9:
+                    scores[index] = max(scores[index], 0.85 + min(max(float(scores[index]), 0), 1) * 0.1)
 
         ranked_ids = np.argsort(scores)[::-1][:top_k]  # type: ignore
         results: list[SearchResult] = []
 
         for idx in ranked_ids:
             score = float(scores[idx])
-            if score < self.min_score:
+            if not np.isfinite(score) or score <= 0 or score < self.min_score:
                 continue
 
             chunk = self.chunks[idx]
@@ -596,6 +762,130 @@ class QASystem:
 
         return results
 
+    @staticmethod
+    def _document_references(text: str) -> list[tuple[str, str]]:
+        """Извлекает обозначения документов, включая сокращённое «СП 60»."""
+        return [(re.sub(r"\s+", "", kind).lower(), number)
+                for kind, number in DOCUMENT_REFERENCE_RE.findall(text or "")]
+
+    @classmethod
+    def _matches_requested_document(cls, name: str, references: list[tuple[str, str]]) -> bool:
+        for kind, number in cls._document_references(name):
+            if any(kind == requested_kind and (number == requested_number or number.startswith(requested_number + "."))
+                   for requested_kind, requested_number in references):
+                return True
+        return False
+
+    @staticmethod
+    def _requested_clauses(query: str) -> list[str]:
+        return re.findall(r"(?:\bпункт(?:а|е|ы|ов)?|\bп\.)\s*(\d+(?:\.\d+)+)(?!\d)", query, flags=re.IGNORECASE)
+
+    @staticmethod
+    def _has_clause_start(text: str, clause: str) -> bool:
+        return bool(re.search(r"(?:^|\n)\s*" + re.escape(clause) + r"(?:\s|[)]|$)", text))
+
+    @staticmethod
+    def _definition_term(question: str) -> str:
+        match = re.search(
+            r"(?:что\s+(?:такое|означает|значит)|определение(?:\s+термина)?|^термин|^понятие)\s+(.+)",
+            question, flags=re.IGNORECASE,
+        )
+        if not match:
+            return ""
+        term = DOCUMENT_REFERENCE_RE.sub("", match.group(1))
+        # Условия поиска и второе предложение не входят в название термина.
+        term = re.split(r"[?!.;\n]|\s+(?:по|согласно|из|в)\s+", term, maxsplit=1, flags=re.IGNORECASE)[0]
+        term = re.sub(r"\s+(?:по|согласно|из|в)\s*$", "", term, flags=re.IGNORECASE)
+        return term.strip(" \t?!.«»\"'").lower()
+
+    @classmethod
+    def _has_definition(cls, text: str, term: str) -> bool:
+        return bool(cls._definition_excerpt(text, term))
+
+    @staticmethod
+    def _evidence_units(text: str) -> list[str]:
+        """Сохраняет условия числовой нормы вместе с её пунктом."""
+        # Не разрезаем пункт на отдельные предложения: это теряет исключения.
+        numbered = bool(re.search(r"(?:^|\n)\s*\d+(?:\.\d+)+\s+", text or ""))
+        boundary = r"\n(?=\s*\d+(?:\.\d+)+\s+)" if numbered else r"\n\s*\n"
+        return [part.strip() for part in re.split(boundary, text or "") if part.strip()]
+
+    @classmethod
+    def _definition_excerpt(cls, text: str, term: str) -> str:
+        """Прямое определение с заголовком; упоминание/ссылка недостаточны."""
+        if not term:
+            return ""
+        pattern = re.compile(
+            r"(?:^|\n|(?<=[.!?])\s+)\s*(?:\d+(?:\.\d+)*\s+)?"
+            + re.escape(term) + r"\s*(?::|[—–]|\s-\s|\bэто\s)\s*(\S.+)",
+            re.IGNORECASE,
+        )
+        for unit in cls._evidence_units(text):
+            match = pattern.search(unit)
+            if not match:
+                continue
+            prefix = unit[:match.start()]
+            if re.search(r"библиограф|нормативные\s+ссылки", prefix, re.IGNORECASE):
+                continue
+            value = match.group(1)
+            if re.match(r"(?:см\.\s*|по\s+|согласно\s+)?(?:ГОСТ|СП|СНиП|\[\d+\])", value, re.IGNORECASE):
+                continue
+            return unit[match.start():].strip()
+        return ""
+
+    @classmethod
+    def _requires_exact_evidence(cls, question: str) -> bool:
+        return bool(cls._definition_term(question) or cls._document_references(question)
+                    or cls._requested_clauses(question) or re.search(
+                        r"норм[аыуе]|норматив|требован|требует|допуска|допустим|"
+                        r"должн|следует|минимальн|максимальн|не\s+(?:менее|более)",
+                        question, re.IGNORECASE,
+                    ))
+
+    @classmethod
+    def _topic_support_score(cls, text: str, question: str) -> float:
+        query = DOCUMENT_REFERENCE_RE.sub("", question)
+        query = re.sub(r"(?:пункт\w*|п\.)\s*\d+(?:\.\d+)*", "", query, flags=re.IGNORECASE)
+        generic = ("како", "каку", "каки", "кака", "определ", "такое", "означ", "значит",
+                   "термин", "поняти", "соглас", "треб", "норм", "допус", "долж", "следу", "найти",
+                   "минималь", "максималь", "обеспеч", "предусматр", "явля", "составля")
+        words = cls._query_terms(query) - {"при", "или", "либо", "более", "менее", "пункт", "такой"}
+        stems = {word[:max(4, min(7, len(word) - 2))] for word in words
+                 if not word.isdigit() and not word.startswith(generic)}
+        if not stems:
+            return float(bool(cls._requested_clauses(question)))
+        lower = text.lower().replace("ё", "е")
+        hits = sum(stem.replace("ё", "е") in lower for stem in stems)
+        return hits / len(stems)
+
+    @classmethod
+    def _has_topic_support(cls, text: str, question: str) -> bool:
+        return cls._topic_support_score(text, question) >= 0.5
+
+    @classmethod
+    def _normative_excerpt(cls, text: str, question: str) -> str:
+        clauses = cls._requested_clauses(question)
+        candidates = []
+        for unit in cls._evidence_units(text):
+            if re.match(r"(?:\[\d+\]\s*)?(?:ГОСТ|СП|СНиП)\s*\d", unit, re.IGNORECASE):
+                continue
+            if re.search(r"^(?:\d+\s+)?(?:Библиография|Нормативные ссылки)\b", unit, re.IGNORECASE):
+                continue
+            if clauses:
+                if any(cls._has_clause_start(unit, clause) for clause in clauses):
+                    return unit
+                continue
+            if not cls._has_topic_support(unit, question):
+                continue
+            if not re.search(r"должн|требует|следует|необходим|допуска|не\s+(?:менее|более)|"
+                             r"принима[ею]|предусматр|устанавлива|запрещ", unit, re.IGNORECASE):
+                continue
+            candidates.append(unit)
+        if not candidates:
+            return ""
+        # Только выбор, без генерации или пересказа числовых ограничений.
+        return max(candidates, key=lambda unit: cls._topic_support_score(unit, question))
+
     def answer(
         self,
         question: str,
@@ -603,37 +893,113 @@ class QASystem:
     ) -> dict[str, Any]:
         """Отвечает на вопрос."""
         results = self.search(question, top_k=top_k)
-        context = self._build_context(results)
+        return self.answer_from_results(question, results)
 
-        if not results:
+    def answer_from_results(
+        self,
+        question: str,
+        results: list[SearchResult | Mapping[str, Any]],
+    ) -> dict[str, Any]:
+        """Отвечает по уже отобранным фрагментам без повторного поиска.
+
+        Определения и нормы возвращаются дословно по прямому свидетельству.
+        Для обычного объяснения проверка ссылок не доказывает все выводы LLM.
+        """
+        normalized_results = self._normalize_search_results(results)
+        # Оркестратор расширяет запрос и может принести фрагменты из других
+        # документов. Повторно применяем ограничения исходного вопроса.
+        document_refs = self._document_references(question)
+        if document_refs:
+            normalized_results = [item for item in normalized_results
+                                  if self._matches_requested_document(item.doc_name, document_refs)]
+        clause_refs = self._requested_clauses(question)
+        if clause_refs:
+            normalized_results = [item for item in normalized_results
+                                  if any(self._has_clause_start(item.text, clause) for clause in clause_refs)]
+        definition_term = self._definition_term(question)
+        exact_evidence = self._requires_exact_evidence(question)
+        if exact_evidence:
+            supported = []
+            for item in normalized_results:
+                excerpt = (self._definition_excerpt(item.text, definition_term) if definition_term
+                           else self._normative_excerpt(item.text, question))
+                if excerpt:
+                    supported.append(replace(item, text=excerpt))
+            normalized_results = supported
+            if not definition_term:
+                # Семантически близкая норма для другого режима (охлаждение /
+                # радиационный обогрев) не должна вытеснять более точное условие.
+                normalized_results.sort(key=lambda item: self._topic_support_score(item.text, question), reverse=True)
+        else:
+            normalized_results = [item for item in normalized_results
+                                  if self._has_topic_support(item.text, question)]
+        if not normalized_results:
             return {
-                "answer": "Не удалось найти релевантную информацию в документах.",
+                "answer": (
+                    "### Краткий ответ\n\nВ базе знаний не найдены фрагменты, "
+                    "достаточные для ответа. "
+                    + ("Прямое определение термина в найденном тексте отсутствует. " if definition_term else "")
+                    + "Уточните документ, раздел или ключевой термин."
+                ),
                 "sources": [],
                 "tables": [],
                 "formulas": [],
                 "provider": "none",
                 "used_llm": False,
                 "context": "",
+                "confidence": 0.0,
+                "needs_clarification": True,
+                "questions": ["Какой документ или раздел нужно проверить?"],
+                "grounded": True,
+                "evidence_mode": "insufficient",
             }
 
+        # Ограничение контекста удерживает запрос в памяти локальной модели.
+        # Копии не изменяют исходные результаты поиска и сам индекс.
+        selected_results = [
+            replace(item, text=(item.text if exact_evidence else self._context_excerpt(item.text, question)),
+                    doc_name=item.doc_name[:200])
+            for item in normalized_results[:max(1, min(self.top_k, 6))]
+        ]
+        context = self._build_context(selected_results)
+        sources = self._build_sources(selected_results)
+        try:
+            tables = tables_to_dicts(extract_tables_from_results(selected_results, min_rows=1))
+        except (AttributeError, KeyError, TypeError, ValueError):
+            logger.exception("Не удалось извлечь таблицы из найденных фрагментов")
+            tables = []
+        payload = {
+            "sources": sources,
+            "tables": tables,
+            "formulas": self._extract_formulas_from_results(selected_results),
+            "context": context,
+            "confidence": round(max(0.0, min(1.0, max(item.score for item in selected_results))), 3),
+            "needs_clarification": False,
+            "questions": [],
+            "grounded": True,
+            "evidence_mode": "exact_excerpt" if exact_evidence else "retrieved_context",
+        }
+        self.last_llm_error = ""
+        if exact_evidence:
+            # Допустимый номер ссылки не даёт LLM права добавлять норму/число.
+            excerpt = selected_results[0].text
+            answer = ("### Краткий ответ\n\nТочная выдержка из найденного документа:\n\n> "
+                      + excerpt.replace("\n", "\n> ") + "\n\n[Источник 1]\n\n### Ограничения\n\n"
+                      "Выдержка приведена без генеративного пересказа. Проверьте область применения "
+                      "и условия в документе; она может не покрывать все условия вопроса.")
+            return {**payload, "answer": answer, "provider": "none", "used_llm": False}
         provider = self._select_provider()
 
         if provider != "none":
             prompt = self._build_prompt(question, context)
-            llm_answer = None
-
-            if provider == "ollama":
-                llm_answer = self._ask_ollama(prompt)
+            llm_answer = self._ask_ollama(prompt)
 
             if llm_answer and self._has_valid_citations(llm_answer, len(selected_results)):
                 return {
+                    **payload,
                     "answer": self._ensure_structured_answer(llm_answer),
-                    "sources": self._build_sources(results),
-                    "tables": tables_to_dicts(extract_tables_from_results(results)),
-                    "formulas": self._extract_formulas_from_results(results),
                     "provider": provider,
                     "used_llm": True,
-                    "context": context,
                 }
 
             if llm_answer:
@@ -641,16 +1007,48 @@ class QASystem:
                     "Ответ %s отклонён: в нём нет корректных ссылок на контекст",
                     provider,
                 )
+                self.last_llm_error = "Ответ модели не содержит корректных ссылок на найденные фрагменты"
         fallback_answer = self._generate_extract_answer(selected_results, question=question)
         return {
+            **payload,
             "answer": fallback_answer,
-            "sources": self._build_sources(results),
-            "tables": tables_to_dicts(extract_tables_from_results(results)),
-            "formulas": self._extract_formulas_from_results(results),
             "provider": "none",
             "used_llm": False,
-            "context": context,
+            "llm_error": self.last_llm_error,
         }
+
+    @staticmethod
+    def _normalize_search_results(
+        results: list[SearchResult | Mapping[str, Any]] | None,
+    ) -> list[SearchResult]:
+        normalized: list[SearchResult] = []
+        seen: set[tuple[str, int, str]] = set()
+        for value in results or []:
+            try:
+                item = SearchResult.from_value(value)
+            except (TypeError, ValueError, OverflowError):
+                logger.warning("Пропущен некорректный результат поиска", exc_info=True)
+                continue
+            key = (item.doc_name, item.chunk_id, item.text)
+            if item.text.strip() and np.isfinite(item.score) and key not in seen:
+                normalized.append(item)
+                seen.add(key)
+        return normalized
+
+    @classmethod
+    def _context_excerpt(cls, text: str, question: str) -> str:
+        """Сохраняет до 1600 символов вокруг предложения по теме вопроса."""
+        if len(text) <= 1600:
+            return text
+        excerpt = cls._select_evidence_excerpt(text, question)
+        position = text.find(excerpt.rstrip("…"))
+        start = max(0, position - 250) if position >= 0 else 0
+        if start:
+            line_start = text.rfind("\n", max(0, start - 150), start)
+            if line_start >= 0:
+                start = line_start + 1
+        end = min(len(text), start + 1580)
+        return ("…\n" if start else "") + text[start:end] + ("\n…" if end < len(text) else "")
 
     def find_definition(self, term: str) -> dict[str, Any]:
         """Ищет определение термина."""
@@ -658,15 +1056,9 @@ class QASystem:
         results = self.search(query, top_k=5)
 
         for item in results:
-            text = item.text
-            if term.lower() in text.lower():
-                sentence = self._best_sentence_for_term(text, term)
-                if sentence:
-                    return {
-                        "found": True,
-                        "definition": sentence,
-                        "source": item.doc_name,
-                    }
+            sentence = self._definition_excerpt(item.text, term)
+            if sentence:
+                return {"found": True, "definition": sentence, "source": item.doc_name}
 
         return {"found": False, "definition": "", "source": ""}
 
@@ -674,11 +1066,19 @@ class QASystem:
     def _build_context(results: list[SearchResult]) -> str:
         """Собирает контекст."""
         parts = []
-        for i, result in enumerate(results, start=1):
+        for i, result in enumerate(results[:6], start=1):
+            metadata = result.metadata or {}
+            location = ""
+            if metadata.get("page"):
+                location = f"; страница {metadata['page']}"
+            elif metadata.get("page_numbers"):
+                location = f"; страницы {metadata['page_numbers']}"
+            if metadata.get("table_title"):
+                location += f"; {metadata['table_title']}"
             parts.append(
-                f"[Источник {i}] {result.doc_name}\n"
-                f"Фрагмент #{result.chunk_id}\n"
-                f"{result.text}"
+                f"[Источник {i}] {result.doc_name[:200]}\n"
+                f"Фрагмент #{result.chunk_id}{location[:150]}\n"
+                f"{result.text[:1600]}"
             )
         return "\n\n".join(parts)
 
@@ -750,14 +1150,18 @@ class QASystem:
                     "model": self.ollama_model,
                     "prompt": prompt,
                     "stream": False,
-                    "options": {"temperature": 0.2},
+                    "options": {"temperature": 0.1, "num_predict": 700, "num_ctx": 8192},
                 },
                 timeout=120,
             )
             response.raise_for_status()
             data = response.json()
-            return (data.get("response") or "").strip() or None
-        except Exception as e:
+            answer = data.get("response")
+            if not isinstance(answer, str):
+                raise ValueError("Ollama вернула ответ без текстового поля response")
+            self.last_llm_error = ""
+            return answer.strip() or None
+        except (requests.RequestException, ValueError, TypeError, AttributeError) as e:
             self.last_llm_error = f"Ollama: {type(e).__name__}: {e}"
             logger.exception("Ошибка запроса к Ollama")
             return None
@@ -766,23 +1170,19 @@ class QASystem:
     def _build_prompt(question: str, context: str) -> str:
         """Формирует промпт."""
         return f"""
-Ты инженерный помощник по строительной документации.
+{get_system_prompt()}
 
-Используй только информацию из контекста ниже.
-Если данных недостаточно, прямо так и скажи.
-Если в тексте есть нормы, значения, таблицы, пункты документов — ссылайся на них в ответе.
-Отвечай на русском языке, кратко и по делу.
-
-Контекст:
+НАЧАЛО КОНТЕКСТА
 {context}
+КОНЕЦ КОНТЕКСТА
 
 Вопрос:
-{question}
+{question[:3000]}
 """.strip()
 
     @staticmethod
     def _has_valid_citations(answer: str, source_count: int) -> bool:
-        """Проверяет, что LLM ссылается только на переданные фрагменты."""
+        """Только синтаксис ссылок, не проверка содержательной обоснованности."""
         references = [
             int(value)
             for value in re.findall(r"\[Источник\s+(\d+)\]", answer, flags=re.IGNORECASE)
@@ -816,24 +1216,37 @@ class QASystem:
         if not clean:
             return ""
         terms = cls._query_terms(question)
+        clauses = cls._requested_clauses(question)
+        definition = cls._definition_term(question)
         candidates = re.split(r"(?<=[.!?])\s+|\n+", clean)
         scored: list[tuple[int, int, str]] = []
         for position, candidate in enumerate(candidates):
             candidate = candidate.strip()
-            if len(candidate) < 15:
+            if len(candidate) < 15 or re.match(r"^\[(?:СТРАНИЦА|ТАБЛИЦА|ИСТОЧНИК)\b", candidate, flags=re.IGNORECASE):
                 continue
             lower = candidate.lower()
             hits = sum(1 for term in terms if term in lower)
+            if any(cls._has_clause_start(candidate, clause) for clause in clauses):
+                hits += 100
+            if definition and cls._has_definition(candidate, definition):
+                hits += 90
             scored.append((hits, -position, candidate))
 
         if scored:
             scored.sort(reverse=True)
             excerpt = scored[0][2]
+            position = -scored[0][1]
+            # Не теряем условие/исключение сразу после выбранного предложения.
+            if position + 1 < len(candidates):
+                following = candidates[position + 1].strip()
+                if re.match(r"^(?:При|Если|Кроме|Для этого|В этом случае|В противном случае)\b", following):
+                    if len(excerpt) + len(following) < 750:
+                        excerpt += " " + following
         else:
             excerpt = clean
 
-        if len(excerpt) > 420:
-            excerpt = excerpt[:420].rsplit(" ", 1)[0].rstrip() + "…"
+        if len(excerpt) > 750:
+            excerpt = excerpt[:750].rsplit(" ", 1)[0].rstrip() + "…"
         return excerpt
 
     @classmethod
@@ -843,56 +1256,77 @@ class QASystem:
             question: str = "",
     ) -> str:
         """Строит структурированный extractive-ответ, когда LLM недоступна."""
-
+        if not results:
+            return "### Краткий ответ\n\nВ базе знаний недостаточно данных для точного ответа."
         parts: list[str] = [
-            "### Краткий ответ","Генеративная модель недоступна; ниже приведены только "
-                "дословные релевантные фрагменты из подключённой базы."
-            )
+            "### Краткий ответ",
+            "По найденным документам:",
         ]
         excerpts: list[str] = []
-        for index, result in enumerate(results[:3], start=1):
+        # Второй по TF-IDF фрагмент может касаться другого условия (например,
+        # температуры для другого типа помещения). Без LLM не смешиваем нормы.
+        for index, result in enumerate(results[:1], start=1):
             excerpt = cls._select_evidence_excerpt(result.text, question)
-        if excerpt:
-            excerpts.append(f"{excerpt} [Источник {index}]")
+            if excerpt:
+                excerpts.append(f"> {excerpt}\n\n[Источник {index}]")
 
         if excerpts:
-            parts.extend(excerpts[:2])
-        # 1. Сначала таблицы — они самые информативные
-        try:
-            tables = extract_tables_from_results(results, limit=3)
-        except (AttributeError, TypeError, ValueError, KeyError) as exc:
-            logger.exception("extract_tables_from_results failed")
-            tables = []
+            parts.append(excerpts[0])
+            if len(excerpts) > 1:
+                parts.extend(["### Дополнительные фрагменты", *excerpts[1:]])
+        parts.extend([
+            "### Ограничения",
+            "Показаны выдержки без генеративного анализа. Они могут не покрывать "
+            "все условия вопроса; проверьте область применения в указанном документе.",
+        ])
+        return "\n\n".join(parts)
 
-        if tables:
-            parts.append("📊 **Найденные таблицы:**")
-            for table in tables[:3]:
-                parts.append(f"\n**{table.title or 'Таблица'}** (источник: {table.source})")
 
-                if table.headers or table.rows:
-                    header = " | ".join(str(h) for h in table.headers) if table.headers else ""
-                    if header:
-                        parts.append(header)
-                        parts.append("-" * min(len(header), 80))
-                    for row in table.rows[:15]:
-                        parts.append(" | ".join(str(c) for c in row))
-                else:
-                    # fallback: сырой текст таблицы
-                    parts.append(table.raw_text[:800])
-            parts.append("")
+def _run_self_tests() -> None:
+    """Офлайн-проверки контракта, поиска, контекста и восстановления индекса."""
+    import tempfile
 
-        # 2. Потом текстовые фрагменты — коротко
-        text_fragments = []
-        for r in results[:3]:
-            text = r.text.strip()
-            if text and len(text) > 20:
-                text_fragments.append(text[:600])
+    qa = QASystem(use_llm=False, use_embeddings=False, min_score=0.05)
+    docs = [{"doc_name": "Вентиляция.docx", "chunks": [{
+        "chunk_id": 1, "text": "Вентиляция обеспечивает организованный воздухообмен в помещениях.",
+        "metadata": {"page": 4},
+    }]}]
+    assert qa.build_index(docs)
+    found = qa.search("Как устроена вентиляция?")
+    assert found and found[0].doc_name == "Вентиляция.docx"
+    assert qa.search("вентиляции")[0].doc_name == "Вентиляция.docx"
+    lexical_score = found[0].score
+    qa.chunk_embeddings = np.ones((1, 3), dtype=np.float32)
+    assert abs(qa.search("Как устроена вентиляция?")[0].score - lexical_score) < 1e-6
+    answer = qa.answer_from_results("вентиляция", [found[0].to_dict()])
+    assert "[Источник 1]" in answer["answer"] and answer["sources"][0]["page"] == 4
+    assert not answer["used_llm"] and answer["provider"] == "none"
+    assert qa.answer_from_results("нет данных", [])["needs_clarification"]
+    assert not qa._has_valid_citations("Нет источников", 1)
+    assert not qa._has_valid_citations("Норма [Источник 2]", 1)
+    assert qa._has_valid_citations("Факт [Источник 1]", 1)
+    assert qa._definition_term("Что такое рабочая зона по СП 60.13330? Найди определение.") == "рабочая зона"
+    assert qa._has_definition("3.1 вентиляция: Организованный воздухообмен.", "вентиляция")
+    assert not qa._has_definition("ГОСТ 12.1.005 Воздух рабочей зоны.", "рабочая зона")
+    assert qa._has_topic_support("Вентиляция обеспечивает воздухообмен.", "требования к вентиляции")
+    assert not qa._has_topic_support("Вентиляция обеспечивает воздухообмен.", "орбита Нептуна")
+    context = qa._build_context([replace(found[0], text="а" * 30000)] * 10)
+    assert len(context) < 12000 and "страница 4" in context
+    assert "НАЧАЛО КОНТЕКСТА" in qa._build_prompt("вопрос", context)
+    with tempfile.TemporaryDirectory() as temp_dir:
+        index_path = Path(temp_dir) / "index.pkl"
+        assert qa.save_index(index_path)
+        target = QASystem(use_llm=False, use_embeddings=False, top_k=2, min_score=0.02,
+                          ollama_model="local-test-model", embedding_model_name="another-model")
+        assert target.load_index(index_path)
+        assert target.top_k == 2 and target.min_score == 0.02
+        assert target.ollama_model == "local-test-model"
+        assert target.embedding_model_name == "another-model" and target.chunk_embeddings is None
+        assert target.search("вентиляции")
 
-        if text_fragments:
-            parts.append("📄 **Текстовые фрагменты:**")
-            parts.append("\n\n".join(text_fragments))
 
-        if not parts:
-            return "Не удалось найти информацию в документах."
+if __name__ == "__main__":
+    _run_self_tests()
+    print("qa_engine: self-tests passed")
 
-        return f"### Ответ\n\n" + "\n".join(parts)
+# ИСПРАВЛЕНО: синтаксис; контракт SearchResult/AgentLoop; только Ollama с проверкой модели; устойчивый TF-IDF/semantic поиск; фильтры СП/пунктов и определения; атомарный индекс без замены настроек; ограниченный контекст, ссылки и точные выдержки; офлайн-тесты.

@@ -26,8 +26,8 @@ ENV DEBIAN_FRONTEND=noninteractive \
     USE_LLM=true \
     LLM_PROVIDER=ollama \
     OLLAMA_MODEL=phi3:mini \
-    AUTO_SYNC_DATASET=false \
-    AUTO_REBUILD_INDEX=false \
+    AUTO_SYNC_DATASET=true \
+    AUTO_REBUILD_INDEX=true \
     PATH="/root/.local/bin:${PATH}"
 
 WORKDIR /app
@@ -47,6 +47,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libxext6 \
     libxrender1 \
     libgomp1 \
+    fonts-dejavu-core \
     zstd \
     antiword \
     catdoc \
@@ -109,3 +110,5 @@ HEALTHCHECK --interval=30s --timeout=10s --start-period=90s --retries=5 \
 # ЗАПУСК
 # ============================================
 CMD ["/app/start.sh"]
+
+# ИСПРАВЛЕНО: кириллический шрифт для экспорта отчётов; сохранён запуск Ollama и загрузка базы во время работы.

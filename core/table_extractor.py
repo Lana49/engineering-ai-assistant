@@ -93,11 +93,12 @@ class TableExtractor:
         in_table = False
         table_lines = []
         table_title = ""
+        table_metadata: dict[str, Any] = {}
 
         def flush() -> None:
-            nonlocal table_lines, table_title, in_table
+            nonlocal table_lines, table_title, in_table, table_metadata
             if table_lines:
-                if all(line.count("|") >= 2 for line in table_lines):
+                if all(table_line.count("|") >= 2 for table_line in table_lines):
                     table = self._build_table_from_pipe_lines(
                         table_lines, source, confidence=0.95
                     )
@@ -107,20 +108,24 @@ class TableExtractor:
                         table_lines, table_title or "Таблица", source, confidence=0.95
                     )
                 if table.is_valid(min_rows=1):
+                    table.metadata.update(table_metadata)
                     tables.append(table)
             table_lines = []
             table_title = ""
+            table_metadata = {}
             in_table = False
 
         for i, line in enumerate(lines):
-            if "[ТАБЛИЦА" in line:
-                stripped = line.strip()
-                if stripped.upper().startswith("[ТАБЛИЦА"):
-                    if in_table:
-                        flush()
+            stripped = line.strip()
+            if stripped.upper().startswith("[ТАБЛИЦА"):
+                if in_table:
+                    flush()
                 in_table = True
                 table_lines = []
-
+                page_match = re.search(r"\bстраница\s+(\d+)", stripped, flags=re.I)
+                if page_match:
+                    table_metadata["page"] = int(page_match.group(1))
+                    table_metadata["page_numbers"] = [int(page_match.group(1))]
                 marker_title = re.sub(r"^\[ТАБЛИЦА\s*:?\s*", "", stripped, flags=re.I)
                 marker_title = marker_title.rstrip("]").split("|", 1)[0].strip()
                 if marker_title:
@@ -132,6 +137,8 @@ class TableExtractor:
                 continue
 
             if in_table:
+                # Служебный маркер следующей страницы/источника не является
+                # строкой таблицы, даже если между блоками нет пустой строки.
                 if not stripped or stripped.startswith("[СТРАНИЦА") or stripped.startswith("[ИСТОЧНИК"):
                     flush()
                 else:
@@ -220,7 +227,7 @@ class TableExtractor:
                         table = self._build_table_from_aligned_lines(
                             table_lines, source, confidence=0.7
                         )
-                        if table.is_valid():
+                        if table.is_valid(min_rows=1):
                             tables.append(table)
                         i = j
                         continue
@@ -264,7 +271,7 @@ class TableExtractor:
                     table = self._build_table_from_keyword_lines(
                         table_lines, title, source, confidence=0.6
                     )
-                    if table.is_valid():
+                    if table.is_valid(min_rows=1):
                         tables.append(table)
                     i = j
                     continue
@@ -322,13 +329,13 @@ class TableExtractor:
                     line = line[1:]
                 if line.endswith("|"):
                     line = line[:-1]
-                parts = [p.strip() for p in line.split("|")]
+                parts = [p.strip().replace("\\|", "|") for p in re.split(r"(?<!\\)\|", line)]
                 if any(parts):
                     rows.append(parts)
 
         filtered_rows = []
         for row in rows:
-            if not all(p.replace("-", "").strip() == "" for p in row):
+            if not all(re.fullmatch(r":?-+:?", p.strip()) for p in row):
                 filtered_rows.append(row)
 
         headers = filtered_rows[0] if filtered_rows else []
@@ -410,13 +417,18 @@ class TableExtractor:
     @staticmethod
     def _table_fingerprint(table: ExtractedTable) -> str:
         """Создаёт уникальный отпечаток таблицы для дедупликации."""
+        return TableExtractor.table_fingerprint(table)
+
+    @staticmethod
+    def table_fingerprint(table: ExtractedTable) -> str:
+        """Публичный ключ содержимого таблицы без обрезания последних строк."""
         def clean(value: Any) -> str:
             return re.sub(r"\s+", " ", str(value).strip().lower())
 
         headers = "|".join(clean(cell) for cell in table.headers)
         rows = "\n".join(
             "|".join(clean(cell) for cell in row)
-            for row in table.rows[:20]
+            for row in table.rows
         )
         return f"{clean(table.source)}::{headers}::{rows}"
 
@@ -440,7 +452,7 @@ class TableExtractor:
         return unique
 
 
-# ФУНКЦИИ ДЛЯ ИМПОРТА
+# ========= УДОБНЫЕ ФУНКЦИИ ДЛЯ ИМПОРТА =========
 
 def extract_tables(text: str, doc_name: str = "", min_rows: int = 2) -> list[ExtractedTable]:
     """Быстрый импорт: извлекает таблицы из текста."""
@@ -458,18 +470,22 @@ def extract_tables_from_results(results: list[Any], min_rows: int = 2, limit: in
         if hasattr(result, "text"):
             text = getattr(result, "text", "")
             doc_name = getattr(result, "doc_name", "Документ")
+            result_metadata = getattr(result, "metadata", {}) or {}
         elif isinstance(result, dict):
             text = result.get("text", "")
             doc_name = result.get("doc_name", "Документ")
+            result_metadata = result.get("metadata", {}) or {}
         else:
             continue
 
-        if not text.strip():
+        if not isinstance(text, str) or not text.strip():
             continue
 
         tables = extractor.extract(text, source=doc_name, min_rows=min_rows)
         for table in tables:
-            fingerprint = TableExtractor._table_fingerprint(table)
+            if isinstance(result_metadata, dict):
+                table.metadata = {**result_metadata, **table.metadata}
+            fingerprint = TableExtractor.table_fingerprint(table)
             if fingerprint not in seen:
                 seen.add(fingerprint)
                 all_tables.append(table)
@@ -477,7 +493,7 @@ def extract_tables_from_results(results: list[Any], min_rows: int = 2, limit: in
     return all_tables
 
 
-def find_city_in_tables(tables: list[ExtractedTable], city: str, city_aliases: dict[str, set[str]] = None) -> dict[str, Any] | None:
+def find_city_in_tables(tables: list[ExtractedTable], city: str, city_aliases: dict[str, set[str]] | None = None) -> dict[str, Any] | None:
     """
     Ищет город в таблицах с учётом алиасов и словоформ.
 
@@ -492,7 +508,7 @@ def find_city_in_tables(tables: list[ExtractedTable], city: str, city_aliases: d
     if not tables or not city:
         return None
 
-    city_lower = city.lower().strip()
+    city_lower = city.lower().replace("ё", "е").strip()
 
     # Собираем все формы для поиска
     city_forms = {city_lower}
@@ -509,7 +525,7 @@ def find_city_in_tables(tables: list[ExtractedTable], city: str, city_aliases: d
         for idx, row in enumerate(table.rows):
             if isinstance(row, list):
                 row_text = " ".join(str(c) for c in row)
-                row_lower = row_text.lower()
+                row_lower = row_text.lower().replace("ё", "е")
 
                 # Проверяем каждую форму
                 for form in city_forms:
@@ -525,7 +541,7 @@ def find_city_in_tables(tables: list[ExtractedTable], city: str, city_aliases: d
 
                 # Проверка по отдельным ячейкам (выше точность)
                 for cell in row:
-                    cell_lower = str(cell).lower()
+                    cell_lower = str(cell).lower().replace("ё", "е")
                     for form in city_forms:
                         if re.search(rf"(?<![а-яa-z]){re.escape(form)}(?![а-яa-z])", cell_lower):
                             return {
@@ -557,7 +573,7 @@ def find_city_in_tables(tables: list[ExtractedTable], city: str, city_aliases: d
             for idx, row in enumerate(table.rows):
                 if isinstance(row, list):
                     row_text = " ".join(str(c) for c in row).lower()
-                    if all(token in row_text for token in city_tokens):
+                    if all(re.search(rf"(?<![а-яa-z]){re.escape(token)}(?![а-яa-z])", row_text) for token in city_tokens):
                         return {
                             "table": table,
                             "row": row,
@@ -568,7 +584,7 @@ def find_city_in_tables(tables: list[ExtractedTable], city: str, city_aliases: d
                         }
                 elif isinstance(row, str):
                     row_lower = row.lower()
-                    if all(token in row_lower for token in city_tokens):
+                    if all(re.search(rf"(?<![а-яa-z]){re.escape(token)}(?![а-яa-z])", row_lower) for token in city_tokens):
                         return {
                             "table": table,
                             "row": [row],
@@ -584,3 +600,27 @@ def find_city_in_tables(tables: list[ExtractedTable], city: str, city_aliases: d
 def tables_to_dicts(tables: list[ExtractedTable]) -> list[dict[str, Any]]:
     """Преобразует список ExtractedTable в список словарей."""
     return [t.to_dict() for t in tables]
+
+
+def _run_self_tests() -> None:
+    """Проверяет границы таблиц, одну строку, метаданные и города."""
+    tables = extract_tables(
+        "[ТАБЛИЦА: Климат | страница 4]\n| Город | t_от | z_от |\n| --- | --- | --- |\n| Томск | -8,4 | 225 |",
+        "СП 131.13330",
+        min_rows=1,
+    )
+    assert tables and tables[0].title == "Климат"
+    assert find_city_in_tables(tables, "омск") is None
+    assert find_city_in_tables(tables, "томск") is not None
+    assert tables[0].metadata["page"] == 4
+    assert extract_tables("Обычный абзац без таблицы", min_rows=1) == []
+    aligned = extract_tables("| Название | Значение |\n| :--- | ---: |\n| A\\|B | 12 |", min_rows=1)
+    assert aligned[0].rows == [["A|B", "12"]]
+
+
+if __name__ == "__main__":
+    _run_self_tests()
+
+# ИСПРАВЛЕНО: инициализация stripped; названия/страницы таблиц; однострочные
+# таблицы; Markdown-разделители и экранированные ячейки; точное сопоставление
+# города; метаданные результатов поиска; дедупликация всех строк; самотесты.

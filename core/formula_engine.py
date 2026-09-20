@@ -17,6 +17,7 @@ core/formula_engine.py
 
 from __future__ import annotations
 import logging
+import math
 import json
 import re
 from dataclasses import asdict, dataclass, field
@@ -25,8 +26,11 @@ from typing import Any, Callable
 
 logger = logging.getLogger(__name__)
 try:
-    from core.query_parser import extract_city, extract_variables
+    from core.query_parser import extract_city, extract_variables, get_parameter_issues
 except ImportError:
+    def get_parameter_issues(text: str, length_kind: str | None = None) -> list[str]:
+        return ["Недоступна проверка единиц исходных данных; восстановите core.query_parser."]
+
     def extract_city(text: str) -> str | None:
         text = (text or "").strip()
         m = re.search(r"\bдля\s+([А-ЯA-ZЁ][А-ЯA-ZЁа-яa-zё\- ]{1,50})", text)
@@ -441,6 +445,10 @@ class FormulaEngine:
             if isinstance(value, (int, float)) and not isinstance(value, bool):
                 result[key] = float(value)
 
+        # Проверка согласованности явного Δt выполняется перед расчётом.
+        # Вывод из температур делаем после объединения, учитывая overrides API.
+        if "delta_t" not in result and {"t_v", "t_n"} <= result.keys():
+            result["delta_t"] = result["t_v"] - result["t_n"]
         return result
 
     def _extract_parameters_from_text(self, text: str) -> dict[str, float]:
@@ -533,59 +541,84 @@ class FormulaEngine:
         params = params or {}
         q = self._normalize_text(query)
 
-        candidates: list[tuple[float, str]] = []
+        # Предмет расчёта важнее случайного полного набора параметров для
+        # другой формулы. Условия после ':'/'при' не переопределяют вопрос.
+        subject = re.split(r"[:;=]|\bпри\b|\bесли\b", q, maxsplit=1)[0]
+        subject_patterns = {
+            "ventilation_heat": (
+                r"(?:теплов[а-я]*\s+)?мощност[а-я]*\s+(?:приточн[а-я]*\s+)?вентиляц"
+                r"|вентиляц|нагрев.{0,20}воздух|теплот.{0,30}воздух"
+            ),
+            "gsop": r"гсоп|градусо.?сут",
+            "heat_loss": r"теплопотер|потер[а-я]*\s+тепл",
+            "thermal_resistance_layer": r"(?:термическ[а-я]*\s+)?сопротивлен",
+            "required_insulation_thickness": r"толщин[а-я]*\s+(?:слоя\s+)?(?:утепл|изоляц|теплоизоляц)",
+            "pipe_surface_heat_flux": r"удельн[а-я]*\s+(?:теплов[а-я]*\s+)?поток|теплопоток|тепловой поток трубы",
+        }
+        targets = []
+        for key, pattern in subject_patterns.items():
+            matched = re.search(pattern, subject)
+            if matched:
+                targets.append((matched.start(), key))
+        for key, meta in self.formulas.items():
+            for alias in meta.get("aliases", []):
+                matched = re.search(rf"(?<!\w){re.escape(self._normalize_text(alias))}(?!\w)", subject)
+                if matched:
+                    targets.append((matched.start(), key))
 
-        for formula_key, meta in self.formulas.items():
-            required = set(meta["required_params"])
-            aliases = meta.get("aliases", [])
+        def without_request_words(value: str) -> str:
+            # Оставляем предмет запроса, убирая только слова команды и
+            # обычные уточняющие прилагательные, а не произвольные существительные.
+            return re.sub(
+                r"\b(?:пожалуйста|мне|помоги(?:те)?|помочь|можешь|можете|"
+                r"рассчита(?:й(?:те)?|ть)|посчита(?:й(?:те)?|ть)|"
+                r"вычисли(?:те|ть)?|определи(?:те|ть)?|найди(?:те)?|расчет|"
+                r"требуем[а-я]*|необходим[а-я]*|суммарн[а-я]*|общ[а-я]*)\b",
+                "", value,
+            ).strip(" ,.-")
 
-            parameter_hits = len(required.intersection(params))
-            complete = parameter_hits == len(required)
+        if targets:
+            position, key = min(targets)
+            if without_request_words(subject[:position]):
+                # Например, «диаметр вентиляции» не означает расчёт теплоты.
+                return None
+            if key == "heat_loss" and re.search(subject_patterns["ventilation_heat"], subject):
+                return "ventilation_heat"
+            return key
 
-            alias_hits = sum(
-                1 for alias in aliases
-                if alias and self._normalize_text(alias) in q
-            )
-
-            score = parameter_hits * 2.0
-            score += alias_hits * 3.0
-
-            if complete:
-                score += 10.0
-
-            if formula_key == "ventilation_heat":
-                if any(token in q for token in ("вентиляц", "приточ", "воздухообмен")):
-                    score += 4.0
-
-            if formula_key == "gsop":
-                if "гсоп" in q or "градусо" in q:
-                    score += 4.0
-
-            if formula_key == "heat_loss":
-                if "теплопотер" in q or "ограждени" in q:
-                    score += 4.0
-
-            if formula_key == "thermal_resistance_layer":
-                if "сопротивлен" in q and ("слоя" in q or "теплопередаче" in q):
-                    score += 4.0
-
-            if formula_key == "required_insulation_thickness":
-                if "толщин" in q and ("утепл" in q or "изоляц" in q):
-                    score += 4.0
-
-            if formula_key == "pipe_surface_heat_flux":
-                if "удельн" in q or "теплопоток" in q:
-                    score += 4.0
-
-            if score > 0:
-                candidates.append((score, formula_key))
-
-        if not candidates:
+        remaining_subject = without_request_words(subject)
+        # В запросе без названного предмета допускается однозначный выбор по
+        # полному набору параметров. Названный неизвестный предмет не подменяем.
+        if remaining_subject and remaining_subject not in {
+            self._normalize_text(name) for name in params
+        }:
             return None
+        complete = [
+            key for key, meta in self.formulas.items()
+            if set(meta["required_params"]).issubset(params)
+        ]
+        return complete[0] if len(complete) == 1 else None
 
-        candidates.sort(reverse=True)
-        best_score, best_key = candidates[0]
-        return best_key if best_score >= 2.0 else None
+    @staticmethod
+    def _get_input_issues(
+        query: str,
+        formula_key: str,
+        params: dict[str, float],
+    ) -> list[str]:
+        length_kind = {
+            "pipe_surface_heat_flux": "length",
+            "ventilation_heat": "air_flow",
+        }.get(formula_key)
+        issues = get_parameter_issues(query, length_kind)
+        if {"delta_t", "t_v", "t_n"}.issubset(params):
+            difference = params["t_v"] - params["t_n"]
+            if not math.isclose(params["delta_t"], difference, rel_tol=1e-9, abs_tol=1e-9):
+                issues.append(
+                    f"Задано Δt={params['delta_t']:g} °C, но t_в − t_н = "
+                    f"{params['t_v']:g} − ({params['t_n']:g}) = {difference:g} °C. "
+                    "Уточните разность температур или исходные температуры."
+                )
+        return issues
 
     def _get_missing_params(
         self,
@@ -636,6 +669,10 @@ class FormulaEngine:
 
         meta = self.formulas[formula_key]
         self.reasoning_steps.append(f"Выбрана формула: {meta['name']}")
+
+        issues = self._get_input_issues(query, formula_key, params)
+        if issues:
+            return self._error("Неоднозначные или несовместимые исходные данные:\n\n" + "\n".join(issues))
 
         missing = self._get_missing_params(formula_key, params)
 
@@ -696,6 +733,9 @@ class FormulaEngine:
         handler = meta["handler"]
 
         try:
+            for name in meta["required_params"]:
+                if not math.isfinite(params[name]):
+                    raise ValueError(f"Параметр {name} должен быть конечным числом")
             result = handler(params, meta)
             result["reasoning"] = "\n".join(self.reasoning_steps)
             return self._format_result(result, meta)
@@ -716,6 +756,34 @@ class FormulaEngine:
             self._table_calculator = TableCalculator(self.qa_system)
 
         try:
+            # Добираем лишь недостающие значения, сохраняя заданные пользователем.
+            # Не подставляем 20 °C молча: для теплопотерь нужны обе температуры.
+            missing = self._get_missing_params(formula_key, params)
+            required_climate = list(missing)
+            if formula_key == "heat_loss" and "delta_t" in required_climate:
+                if "t_v" not in params:
+                    return self._missing_params(self.formulas[formula_key], ["t_v", "t_n"])
+                required_climate = ["t_n"]
+            climate_reader = getattr(self._table_calculator, "_climate_values_from_tables", None)
+            if callable(climate_reader):
+                climate = climate_reader(city, tuple(required_climate))
+                if climate:
+                    climate_values, source = climate
+                    enriched = self._merge_parameters(climate_values, params)
+                    if not self._get_missing_params(formula_key, enriched):
+                        self.reasoning_steps.append(f"Из таблицы для {city} получены: {climate_values}")
+                        calculated = self._execute_formula(formula_key, enriched)
+                        if not calculated.get("needs_clarification"):
+                            calculated["sources"] = [source]
+                            calculated["grounded"] = True
+                            calculated["answer"] += f"\n\nИсточник климатических данных: {source.get('doc_name', 'таблица')}"
+                        return calculated
+                missing_reader = getattr(self._table_calculator, "_missing_climate_response", None)
+                if callable(missing_reader):
+                    return missing_reader(city, tuple(required_climate))
+                return None
+
+            # Совместимость с прежним TableCalculator без доступа к значениям.
             if formula_key == "gsop":
                 result = self._table_calculator.calculate_gsop_from_table(
                     city=city,
@@ -749,7 +817,11 @@ class FormulaEngine:
             else:
                 return None
 
-            if not result or result.get("confidence", 0.0) < 0.5:
+            if not result:
+                return None
+            if result.get("needs_clarification"):
+                return result
+            if result.get("confidence", 0.0) < 0.5:
                 return None
 
             self.reasoning_steps.append("Табличные климатические данные успешно получены")
@@ -759,8 +831,8 @@ class FormulaEngine:
             result.setdefault("questions", [])
             return result
 
-        except (AttributeError, KeyError, TypeError, ValueError) as exc:
-            logger.warning("Табличный метод расчёта недоступен: %s", exc)
+        except (ArithmeticError, AttributeError, KeyError, TypeError, ValueError) as exc:
+            logger.exception("Табличный метод расчёта недоступен")
             self.reasoning_steps.append(f"Табличный метод недоступен: {exc}")
             return None
 
@@ -904,8 +976,10 @@ class FormulaEngine:
         t_ot = p["t_ot"]
         z_ot = p["z_ot"]
 
-        if z_ot <= 0:
-            raise ValueError("z_ot должно быть больше 0")
+        if not 0 < z_ot <= 366:
+            raise ValueError("z_ot должно быть больше 0 и не больше 366 суток")
+        if t_v < t_ot:
+            raise ValueError("Для отопления t_v должна быть не ниже t_ot")
 
         value = (t_v - t_ot) * z_ot
 
@@ -931,6 +1005,8 @@ class FormulaEngine:
 
         if air_flow < 0:
             raise ValueError("Расход воздуха L не может быть отрицательным")
+        if t_v < t_n:
+            raise ValueError("Формула нагрева требует t_v ≥ t_n; для охлаждения нужен другой расчёт")
 
         value = 0.335 * air_flow * (t_v - t_n)
 
@@ -958,6 +1034,8 @@ class FormulaEngine:
             raise ValueError("Площадь A должна быть больше 0")
         if resistance <= 0:
             raise ValueError("Сопротивление R должно быть больше 0")
+        if delta_t < 0:
+            raise ValueError("Для расчёта теплопотерь Δt должна быть неотрицательной")
 
         value = (area * delta_t) / resistance
 
@@ -1035,6 +1113,8 @@ class FormulaEngine:
 
         if length <= 0:
             raise ValueError("Длина L должна быть больше 0")
+        if heat_power < 0:
+            raise ValueError("Тепловая мощность Q не может быть отрицательной")
 
         value = heat_power / length
 
@@ -1092,9 +1172,26 @@ class FormulaEngine:
             "source": meta["source"],
         }
 
+        params = result.get("params", {})
+        legend = meta.get("legend", {})
+        input_lines = [
+            f"- {name} = {params[name]:g} — {legend.get(name, name)}"
+            for name in meta["required_params"] if name in params
+        ]
+        answer = (
+            "### Исходные данные\n\n" + "\n".join(input_lines)
+            + f"\n\n### Формула\n\n{meta['expression']}\n\n"
+            + result.get("answer", "")
+        )
+        if meta["id"] == "ventilation_heat":
+            answer += "\n\nПринято постоянное значение коэффициента 0,335 Вт·ч/(м³·°C); рекуперация и влажность не учитываются."
+        elif meta["id"] == "required_insulation_thickness":
+            answer += "\n\nЭто оценка для одного однородного слоя; сопротивления остальных слоёв и поверхностей не учтены."
+
         return {
-            "answer": result.get("answer", ""),
-            "sources": [{"doc_name": result.get("source", meta["source"])}],
+            "answer": answer,
+            # Встроенная формула не является извлечённой цитатой из СП.
+            "sources": [],
             "tables": result.get("tables", []),
             "formulas": [formula],
             "formula": formula,
@@ -1105,6 +1202,7 @@ class FormulaEngine:
             "needs_clarification": False,
             "questions": [],
             "query_type": "calculation",
+            "grounded": False,
         }
 
     @staticmethod
@@ -1210,6 +1308,10 @@ class FormulaEngine:
         if formula_key is None:
             return self._error("Не удалось определить тип расчёта.")
 
+        issues = self._get_input_issues(query, formula_key, params)
+        if issues:
+            return self._error("Неоднозначные или несовместимые исходные данные:\n\n" + "\n".join(issues))
+
         meta = self.formulas[formula_key]
         missing = self._get_missing_params(formula_key, params)
 
@@ -1237,6 +1339,9 @@ class FormulaEngine:
 
         formula_key = self._detect_formula_key(query, params)
         if formula_key is None:
+            return None
+
+        if self._get_input_issues(query, formula_key, params):
             return None
 
         meta = self.formulas[formula_key]
@@ -1361,12 +1466,31 @@ class FormulaEngine:
                 })
 
         return result[:10]
-if __name__ == "__main__":
+def _run_self_tests() -> None:
+    """Контрольные числовые примеры и ошибки входных данных."""
     import asyncio
 
     engine = FormulaEngine()
-    result = asyncio.run(engine.answer_calculation(
-        "Рассчитай вентиляцию: L=100 м3/ч, tв=20 °C, tн=-25 °C"
-    ))
-    assert result["needs_clarification"] is False
-    assert round(float(result["result"]), 1) == 1507.5
+    examples = (
+        ("Рассчитай вентиляцию: L=100 м3/ч, tв=20 °C, tн=-25 °C", 1507.5),
+        ("Рассчитай теплопотери: A=12, R=3, tв=20, tн=-30", 200.0),
+        ("Сопротивление слоя: толщина 100 мм, λ=0,04", 2.5),
+        ("Рассчитай толщину утеплителя: R_tr=3, λ=0,04", 0.12),
+        ("Удельный тепловой поток: Q=2 кВт, длина трубы 10 м", 200.0),
+        ("Рассчитай ГСОП tв=20 tот=-8,4 zот=225", 6390.0),
+    )
+    for question, expected in examples:
+        test_result = asyncio.run(engine.answer_calculation(question))
+        assert not test_result["needs_clarification"], test_result
+        assert math.isclose(float(test_result["result"]), expected), test_result
+        assert "Исходные данные" in test_result["answer"] and "Формула" in test_result["answer"]
+    invalid = asyncio.run(engine.answer_calculation("Теплопотери A=10 R=0 dt=20"))
+    assert invalid["needs_clarification"] and "больше 0" in invalid["answer"]
+    overridden = asyncio.run(engine.answer_calculation("Теплопотери A=10 R=2 tв=20 tн=-20", {"t_n": -30}))
+    assert overridden["result"] == 250.0
+
+
+if __name__ == "__main__":
+    _run_self_tests()
+
+# ИСПРАВЛЕНО: неподдерживаемый предмет не подменяется; проверяются единицы/L и конфликт Δt после API overrides; async API сохранён.

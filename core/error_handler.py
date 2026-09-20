@@ -43,7 +43,7 @@ class ErrorHandler:
             "timestamp": datetime.now().isoformat(),
             "type": type(error).__name__,
             "message": str(error),
-            "traceback": traceback.format_exc(),
+            "traceback": "".join(traceback.format_exception(type(error), error, error.__traceback__)),
             "context": context or {},
         }
 
@@ -222,6 +222,7 @@ def safe_execute(
         result = func(*args, **kwargs)
         return result, None
     except Exception as exc:
+        logger.exception("Ошибка безопасного синхронного вызова")
         return None, exc
 
 
@@ -235,10 +236,24 @@ async def safe_execute_async(
         result = await async_func(*args, **kwargs)
         return result, None
     except Exception as exc:
+        logger.exception("Ошибка безопасного асинхронного вызова")
         return None, exc
 
-if __name__ == "__main__":
+
+def _run_self_tests() -> None:
+    from unittest.mock import patch
     handler = ErrorHandler(log_level="debug")
     info = handler.handle(ValueError("проверка журнала"), {"stage": "self-test"})
     assert info["is_error"] is True
     assert handler.get_error_summary()["total"] == 1
+    assert "ValueError: проверка журнала" in handler.errors[0]["traceback"]
+    with patch.object(logger, "exception") as log:
+        result, error = safe_execute(lambda: 1 / 0)
+        assert result is None and isinstance(error, ZeroDivisionError)
+        assert log.called
+
+
+if __name__ == "__main__":
+    _run_self_tests()
+
+# ИСПРАВЛЕНО: traceback сохраняется и вне except; safe_execute/async записывают причину ошибки в журнал.

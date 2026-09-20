@@ -3,14 +3,15 @@ from __future__ import annotations
 
 import asyncio
 import json
-
+from contextlib import AbstractContextManager
 import os
-import time
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, cast
+from xml.sax.saxutils import escape
 import logging
 import sys
+import pandas as pd
 import streamlit as st
 from reportlab.lib.colors import HexColor
 
@@ -27,11 +28,11 @@ except ImportError:
     print("⚠️ huggingface-hub не установлен")
 
 from core.agent_loop import AgentLoop
+from core import config as settings
 from core.config import PROCESSED_DIR, RAW_DIR, HF_DATASET_REPO_ID
 from core.error_handler import ErrorHandler
 from core.formula_engine import FormulaEngine
 from core.parser import parse_directory
-from core.prompts import get_quick_definition
 from core.qa_engine import QASystem
 from core.table_calculator import patch_app_with_table_calculator
 
@@ -60,19 +61,21 @@ def get_cached_qa_system() -> QASystem:
     return init_qa_system()
 
 
-@st.cache_resource(show_spinner=False)
 def get_cached_formula_engine(qa_system: QASystem) -> FormulaEngine:
-    """Кэширует FormulaEngine."""
+    """Создаёт FormulaEngine; экземпляр хранится в session_state."""
     return FormulaEngine(qa_system)
 
 
-@st.cache_resource(show_spinner=False)
 def get_cached_agent_loop(qa_system: QASystem, formula_engine: FormulaEngine) -> AgentLoop:
-    """Кэширует AgentLoop."""
+    """Создаёт AgentLoop; экземпляр хранится в session_state."""
     return AgentLoop(qa_system, formula_engine)
 
 
 # ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ
+
+def _spinner(message: str) -> AbstractContextManager[None]:
+    """Явный тип контекстного менеджера для разных версий Streamlit/PyCharm."""
+    return cast(AbstractContextManager[None], st.spinner(message))
 
 def safe_call(callback: Callable[..., Any] | None, *args: Any, **kwargs: Any) -> Any | None:
     """Безопасно вызывает callback, если он существует."""
@@ -106,6 +109,50 @@ def call_maybe_async(func: Callable[..., Any] | None, *args: Any, **kwargs: Any)
     return result
 
 
+def answer_user_query(agent_loop: AgentLoop, query: str) -> dict[str, Any]:
+    """Один проверяемый маршрут для определений, поиска, таблиц и расчётов."""
+    cleaned = query.strip()
+    if not cleaned:
+        return {"answer": "Введите вопрос по документам или исходные данные для расчёта.",
+                "sources": [], "tables": [], "formulas": []}
+    result = call_maybe_async(agent_loop.run, cleaned)
+    if not isinstance(result, dict):
+        raise TypeError("AgentLoop.run должен возвращать словарь с ответом")
+    result.setdefault("answer", "Не удалось сформировать ответ по документам.")
+    for key in ("sources", "tables", "formulas"):
+        result.setdefault(key, [])
+    if not result["formulas"] and result.get("formula"):
+        result["formulas"] = [result["formula"]]
+    return result
+
+
+def _source_label(source: dict[str, Any]) -> str:
+    """Показывает номер ссылки и местоположение найденного фрагмента."""
+    metadata = source.get("metadata") or {}
+    label = str(source.get("doc_name") or "Документ")
+    if source.get("reference_id"):
+        label = f"[{source['reference_id']}] {label}"
+    page = source.get("page") or metadata.get("page")
+    if page:
+        label += f", стр. {page}"
+    table = source.get("table_title") or metadata.get("table_title")
+    if table:
+        label += f", {table}"
+    return label
+
+
+def _render_table(table: dict[str, Any]) -> None:
+    """Показывает извлечённые ячейки, а не одно название таблицы."""
+    st.markdown(f"**{table.get('title') or 'Таблица'}**")
+    rows = table.get("rows") or []
+    headers = table.get("headers") or []
+    if rows and headers and all(len(row) == len(headers) for row in rows):
+        columns = [f"{header or 'Столбец'} ({index + 1})" for index, header in enumerate(headers)]
+        st.dataframe(pd.DataFrame(rows, columns=columns), use_container_width=True, hide_index=True)
+    elif table.get("content"):
+        st.markdown(str(table["content"]))
+
+
 def get_initial_message() -> list[dict[str, str]]:
     return [{
         "role": "assistant",
@@ -125,9 +172,12 @@ def get_initial_message() -> list[dict[str, str]]:
 
 def save_history() -> None:
     """Сохраняет историю чата в файл."""
-    HISTORY_FILE.parent.mkdir(parents=True, exist_ok=True)
-    with open(HISTORY_FILE, "w", encoding="utf-8") as f:
-        json.dump(st.session_state.messages, f, ensure_ascii=False, indent=2)
+    try:
+        HISTORY_FILE.parent.mkdir(parents=True, exist_ok=True)
+        with HISTORY_FILE.open("w", encoding="utf-8") as history_stream:
+            json.dump(st.session_state.messages, history_stream, ensure_ascii=False, indent=2)
+    except (OSError, TypeError, ValueError):
+        logger.exception("Не удалось сохранить историю; ответ остаётся в текущей сессии")
 
 
 def get_docs_from_raw() -> list[Path]:
@@ -168,24 +218,22 @@ def sync_hf_dataset_to_raw(force: bool = False) -> bool:
         print("❌ HF_DATASET_REPO_ID не задан")
         return False
 
-    if snapshot_download is None:
+    downloader = snapshot_download
+    if not callable(downloader):
         print("❌ huggingface-hub не установлен")
         return False
 
     RAW_DIR.mkdir(parents=True, exist_ok=True)
 
-    existing_docs = get_docs_from_raw()
-    if existing_docs and not force:
-        print(f"✅ Документы уже есть: {len(existing_docs)}")
-        return True
-
     try:
         print(f"📥 Скачиваю датасет {dataset_repo_id} в {RAW_DIR} ...")
-        snapshot_download(
+        downloader(
             repo_id=dataset_repo_id,
             repo_type="dataset",
             local_dir=str(RAW_DIR),
-            local_dir_use_symlinks=False,
+            allow_patterns=["*.pdf", "*.PDF", "*.docx", "*.DOCX", "*.doc", "*.DOC", "*.rtf", "*.RTF"],
+            max_workers=4,
+            force_download=force,
         )
 
         all_files = [p for p in RAW_DIR.rglob("*") if p.is_file()]
@@ -204,8 +252,9 @@ def sync_hf_dataset_to_raw(force: bool = False) -> bool:
 
         return True
 
-    except Exception as e:
-        print(f"❌ Ошибка загрузки датасета: {type(e).__name__}: {e}")
+    except Exception:
+        # Граница внешней библиотеки: сохраняем traceback, а UI остаётся доступным.
+        logger.exception("Ошибка загрузки датасета %s", dataset_repo_id)
         return False
 
 
@@ -228,6 +277,8 @@ def force_rebuild_index(qa: QASystem) -> bool:
 
     print("📖 Начинаем парсинг документов...")
     parsed_docs = parse_directory(RAW_DIR, recursive=True)
+    parsed_paths = {str(Path(doc.get("filepath", "")).resolve()) for doc in parsed_docs}
+    unread_documents = [path.name for path in docs if str(path.resolve()) not in parsed_paths]
 
     if not parsed_docs:
         print("❌ Парсинг не вернул ни одного документа")
@@ -240,6 +291,8 @@ def force_rebuild_index(qa: QASystem) -> bool:
 
     print("🔨 Строим индекс с эмбеддингами...")
     result = qa.build_index(parsed_docs)
+    qa.last_index_diagnostics["unread_documents"] = unread_documents
+    qa.last_index_diagnostics["files_found"] = len(docs)
 
     if not result:
         print("❌ build_index вернул False")
@@ -262,8 +315,9 @@ def force_rebuild_index(qa: QASystem) -> bool:
     size = INDEX_FILE.stat().st_size
     print(f"✅ Индекс сохранён, размер: {size} байт")
 
-    if size < 1_000_000:
-        print(f"⚠️ Подозрительно маленький индекс: {size} байт")
+    # Размер зависит от корпуса; маленький, но непустой индекс тоже корректен.
+    if size == 0 or not qa.is_ready or not qa.chunks:
+        logger.error("Сохранён пустой индекс")
         return False
 
     print("=" * 50)
@@ -304,12 +358,13 @@ def get_llm_status(qa_system: QASystem) -> dict[str, str]:
 def init_qa_system() -> QASystem:
     """Инициализирует QASystem."""
     use_llm = os.getenv("USE_LLM", "true").lower() == "true"
-    llm_provider = os.getenv("LLM_PROVIDER", "ollama").strip().lower()
+    llm_provider = settings.LLM_PROVIDER
     ollama_base_url = os.getenv("OLLAMA_BASE_URL", "http://127.0.0.1:11434").strip()
     ollama_model = os.getenv("OLLAMA_MODEL", "phi3:mini").strip()
 
-    auto_sync = os.getenv("AUTO_SYNC_DATASET", "false").lower() == "true"
-    auto_rebuild = os.getenv("AUTO_REBUILD_INDEX", "false").lower() == "true"
+    auto_default = "true" if settings.IS_HF_SPACE else "false"
+    auto_sync = os.getenv("AUTO_SYNC_DATASET", auto_default).lower() == "true"
+    auto_rebuild = os.getenv("AUTO_REBUILD_INDEX", auto_default).lower() == "true"
 
     print("🔧 Инициализация QASystem:")
     print(f"   use_llm: {use_llm}")
@@ -322,7 +377,12 @@ def init_qa_system() -> QASystem:
     qa = QASystem(
         use_llm=use_llm,
         llm_provider=llm_provider if use_llm else "none",
-        use_embeddings=True,
+        use_embeddings=settings.USE_EMBEDDINGS,
+        embedding_model_name=settings.EMBEDDING_MODEL,
+        top_k=settings.TOP_K,
+        min_score=settings.MIN_SCORE,
+        semantic_weight=settings.SEMANTIC_WEIGHT,
+        lexical_weight=settings.LEXICAL_WEIGHT,
         ollama_base_url=ollama_base_url,
         ollama_model=ollama_model
     )
@@ -333,8 +393,8 @@ def init_qa_system() -> QASystem:
             if qa.load_index(INDEX_FILE):
                 print(f"✅ Индекс загружен: {len(qa.chunks)} чанков")
                 return qa
-        except Exception as e:
-            print(f"⚠️ Ошибка загрузки индекса: {e}")
+        except (OSError, ValueError, TypeError, RuntimeError):
+            logger.exception("Ошибка загрузки индекса")
 
     if auto_sync:
         print("📥 AUTO_SYNC_DATASET=true → синхронизация dataset")
@@ -352,7 +412,7 @@ def init_qa_system() -> QASystem:
 def init_session_state() -> None:
     """Инициализирует состояние сессии Streamlit."""
     if "qa_system" not in st.session_state:
-        with st.spinner("Загрузка системы..."):
+        with _spinner("Загрузка системы..."):
             qa_system = get_cached_qa_system()
             formula_engine = get_cached_formula_engine(qa_system)
             agent_loop = get_cached_agent_loop(qa_system, formula_engine)
@@ -514,10 +574,25 @@ def export_to_pdf(
         filename = f"engineering_report_{timestamp}.pdf"
 
     try:
+        from reportlab.lib.enums import TA_CENTER
         from reportlab.lib.pagesizes import A4
         from reportlab.lib.styles import ParagraphStyle, getSampleStyleSheet
         from reportlab.lib.units import inch
         from reportlab.platypus import Paragraph, SimpleDocTemplate, Spacer
+        from reportlab.pdfbase import pdfmetrics
+        from reportlab.pdfbase.ttfonts import TTFont
+
+        font_paths = [
+            Path("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"),
+            Path("/System/Library/Fonts/Supplemental/Arial.ttf"),
+            Path("C:/Windows/Fonts/arial.ttf"),
+        ]
+        font_path = next((path for path in font_paths if path.exists()), None)
+        if font_path is None:
+            raise OSError("Для русского PDF нужен шрифт DejaVu Sans или Arial; пока используйте DOCX")
+        font_name = "EngineeringCyrillic"
+        if font_name not in pdfmetrics.getRegisteredFontNames():
+            pdfmetrics.registerFont(TTFont(font_name, str(font_path)))
 
         output_path = PROCESSED_DIR / filename
         output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -525,18 +600,19 @@ def export_to_pdf(
         doc = SimpleDocTemplate(str(output_path), pagesize=A4)
         styles = getSampleStyleSheet()
 
-        # Исправлено: alignment="center" (нижний регистр для type checker)
         title_style = ParagraphStyle(
             "TitleStyle",
             parent=styles["Title"],
             fontSize=24,
             textColor=HexColor("#1a5276"),
-            alignment="center",
+            alignment=TA_CENTER,
+            fontName=font_name,
             spaceAfter=20,
         )
         heading_style = ParagraphStyle(
             "HeadingStyle",
             parent=styles["Heading1"],
+            fontName=font_name,
             fontSize=16,
             textColor=HexColor("#2e86c1"),
             spaceAfter=12,
@@ -545,6 +621,7 @@ def export_to_pdf(
         normal_style = ParagraphStyle(
             "NormalStyle",
             parent=styles["Normal"],
+            fontName=font_name,
             fontSize=11,
             spaceAfter=6,
         )
@@ -559,15 +636,15 @@ def export_to_pdf(
 
         for line in answer.split("\n"):
             if line.strip():
-                story.append(Paragraph(line.replace("**", "").replace("*", ""), normal_style))
+                story.append(Paragraph(escape(line.replace("**", "").replace("*", "")), normal_style))
 
         if sources:
             story.append(Paragraph("Источники", heading_style))
             for src in sources:
                 if isinstance(src, dict):
-                    story.append(Paragraph(f"• {src.get('doc_name', 'Документ')}", normal_style))
+                    story.append(Paragraph(escape(f"• {_source_label(src)}"), normal_style))
                 else:
-                    story.append(Paragraph(f"• {str(src)}", normal_style))
+                    story.append(Paragraph(escape(f"• {src}"), normal_style))
 
         doc.build(story)
         return output_path
@@ -603,7 +680,7 @@ def render_export_buttons(
     if response_id is None:
         response_id = st.session_state.get("current_response_id", 0)
 
-    unique_id = f"{key_suffix}_{response_id}_{int(time.time() * 1000)}"
+    unique_id = f"{key_suffix}_{response_id}"
     col1, col2, col3 = st.columns(3)
 
     with col1:
@@ -635,7 +712,7 @@ def render_export_buttons(
     with col3:
         if st.button("📋 Копировать", key=f"copy_{unique_id}"):
             st.code(answer, language="text")
-            st.success("✅ Текст скопирован!")
+            st.caption("Нажмите значок копирования в правом верхнем углу блока текста.")
 
 
 def render_sidebar(
@@ -663,6 +740,13 @@ def render_sidebar(
         chunks_count = len(getattr(qa_system, "chunks", []))
         st.write(f"Чанков в памяти: `{chunks_count}`")
         st.write(f"is_ready: `{getattr(qa_system, 'is_ready', False)}`")
+        st.write(f"Документов в индексе: `{len(qa_system.documents)}`")
+        st.caption("Семантический поиск включён" if qa_system.embedding_model is not None and qa_system.chunk_embeddings is not None else "Работает лексический поиск; семантические векторы пока недоступны")
+        unread_documents = qa_system.last_index_diagnostics.get("unread_documents", [])
+        if unread_documents:
+            st.warning(f"Не прочитано документов: {len(unread_documents)}")
+            with st.expander("Какие файлы не прочитаны"):
+                st.write(unread_documents)
 
         diag = inspect_raw_directory()
         st.write(f"Файлов в RAW_DIR: `{diag['total']}`")
@@ -676,7 +760,7 @@ def render_sidebar(
             for path in diag["all_files"][:30]:
                 try:
                     st.code(str(path.relative_to(RAW_DIR)))
-                except Exception:
+                except ValueError:
                     st.code(str(path))
 
         st.divider()
@@ -706,6 +790,8 @@ def render_sidebar(
         st.write(f"llm_available: `{llm_status['llm_available']}`")
         st.write(f"ollama_alive: `{llm_status['ollama_alive']}`")
         st.write(f"ollama_model: `{llm_status['ollama_model']}`")
+        if qa_system.last_llm_error:
+            st.warning(qa_system.last_llm_error)
 
         st.divider()
         auto_load_documents()
@@ -714,7 +800,7 @@ def render_sidebar(
         st.subheader("📁 Управление данными")
 
         if st.button("📥 Скачать датасет", use_container_width=True):
-            with st.spinner("Скачивание документов из Hugging Face..."):
+            with _spinner("Скачивание документов из Hugging Face..."):
                 ok = sync_hf_dataset_to_raw(force=False)
             if ok:
                 st.success("✅ Датасет скачан! Теперь можно строить индекс.")
@@ -723,7 +809,7 @@ def render_sidebar(
                 st.error("❌ Не удалось скачать датасет. Проверьте логи.")
 
         if st.button("🔄 Перескачать датасет", use_container_width=True):
-            with st.spinner("Перескачиваю датасет..."):
+            with _spinner("Перескачиваю датасет..."):
                 ok = sync_hf_dataset_to_raw(force=True)
             if ok:
                 st.success("✅ Датасет перескачан!")
@@ -738,7 +824,7 @@ def render_sidebar(
             if not docs:
                 st.warning("⚠️ Сначала скачайте датасет: RAW_DIR пуст.")
             else:
-                with st.spinner("Перестраиваю индекс..."):
+                with _spinner("Перестраиваю индекс..."):
                     ok = force_rebuild_index(qa_system)
                 if ok:
                     st.success("✅ Индекс перестроен и сохранён!")
@@ -818,14 +904,14 @@ def main() -> None:
                             st.markdown("**Источники:**")
                             for src in msg.get("sources", []):
                                 if isinstance(src, dict):
-                                    st.markdown(f"- {src.get('doc_name', 'Документ')}")
+                                    st.markdown(f"- {_source_label(src)}")
                                 else:
                                     st.markdown(f"- {src}")
                         if has_tables:
                             st.markdown("**Таблицы:**")
                             for table in msg.get("tables", [])[:2]:
                                 if isinstance(table, dict):
-                                    st.markdown(f"- {table.get('title', 'Таблица')}")
+                                    _render_table(table)
                         if has_formulas:
                             st.markdown("**Формулы:**")
                             for formula in msg.get("formulas", [])[:5]:
@@ -857,88 +943,21 @@ def main() -> None:
     formulas: list = []
 
     with st.chat_message("assistant"):
-        with st.spinner("🔍 Анализирую запрос..."):
+        with _spinner("🔍 Анализирую запрос..."):
             try:
-                prompt_clean = prompt.strip()
-                prompt_lower = prompt_clean.lower()
-
-                calc_triggers = ["рассчитай", "вычисли", "посчитай", "формул"]
-                definition_triggers = ["что такое ", "что значит ", "определение ", "определи "]
-                table_triggers = ["таблица", "таблицы", "таблиц"]
-
-                is_calc = any(w in prompt_lower for w in calc_triggers)
-                is_definition_query = any(prompt_lower.startswith(t) for t in definition_triggers)
-                is_table = any(w in prompt_lower for w in table_triggers)
-
-                if is_definition_query:
-                    clean_term = prompt_lower
-                    for trigger in definition_triggers:
-                        if clean_term.startswith(trigger):
-                            clean_term = clean_term[len(trigger):].strip(" ?!.,:;\"'«»()[]")
-                            break
-
-                    quick_def = get_quick_definition(clean_term) if clean_term else None
-
-                    if quick_def:
-                        response = (
-                            f"📖 **Определение:**\n\n"
-                            f"{quick_def.get('definition', '')}\n\n"
-                            f"📚 **Источник:** {quick_def.get('source', '')}"
-                        )
-                        if quick_def.get("example"):
-                            response += f"\n\n📌 **Пример:** {quick_def['example']}"
-                    elif clean_term:
-                        definition_result = qa_system.find_definition(clean_term)
-                        if definition_result.get("found"):
-                            response = (
-                                f"📖 **Определение термина «{clean_term}»:**\n\n"
-                                f"{definition_result.get('definition', '')}\n\n"
-                                f"📚 **Источник:** {definition_result.get('source', 'Нормативная база')}"
-                            )
-                        else:
-                            response = f"⚠️ В документах не найдено определение для термина «{clean_term}»."
-                    else:
-                        response = "⚠️ Уточните термин для определения."
-
-                elif is_calc:
-                    result = call_maybe_async(formula_engine.answer_calculation, prompt_clean)
-                    response = result.get("answer", "Не удалось выполнить расчёт")
-                    sources = result.get("sources", [])
-                    tables = result.get("tables", [])
-                    formulas = result.get("formulas", [])
-                    if not formulas and result.get("formula"):
-                        formulas = [result["formula"]]
-
-                elif is_table:
-                    result = qa_system.answer(prompt_clean)
-                    response = result.get("answer", "Таблица не найдена")
-                    tables = result.get("tables", [])
-                    sources = result.get("sources", [])
-                    formulas = result.get("formulas", [])
-
-                    if tables:
-                        response += "\n\n📊 **Найденные таблицы:**\n"
-                        for table in tables[:2]:
-                            if isinstance(table, dict):
-                                response += f"\n**{table.get('title', 'Таблица')}**\n"
-                                content = table.get("content", "")
-                                if len(content) > 500:
-                                    content = content[:500] + "..."
-                                response += f"```\n{content}\n```\n"
-
-                else:
-                    result = call_maybe_async(agent_loop.run, prompt_clean)
-                    response = result.get("answer", "Не удалось получить ответ")
-                    sources = result.get("sources", [])
-                    tables = result.get("tables", [])
-                    formulas = result.get("formulas", [])
-
-                    if result.get("needs_clarification"):
-                        questions = result.get("questions", [])
-                        if questions:
-                            response += "\n\n❓ **Уточните:**\n" + "\n".join([f"• {q}" for q in questions])
+                result = answer_user_query(agent_loop, prompt)
+                response = str(result["answer"])
+                sources = result["sources"]
+                tables = result["tables"]
+                formulas = result["formulas"]
+                if result.get("needs_clarification"):
+                    questions = [str(q) for q in result.get("questions", []) if str(q) not in response]
+                    if questions:
+                        response += "\n\nУточните:\n\n" + "\n".join(f"- {q}" for q in questions)
 
             except Exception as e:
+                # Последняя граница UI: ошибка видна в журнале и не обрывает Streamlit.
+                logger.exception("Не удалось обработать вопрос")
                 error_info = error_handler.handle(e, {"query": prompt})
                 response = error_info.get("user_message", f"❌ Ошибка: {e}")
 
@@ -954,14 +973,14 @@ def main() -> None:
                     st.markdown("**Источники:**")
                     for src in sources:
                         if isinstance(src, dict):
-                            st.markdown(f"- {src.get('doc_name', 'Документ')}")
+                            st.markdown(f"- {_source_label(src)}")
                         else:
                             st.markdown(f"- {src}")
                 if has_tables:
                     st.markdown("**Таблицы:**")
                     for table in tables[:5]:
                         if isinstance(table, dict):
-                            st.markdown(f"- {table.get('title', 'Таблица')}")
+                            _render_table(table)
                 if has_formulas:
                     st.markdown("**Формулы:**")
                     for formula in formulas[:5]:
@@ -992,5 +1011,24 @@ def main() -> None:
     save_history()
 
 
+def _run_self_tests() -> None:
+    """Проверяет UI-контракт без Streamlit-сервера, Ollama и скачивания моделей."""
+    from unittest.mock import AsyncMock, Mock
+    fake_agent = Mock()
+    fake_agent.run = AsyncMock(return_value={"answer": "Ответ по документу [1]", "sources": []})
+    answered = answer_user_query(fake_agent, "  Что такое вентиляция?  ")
+    fake_agent.run.assert_awaited_once_with("Что такое вентиляция?")
+    assert answered["answer"].endswith("[1]") and answered["formulas"] == []
+    assert answer_user_query(fake_agent, " ")["sources"] == []
+    assert _source_label({"doc_name": "СП", "reference_id": 2, "metadata": {"page": 7}}) == "[2] СП, стр. 7"
+    assert safe_call(None) is None
+    assert call_maybe_async(lambda: 3) == 3
+
+
 if __name__ == "__main__":
-    main()
+    if "--self-test" in sys.argv:
+        _run_self_tests()
+    else:
+        main()
+
+# ИСПРАВЛЕНО: один маршрут AgentLoop; кэш ресурсов; optional downloader; тип spinner; малый индекс; настройки поиска; ссылки; PDF/экспорт.

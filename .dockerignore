@@ -1,0 +1,21 @@
+.git
+.idea
+.venv
+venv
+__pycache__
+**/__pycache__
+*.pyc
+.env
+.env.*
+!.env.example
+op.env
+cache
+.cache
+data/raw/*
+data/processed/*
+data/models/*
+data/embeddings/
+!data/**/.gitkeep
+tests/__pycache__
+
+# ИСПРАВЛЕНО: окружения, локальные настройки и скачанные документы не попадают в образ.

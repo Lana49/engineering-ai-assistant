@@ -8,3 +8,13 @@ data/raw/*.docx
 *.docx
 *.log
 op.env
+
+# Локально скачанный корпус, модели и служебные кэши.
+data/raw/*
+!data/raw/.gitkeep
+data/embeddings/
+data/models/*
+!data/models/.gitkeep
+venv/
+cache/
+.cache/

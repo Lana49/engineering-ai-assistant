@@ -6,9 +6,11 @@ Retrieval Memory — память успешных поисковых запро
 from __future__ import annotations
 import logging
 import json
+import os
 from dataclasses import asdict, dataclass, field
 from datetime import datetime
 from pathlib import Path
+from tempfile import NamedTemporaryFile
 from core.query_parser import STOPWORDS
 logger = logging.getLogger(__name__)
 @dataclass(slots=True)
@@ -43,27 +45,57 @@ class RetrievalMemory:
             data = json.loads(self.memory_path.read_text(encoding="utf-8"))
             if not isinstance(data, list):
                 raise TypeError("файл памяти должен содержать список")
-            self.records = [RetrievalRecord(**item) for item in data if isinstance(item, dict)]
-        except (json.JSONDecodeError, KeyError, TypeError, OSError) as exc:
+            self.records = []
+            for item in data:
+                if not isinstance(item, dict):
+                    logger.warning("Пропущена некорректная запись retrieval memory")
+                    continue
+                try:
+                    record = RetrievalRecord(**item)
+                    if not isinstance(record.pattern, str) or not isinstance(record.query_type, str):
+                        raise TypeError("pattern и query_type должны быть строками")
+                    for values in (record.keywords, record.preferred_sources, record.boost_terms):
+                        if not isinstance(values, list) or not all(isinstance(value, str) for value in values):
+                            raise TypeError("ключевые слова и источники должны быть списками строк")
+                    if not isinstance(record.success_count, int) or record.success_count < 1:
+                        raise ValueError("success_count должен быть положительным целым числом")
+                    if not isinstance(record.last_used, str):
+                        raise TypeError("last_used должен быть строкой")
+                    self.records.append(record)
+                except (TypeError, ValueError) as exc:
+                    logger.warning("Пропущена повреждённая запись retrieval memory: %s", exc)
+        except (json.JSONDecodeError, UnicodeDecodeError, KeyError, TypeError, OSError) as exc:
             logger.warning("Не удалось загрузить retrieval memory %s: %s", self.memory_path, exc)
             self.records = []
 
     def save(self) -> None:
-        """Сохраняет записи в файл."""
+        """Атомарно сохраняет записи; ошибка памяти не прерывает ответ."""
+        temporary_path: Path | None = None
         try:
             self.memory_path.parent.mkdir(parents=True, exist_ok=True)
-        payload = [asdict(record) for record in self.records]
-        temporary_path = self.memory_path.with_suffix(self.memory_path.suffix + ".tmp")
-        temporary_path.write_text(
-            json.dumps(payload, ensure_ascii=False, indent=2),
-            encoding="utf-8",
-        )
-        temporary_path.replace(self.memory_path)
-
-    except OSError:
-    # Память — только бустинг ранжирования. Её сбой не должен отменять
-    # уже найденный ответ или расчёт.
-    logger.exception("Не удалось сохранить retrieval memory %s", self.memory_path)
+            payload = [asdict(record) for record in self.records]
+            serialized = json.dumps(payload, ensure_ascii=False, indent=2)
+            # Уникальное имя исключает столкновение временных файлов сессий.
+            # Та же директория обеспечивает атомарную замену в одной ФС.
+            with NamedTemporaryFile(
+                mode="w", encoding="utf-8", dir=self.memory_path.parent,
+                prefix=self.memory_path.name + ".", suffix=".tmp", delete=False,
+            ) as temporary_file:
+                temporary_path = Path(temporary_file.name)
+                temporary_file.write(serialized)
+                temporary_file.flush()
+                os.fsync(temporary_file.fileno())
+            temporary_path.replace(self.memory_path)
+        except (OSError, TypeError, ValueError):
+            # Память — только бустинг ранжирования. Её сбой не должен отменять
+            # уже найденный ответ или расчёт.
+            logger.exception("Не удалось сохранить retrieval memory %s", self.memory_path)
+        finally:
+            if temporary_path is not None and temporary_path.exists():
+                try:
+                    temporary_path.unlink()
+                except OSError:
+                    logger.warning("Не удалось удалить временный файл памяти %s", temporary_path)
 
     @staticmethod
     def normalize_query(query: str) -> str:
@@ -198,3 +230,30 @@ class RetrievalMemory:
     def get_most_successful(self, limit: int = 10) -> list[RetrievalRecord]:
         """Возвращает наиболее успешные записи."""
         return sorted(self.records, key=lambda r: r.success_count, reverse=True)[:limit]
+
+
+def _run_self_tests() -> None:
+    """Проверяет сохранение, повреждённые записи и отказ диска."""
+    from tempfile import TemporaryDirectory
+    from unittest.mock import patch
+
+    with TemporaryDirectory() as directory:
+        memory = RetrievalMemory(Path(directory) / "memory.json")
+        memory.save_success("требования к вентиляции", "regulatory", ["вентиляции"], ["СП 60"])
+        assert memory.get_boosts("требования к вентиляции", "regulatory")["sources"] == ["СП 60"]
+        reloaded = RetrievalMemory(memory.memory_path)
+        assert len(reloaded.records) == 1
+        original = memory.memory_path.read_bytes()
+        with patch.object(Path, "replace", side_effect=OSError("test disk failure")):
+            memory.save()
+        assert memory.memory_path.read_bytes() == original
+        assert not list(Path(directory).glob("*.tmp"))
+        memory.memory_path.write_text('[{"pattern": "bad"}]', encoding="utf-8")
+        assert RetrievalMemory(memory.memory_path).records == []
+
+
+if __name__ == "__main__":
+    _run_self_tests()
+
+# ИСПРАВЛЕНО: отступы save; проверка повреждённых записей; атомарное сохранение
+# через уникальный временный файл; отказ диска не ломает ответ; регрессионные тесты.

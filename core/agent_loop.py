@@ -12,6 +12,7 @@
 from __future__ import annotations
 
 import re
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any
@@ -332,7 +333,7 @@ class AgentLoop:
         self,
         context: ContextInfo,
     ) -> ReasoningStep:
-        """Выбирает обработчик по intent."""
+        """Расчёты направляет в FormulaEngine, ответы — в общий RAG-путь."""
         if context.query_type == QueryType.CALCULATION:
             return await self._handle_calculation(context)
 
@@ -340,12 +341,34 @@ class AgentLoop:
             return self._handle_definition(context)
 
         if context.query_type == QueryType.COMPARISON:
-            return self._handle_comparison(context)
+            return self._handle_grounded(context, "Сравнение по найденным документам")
 
         if context.query_type == QueryType.REGULATORY:
             return self._handle_regulatory(context)
 
         return self._handle_search(context)
+
+    def _handle_grounded(self, context: ContextInfo, description: str) -> ReasoningStep:
+        """Передаёт уже найденные фрагменты QA без повторного поиска и потери источников."""
+        step = ReasoningStep(step_id=4, description=description)
+        try:
+            answer_from_results = getattr(self.qa_system, "answer_from_results", None)
+            if callable(answer_from_results):
+                answer = answer_from_results(context.query, context.chunks)
+            else:
+                # Совместимость со старым пользовательским QA: только цитаты
+                # найденного текста, без дополнений из памяти модели.
+                answer = self._search_answer(context)
+                answer.update(provider="none", used_llm=False, grounded=True)
+            if not isinstance(answer, dict):
+                raise TypeError("QA должен вернуть словарь с ответом и источниками")
+            step.result = answer
+            step.confidence = float(answer.get("confidence", 0.0) or 0.0)
+        except (AttributeError, KeyError, TypeError, ValueError) as exc:
+            logger.exception("Не удалось сформировать ответ по найденным фрагментам")
+            step.result = self._create_error_response(f"Ошибка формирования ответа: {exc}", step_id=4)
+            step.confidence = 0.0
+        return step
 
     async def _handle_calculation(
         self,
@@ -380,7 +403,7 @@ class AgentLoop:
             TypeError,
             ValueError,
         ) as exc:
-            logger.exception("Ошибка grounded-ответа")
+            logger.exception("Ошибка инженерного расчёта")
             step.result = {
                 "type": "calculation",
                 "answer": f"❌ Ошибка расчёта: {exc}",
@@ -409,6 +432,7 @@ class AgentLoop:
             "parameters": result.get("params", {}),
             "result": result.get("result"),
             "reasoning": result.get("reasoning", ""),
+            "grounded": bool(result.get("grounded", False)),
             "confidence": result.get("confidence", 0.0),
             "needs_clarification": result.get(
                 "needs_clarification",
@@ -491,7 +515,7 @@ class AgentLoop:
             query,
             query_type.value,
         )
-        memory_terms = memory_boosts.get("terms", [])
+        memory_terms = [str(term) for term in memory_boosts.get("terms", [])]
 
         if memory_terms:
             variants.append(
@@ -551,7 +575,7 @@ class AgentLoop:
             if any(ref in lower_text for ref in section_refs):
                 score += 0.30
 
-            if city and city in lower_text:
+            if city and re.search(rf"\b{re.escape(city)}\b", lower_text):
                 score += 0.25
 
             term_hits = sum(
@@ -636,7 +660,8 @@ class AgentLoop:
                     top_k=top_k,
                 )
 
-                for chunk in found or []:
+                for raw_chunk in found or []:
+                    chunk = self._search_result_to_dict(raw_chunk)
                     doc_name = str(chunk.get("doc_name", ""))
                     text = str(chunk.get("text", ""))
                     fingerprint = (
@@ -686,6 +711,7 @@ class AgentLoop:
             TypeError,
             ValueError,
         ) as exc:
+            logger.exception("Ошибка поиска фрагментов для запроса %r", query[:200])
             step.result = {
                 "chunks": [],
                 "count": 0,
@@ -698,13 +724,33 @@ class AgentLoop:
         return step
 
     @staticmethod
+    def _search_result_to_dict(value: Any) -> dict[str, Any]:
+        """Принимает старый dict и текущий SearchResult с атрибутами."""
+        if isinstance(value, Mapping):
+            return dict(value)
+        converter = getattr(value, "to_dict", None)
+        if callable(converter):
+            converted = converter()
+            if isinstance(converted, Mapping):
+                return dict(converted)
+        if hasattr(value, "text"):
+            return {
+                "text": str(value.text),
+                "doc_name": str(getattr(value, "doc_name", "")),
+                "chunk_id": getattr(value, "chunk_id", 0),
+                "score": float(getattr(value, "score", 0.0) or 0.0),
+                "metadata": dict(getattr(value, "metadata", {}) or {}),
+            }
+        raise TypeError(f"Неподдерживаемый результат поиска: {type(value).__name__}")
+
+    @staticmethod
     def _extract_formulas(text: str) -> list[dict[str, Any]]:
         """Извлекает короткие формулы из найденного текста."""
         raw_formulas: list[str] = []
 
         equation_pattern = (
             r"(?<!\w)"
-            r"([A-Za-zА-Яа-яΔδλ][\w_внтотр]*\s*="
+            r"([A-Za-zА-Яа-яΔδλ]\w*\s*="
             r"\s*[^\n.;]{3,180})"
         )
         raw_formulas.extend(re.findall(equation_pattern, text))
@@ -721,7 +767,7 @@ class AgentLoop:
             seen.add(normalized)
 
             variables = re.findall(
-                r"[A-Za-zА-Яа-яΔδλ][\w_внтотр]*",
+                r"[A-Za-zА-Яа-яΔδλ]\w*",
                 normalized,
             )
 
@@ -787,11 +833,6 @@ class AgentLoop:
         self,
         context: ContextInfo,
     ) -> ReasoningStep:
-        step = ReasoningStep(
-            step_id=4,
-            description="Поиск определения термина",
-        )
-
         term = self._extract_definition_term(context.query)
 
         if not term:
@@ -807,7 +848,7 @@ class AgentLoop:
             }
             step.confidence = 0.2
             return step
-            return self._handle_grounded(context, f"Определение термина «{term}» по базе")
+        return self._handle_grounded(context, f"Определение термина «{term}» по базе")
 
 
     @staticmethod
@@ -913,11 +954,6 @@ class AgentLoop:
         self,
         context: ContextInfo,
     ) -> ReasoningStep:
-        step = ReasoningStep(
-            step_id=4,
-            description="Поиск информации в документах",
-        )
-
         return self._handle_grounded(context, "Ответ по найденным документам")
 
     def _search_answer(
@@ -1229,7 +1265,8 @@ class AgentLoop:
             "query_type": "error",
             "steps": step_id,
         }
-if  __name__ == "__main__":
+def _run_self_tests() -> None:
+    """Проверяет общий RAG-путь и совместимость с объектами SearchResult."""
     import asyncio
     from pathlib import Path
     from tempfile import TemporaryDirectory
@@ -1237,16 +1274,19 @@ if  __name__ == "__main__":
     class _TestQA:
         is_ready = True
 
-        def search(self, query: str, top_k: int = 5) -> list[dict[str, Any]]:
-            return [{
-                "doc_name": "Тестовый СП",
-                "chunk_id": 3,
-                "text": "Вентиляция должна обеспечивать требуемый воздухообмен.",
-                "score": 0.9,
-                "metadata": {"page": 7},
-            }]
+        @staticmethod
+        def search(query: str, top_k: int = 5) -> list[Any]:
+            from types import SimpleNamespace
+            assert query and top_k > 0
+            return [SimpleNamespace(
+                doc_name="Тестовый СП", chunk_id=3,
+                text="Вентиляция должна обеспечивать требуемый воздухообмен.",
+                score=0.9, metadata={"page": 7},
+            )]
 
-        def answer_from_results(self, question: str, results: list[dict[str, Any]]) -> dict[str, Any]:
+        @staticmethod
+        def answer_from_results(question: str, results: list[dict[str, Any]]) -> dict[str, Any]:
+            assert question
             assert results and results[0]["doc_name"] == "Тестовый СП"
             return {
                 "answer": "### Краткий ответ\n\nТребование найдено. [Источник 1]",
@@ -1256,12 +1296,26 @@ if  __name__ == "__main__":
             }
 
     class _TestFormula:
-        def can_calculate_directly(self, query: str, parameters: dict[str, Any]) -> bool:
+        @staticmethod
+        def can_calculate_directly(query: str, parameters: dict[str, Any]) -> bool:
+            assert query and isinstance(parameters, dict)
             return False
 
     with TemporaryDirectory() as directory:
         loop = AgentLoop(_TestQA(), _TestFormula())
         loop.memory = RetrievalMemory(Path(directory) / "memory.json")
-        response = asyncio.run(loop.run("Какие требования к вентиляции?"))
-        assert response["sources"][0]["doc_name"] == "Тестовый СП"
-        assert response["query_type"] == "regulatory"
+        for question, expected_intent in (
+            ("Какие требования к вентиляции?", "regulatory"),
+            ("Что такое вентиляция?", "definition"),
+            ("Сравни вентиляцию и отопление", "comparison"),
+        ):
+            test_response = asyncio.run(loop.run(question))
+            assert test_response["sources"][0]["doc_name"] == "Тестовый СП"
+            assert test_response["query_type"] == expected_intent
+            assert test_response["grounded"]
+
+
+if __name__ == "__main__":
+    _run_self_tests()
+
+# ИСПРАВЛЕНО: _handle_grounded; адаптер SearchResult; возврат определения; поиск/логирование; сравнение через QA; тесты.
