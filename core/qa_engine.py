@@ -837,12 +837,28 @@ class QASystem:
 
     @classmethod
     def _requires_exact_evidence(cls, question: str) -> bool:
-        return bool(cls._definition_term(question) or cls._document_references(question)
-                    or cls._requested_clauses(question) or re.search(
-                        r"норм[аыуе]|норматив|требован|требует|допуска|допустим|"
-                        r"должн|следует|минимальн|максимальн|не\s+(?:менее|более)",
-                        question, re.IGNORECASE,
-                    ))
+        """
+        Строгая выдержка нужна для:
+        - определений;
+        - конкретного пункта;
+        - явно запрошенной нормы/требования.
+
+        Само указание СП/ГОСТ является только фильтром документа.
+        """
+        return bool(
+            cls._definition_term(question)
+            or cls._requested_clauses(question)
+            or re.search(
+                r"норм[аыуе]|норматив|"
+                r"требован|требует|"
+                r"допуска|допустим|"
+                r"должн|следует|"
+                r"минимальн|максимальн|"
+                r"не\s+(?:менее|более)",
+                question,
+                re.IGNORECASE,
+            )
+        )
 
     @classmethod
     def _topic_support_score(cls, text: str, question: str) -> float:
