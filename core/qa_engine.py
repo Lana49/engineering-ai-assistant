@@ -8,6 +8,7 @@ QA Engine для инженерной документации.
 from __future__ import annotations
 
 import math
+import json
 import os
 import pickle
 import re
@@ -22,6 +23,7 @@ import requests
 
 from core.table_extractor import extract_tables_from_results, tables_to_dicts
 from core.prompts import get_system_prompt
+from core.answer_formatter import compact_evidence, evidence_key, format_document_answer
 
 try:
     from dotenv import load_dotenv
@@ -902,8 +904,8 @@ class QASystem:
     ) -> dict[str, Any]:
         """Отвечает по уже отобранным фрагментам без повторного поиска.
 
-        Определения и нормы возвращаются дословно по прямому свидетельству.
-        Для обычного объяснения проверка ссылок не доказывает все выводы LLM.
+        Оформление принадлежит одному formatter. Модель может выбрать только
+        проверяемые выдержки: номер ссылки сам по себе не подтверждает вывод.
         """
         normalized_results = self._normalize_search_results(results)
         # Оркестратор расширяет запрос и может принести фрагменты из других
@@ -935,12 +937,8 @@ class QASystem:
                                   if self._has_topic_support(item.text, question)]
         if not normalized_results:
             return {
-                "answer": (
-                    "### Краткий ответ\n\nВ базе знаний не найдены фрагменты, "
-                    "достаточные для ответа. "
-                    + ("Прямое определение термина в найденном тексте отсутствует. " if definition_term else "")
-                    + "Уточните документ, раздел или ключевой термин."
-                ),
+                "answer": format_document_answer([], insufficient=True),
+                "answer_formatted": True,
                 "sources": [],
                 "tables": [],
                 "formulas": [],
@@ -957,10 +955,12 @@ class QASystem:
         # Ограничение контекста удерживает запрос в памяти локальной модели.
         # Копии не изменяют исходные результаты поиска и сам индекс.
         selected_results = [
-            replace(item, text=(item.text if exact_evidence else self._context_excerpt(item.text, question)),
-                    doc_name=item.doc_name[:200])
-            for item in normalized_results[:max(1, min(self.top_k, 6))]
+            replace(item, text=(item.text if exact_evidence else self._context_excerpt(item.text, question)))
+            for item in normalized_results
         ]
+        # Повторный отбор нужен после выделения выдержки: разные перекрывающиеся
+        # чанки могут содержать один и тот же пункт. Номера чанков не доказательства.
+        selected_results = self._deduplicate_context(selected_results)[:max(1, min(self.top_k, 6))]
         context = self._build_context(selected_results)
         sources = self._build_sources(selected_results)
         try:
@@ -969,6 +969,7 @@ class QASystem:
             logger.exception("Не удалось извлечь таблицы из найденных фрагментов")
             tables = []
         payload = {
+            "answer_formatted": True,
             "sources": sources,
             "tables": tables,
             "formulas": self._extract_formulas_from_results(selected_results),
@@ -981,37 +982,42 @@ class QASystem:
         }
         self.last_llm_error = ""
         if exact_evidence:
-            # Допустимый номер ссылки не даёт LLM права добавлять норму/число.
-            excerpt = selected_results[0].text
-            answer = ("### Краткий ответ\n\nТочная выдержка из найденного документа:\n\n> "
-                      + excerpt.replace("\n", "\n> ") + "\n\n[Источник 1]\n\n### Ограничения\n\n"
-                      "Выдержка приведена без генеративного пересказа. Проверьте область применения "
-                      "и условия в документе; она может не покрывать все условия вопроса.")
-            return {**payload, "answer": answer, "provider": "none", "used_llm": False}
+            primary = selected_results[:1]
+            return {**payload, "sources": self._build_sources(primary),
+                    "answer": format_document_answer(self._formatter_excerpts(primary)),
+                    "provider": "none", "used_llm": False}
         provider = self._select_provider()
 
         if provider != "none":
             prompt = self._build_prompt(question, context)
             llm_answer = self._ask_ollama(prompt)
 
-            if llm_answer and self._has_valid_citations(llm_answer, len(selected_results)):
+            evidence = self._validated_model_evidence(llm_answer, selected_results) if llm_answer else None
+            if evidence == []:
+                return {**payload, "answer": format_document_answer([], insufficient=True),
+                        "sources": [], "tables": [], "formulas": [], "confidence": 0.0,
+                        "needs_clarification": True, "evidence_mode": "insufficient",
+                        "provider": provider, "used_llm": True}
+            if evidence:
                 return {
                     **payload,
-                    "answer": self._ensure_structured_answer(llm_answer),
+                    "answer": format_document_answer(self._formatter_excerpts(evidence)),
+                    "sources": self._build_sources(evidence),
                     "provider": provider,
                     "used_llm": True,
                 }
 
             if llm_answer:
                 logger.warning(
-                    "Ответ %s отклонён: в нём нет корректных ссылок на контекст",
+                    "Ответ %s отклонён: выдержки не подтверждены переданным контекстом",
                     provider,
                 )
-                self.last_llm_error = "Ответ модели не содержит корректных ссылок на найденные фрагменты"
+                self.last_llm_error = "Ответ модели не содержит проверяемых выдержек из найденных фрагментов"
         fallback_answer = self._generate_extract_answer(selected_results, question=question)
         return {
             **payload,
             "answer": fallback_answer,
+            "sources": self._build_sources(selected_results[:1]),
             "provider": "none",
             "used_llm": False,
             "llm_error": self.last_llm_error,
@@ -1022,18 +1028,82 @@ class QASystem:
         results: list[SearchResult | Mapping[str, Any]] | None,
     ) -> list[SearchResult]:
         normalized: list[SearchResult] = []
-        seen: set[tuple[str, int, str]] = set()
+        seen: set[str] = set()
         for value in results or []:
             try:
                 item = SearchResult.from_value(value)
             except (TypeError, ValueError, OverflowError):
                 logger.warning("Пропущен некорректный результат поиска", exc_info=True)
                 continue
-            key = (item.doc_name, item.chunk_id, item.text)
+            key = evidence_key(item.text)
             if item.text.strip() and np.isfinite(item.score) and key not in seen:
                 normalized.append(item)
                 seen.add(key)
         return normalized
+
+    @classmethod
+    def _deduplicate_context(cls, results: list[SearchResult]) -> list[SearchResult]:
+        """Убирает повторные абзацы/пункты, сохраняя разные условия и числа."""
+        selected = []
+        seen: set[str] = set()
+        for item in results:
+            units = []
+            for unit in cls._evidence_units(compact_evidence(item.text)):
+                key = evidence_key(unit)
+                if key and key not in seen:
+                    units.append(unit)
+                    seen.add(key)
+            if units:
+                selected.append(replace(item, text="\n\n".join(units)))
+        return selected
+
+    @staticmethod
+    def _formatter_excerpts(results: list[SearchResult]) -> list[dict[str, Any]]:
+        return [{**item.to_dict(), "reference_id": index}
+                for index, item in enumerate(results, start=1)]
+
+    @classmethod
+    def _validated_model_evidence(
+        cls, answer: str, results: list[SearchResult],
+    ) -> list[SearchResult] | None:
+        """Разрешает только полные исходные абзацы/пункты, без пересказа.
+
+        Даже дословная часть пункта может потерять отрицание или исключение.
+        Поэтому проверяем целую единицу доказательства, а не подстроку/ссылку.
+        None означает ошибку протокола, [] — явное отсутствие подтверждения.
+        """
+        try:
+            raw = re.sub(r"^```(?:json)?\s*|\s*```$", "", answer.strip(), flags=re.IGNORECASE)
+            data = json.loads(raw)
+            if not isinstance(data, dict):
+                return None
+            if data == {"insufficient": True}:
+                return []
+            if set(data) != {"evidence"} or not isinstance(data["evidence"], list) or not data["evidence"]:
+                return None
+            validated = []
+            seen: set[str] = set()
+            for entry in data["evidence"]:
+                if not isinstance(entry, dict) or set(entry) != {"source_id", "quote"}:
+                    return None
+                reference = entry["source_id"]
+                if type(reference) is not int or not 1 <= reference <= len(results) or not isinstance(entry["quote"], str):
+                    return None
+                source = results[reference - 1]
+                # Нормализуем только пробельные символы; регистр/числа/отрицания
+                # модели не исправляем. Возвращаем оригинал, не текст модели.
+                quote = re.sub(r"\s+", " ", entry["quote"]).strip()
+                original = next((unit for unit in cls._evidence_units(source.text)
+                                 if re.sub(r"\s+", " ", unit).strip() == quote), None)
+                if not original or "…" in original:
+                    return None
+                key = evidence_key(original)
+                if key not in seen:
+                    validated.append(replace(source, text=original))
+                    seen.add(key)
+            return validated[:3]
+        except (ValueError, TypeError):
+            return None
 
     @classmethod
     def _context_excerpt(cls, text: str, question: str) -> str:
@@ -1150,7 +1220,8 @@ class QASystem:
                     "model": self.ollama_model,
                     "prompt": prompt,
                     "stream": False,
-                    "options": {"temperature": 0.1, "num_predict": 700, "num_ctx": 8192},
+                    "format": "json",
+                    "options": {"temperature": 0.0, "num_predict": 700, "num_ctx": 8192},
                 },
                 timeout=120,
             )
@@ -1188,13 +1259,6 @@ class QASystem:
             for value in re.findall(r"\[Источник\s+(\d+)\]", answer, flags=re.IGNORECASE)
         ]
         return bool(references) and all(1 <= value <= source_count for value in references)
-
-    @staticmethod
-    def _ensure_structured_answer(answer: str) -> str:
-        """Добавляет заголовок, если модель не оформила краткий ответ."""
-        if re.search(r"^#{1,3}\s*кратк", answer, flags=re.IGNORECASE | re.MULTILINE):
-            return answer.strip()
-        return "### Краткий ответ\n\n" + answer.strip()
 
     @staticmethod
     def _query_terms(question: str) -> set[str]:
@@ -1255,31 +1319,13 @@ class QASystem:
             results: list[SearchResult],
             question: str = "",
     ) -> str:
-        """Строит структурированный extractive-ответ, когда LLM недоступна."""
+        """Тот же formatter для fallback; без служебных предупреждений об LLM."""
         if not results:
-            return "### Краткий ответ\n\nВ базе знаний недостаточно данных для точного ответа."
-        parts: list[str] = [
-            "### Краткий ответ",
-            "По найденным документам:",
-        ]
-        excerpts: list[str] = []
-        # Второй по TF-IDF фрагмент может касаться другого условия (например,
-        # температуры для другого типа помещения). Без LLM не смешиваем нормы.
-        for index, result in enumerate(results[:1], start=1):
-            excerpt = cls._select_evidence_excerpt(result.text, question)
-            if excerpt:
-                excerpts.append(f"> {excerpt}\n\n[Источник {index}]")
-
-        if excerpts:
-            parts.append(excerpts[0])
-            if len(excerpts) > 1:
-                parts.extend(["### Дополнительные фрагменты", *excerpts[1:]])
-        parts.extend([
-            "### Ограничения",
-            "Показаны выдержки без генеративного анализа. Они могут не покрывать "
-            "все условия вопроса; проверьте область применения в указанном документе.",
-        ])
-        return "\n\n".join(parts)
+            return format_document_answer([], insufficient=True)
+        primary = results[0]
+        units = cls._evidence_units(primary.text)
+        relevant = max(units, key=lambda unit: cls._topic_support_score(unit, question))
+        return format_document_answer(cls._formatter_excerpts([replace(primary, text=relevant)]))
 
 
 def _run_self_tests() -> None:
